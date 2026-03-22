@@ -2,9 +2,9 @@
 """Run the V3 RSI-filtered asymmetric regime ensemble strategy live.
 
 Usage:
-    python -m live.run_rsi_filtered [--testnet] [--leverage N] [--size USDT]
+    python -m live.run_rsi_filtered [--config PATH] [--testnet] [--leverage N] [--size USDT]
 
-Configuration via env vars or ~/.claude_trader/live_config.json:
+Configuration via --config, env vars, or ~/.claude_trader/live_config.json:
     BINANCE_API_KEY, BINANCE_API_SECRET (required)
     BINANCE_TESTNET=true            (use testnet)
     BINANCE_POSITION_SIZE=100       (USDT per trade)
@@ -24,6 +24,7 @@ from live.rsi_filtered_strategy import RsiFilteredStrategy
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="RSI-Filtered Regime Ensemble V3 - Live Trader")
+    parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
     parser.add_argument("--testnet", action="store_true", help="Use Binance testnet")
     parser.add_argument("--leverage", type=float, default=1.0, help="Leverage multiplier (default: 1)")
     parser.add_argument("--size", type=float, default=None, help="Position size in USDT (overrides config)")
@@ -31,8 +32,8 @@ def main() -> None:
     parser.add_argument("--poll-interval", type=float, default=60.0, help="Seconds between polls (default: 60)")
     args = parser.parse_args()
 
-    # Load base config (env vars or file)
-    config = LiveConfig.load()
+    # Load base config from an explicit file or the default env/file lookup.
+    config = LiveConfig.load(args.config)
 
     # Apply CLI overrides by rebuilding config
     overrides: dict = {}

@@ -93,8 +93,15 @@ class LiveConfig:
             object.__setattr__(self, "base_url", _TESTNET_BASE_URL)
 
     @staticmethod
-    def load() -> LiveConfig:
-        """Load config from env vars or ~/.claude_trader/live_config.json."""
+    def load(config_path: str | Path | None = None) -> LiveConfig:
+        """Load config from an explicit file, env vars, or ~/.claude_trader/live_config.json."""
+        if config_path is not None:
+            path = Path(config_path).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"Config file not found: {path}")
+            data = json.loads(path.read_text())
+            return LiveConfig(**data)
+
         api_key = os.environ.get("BINANCE_API_KEY", "")
         api_secret = os.environ.get("BINANCE_API_SECRET", "")
         if api_key and api_secret:
