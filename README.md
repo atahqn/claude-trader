@@ -1,25 +1,6 @@
 # claude-trader
 
-Minimal backbone repository extracted from the original `claude_trader` workspace.
-
-Included packages:
-
-- `backtester/`: market-data client, trade resolution, and backtest engine.
-- `live/`: live trading runtime primitives, authenticated Binance Futures client,
-  signal-generator interface, order execution, and position tracking.
-
-Excluded from this repository:
-
-- research and experiment directories
-- concrete live strategies and runner scripts
-- cached data, result artifacts, and local state
-
-## Python
-
-The backbone code is stdlib-only, but it relies on Python 3.11+ features such as
-`enum.StrEnum` and `datetime.UTC`.
-
-## Live Config
+Trading engine and backtester for signals. Repository is created so that an LLM (claude) can experiment with different crypto trading strategies and execute them with real money in binance.
 
 The live layer loads credentials from environment variables or
 `~/.claude_trader/live_config.json`.
