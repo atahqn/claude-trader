@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -64,6 +64,7 @@ class LivePosition:
     sl_order: ExchangeOrder | None = None
     fill_price: float = 0.0
     quantity: float = 0.0
+    opened_at: datetime | None = None
     pnl_pct: float = 0.0
     gross_pnl_pct: float = 0.0
     fee_drag_pct: float = 0.0
@@ -84,11 +85,13 @@ class LiveConfig:
     base_url: str = _PROD_BASE_URL
     position_size_usdt: float = 100.0
     max_concurrent_positions: int = 3
-    poll_interval_seconds: float = 60.0
+    max_holding_hours: int = 168
     order_check_interval_seconds: float = 5.0
     testnet: bool = False
 
     def __post_init__(self) -> None:
+        if self.max_holding_hours <= 0:
+            raise ValueError("max_holding_hours must be positive")
         if self.testnet and self.base_url == _PROD_BASE_URL:
             object.__setattr__(self, "base_url", _TESTNET_BASE_URL)
 
@@ -111,7 +114,7 @@ class LiveConfig:
                 base_url=os.environ.get("BINANCE_BASE_URL", _PROD_BASE_URL),
                 position_size_usdt=float(os.environ.get("BINANCE_POSITION_SIZE", "100")),
                 max_concurrent_positions=int(os.environ.get("BINANCE_MAX_POSITIONS", "3")),
-                poll_interval_seconds=float(os.environ.get("BINANCE_POLL_INTERVAL", "60")),
+                max_holding_hours=int(os.environ.get("BINANCE_MAX_HOLDING_HOURS", "168")),
                 order_check_interval_seconds=float(os.environ.get("BINANCE_ORDER_CHECK_INTERVAL", "5")),
                 testnet=os.environ.get("BINANCE_TESTNET", "").lower() in ("1", "true", "yes"),
             )

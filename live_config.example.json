@@ -4,7 +4,7 @@
   "base_url": "https://fapi.binance.com",
   "position_size_usdt": 100.0,
   "max_concurrent_positions": 3,
-  "poll_interval_seconds": 60.0,
+  "max_holding_hours": 168,
   "order_check_interval_seconds": 5.0,
   "testnet": false
 }

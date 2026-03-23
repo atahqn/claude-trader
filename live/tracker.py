@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from backtester.data import _symbol_for_api
 from backtester.models import PositionType, Signal
 from backtester.resolver import compute_pnl
 
@@ -13,6 +14,7 @@ from .auth_client import BinanceFuturesClient
 from .executor import OrderExecutor
 from .models import (
     ExchangeOrder,
+    LiveConfig,
     LivePosition,
     OrderSide,
     OrderStatus,
@@ -31,10 +33,13 @@ class PositionTracker:
         self,
         client: BinanceFuturesClient,
         executor: OrderExecutor,
+        config: LiveConfig,
     ) -> None:
         self._client = client
         self._executor = executor
+        self._config = config
         self._positions: list[LivePosition] = []
+        self._external_position_keys: set[tuple[str, str]] = set()
         self._dirty = False
 
     @property
@@ -43,10 +48,11 @@ class PositionTracker:
 
     @property
     def open_count(self) -> int:
-        return sum(
+        tracked_open = sum(
             1 for p in self._positions
             if p.status in (PositionStatus.PENDING_ENTRY, PositionStatus.OPEN)
         )
+        return tracked_open + len(self._external_position_keys)
 
     # -- Position management ---------------------------------------------------
 
@@ -54,17 +60,48 @@ class PositionTracker:
         self._positions.append(position)
         self._dirty = True
 
-    def check_fills(self) -> None:
+    def reconcile_with_exchange(self) -> None:
+        """Track exchange positions that are not present in local state."""
+        try:
+            raw_positions = self._client.get_position_info()
+        except Exception as exc:
+            print(f"Failed to reconcile exchange positions: {exc}", file=sys.stderr)
+            return
+
+        tracked_keys = self._tracked_exchange_keys()
+        external_keys = self._exchange_position_keys(raw_positions) - tracked_keys
+        if external_keys == self._external_position_keys:
+            return
+
+        self._external_position_keys = external_keys
+        if external_keys:
+            rendered = ", ".join(f"{symbol}:{side}" for symbol, side in sorted(external_keys))
+            print(
+                f"Recovered {len(external_keys)} untracked exchange position(s): {rendered}",
+                file=sys.stderr,
+            )
+        else:
+            print("No untracked exchange positions remain.", file=sys.stderr)
+
+    def has_external_conflict(self, signal: Signal) -> bool:
+        api_symbol = _symbol_for_api(signal.ticker)
+        return any(symbol == api_symbol for symbol, _side in self._external_position_keys)
+
+    def check_fills(self, now_utc: datetime | None = None) -> None:
         """Poll exchange for order status updates on all active positions."""
+        now_utc = now_utc or self._client.server_now()
         for pos in self._positions:
             if pos.status is PositionStatus.PENDING_ENTRY:
-                self._check_entry_fill(pos)
+                self._check_entry_fill(pos, now_utc)
             elif pos.status is PositionStatus.OPEN:
-                self._check_exit_fills(pos)
+                exit_closed = self._check_exit_fills(pos, now_utc)
+                if exit_closed is not False:
+                    continue
+                self._check_timeout(pos, now_utc)
 
     # -- Entry fill detection --------------------------------------------------
 
-    def _check_entry_fill(self, pos: LivePosition) -> None:
+    def _check_entry_fill(self, pos: LivePosition, now_utc: datetime) -> None:
         if pos.entry_order is None:
             pos.status = PositionStatus.FAILED
             self._dirty = True
@@ -78,7 +115,7 @@ class PositionTracker:
             and updated.created_at is not None
             and pos.signal.fill_timeout_seconds > 0
         ):
-            age = (datetime.now(UTC) - updated.created_at).total_seconds()
+            age = (now_utc - updated.created_at).total_seconds()
             if age >= pos.signal.fill_timeout_seconds:
                 try:
                     self._client.cancel_order(pos.signal.ticker, updated.order_id)
@@ -97,6 +134,7 @@ class PositionTracker:
         if updated.status is OrderStatus.FILLED:
             pos.fill_price = updated.avg_fill_price if updated.avg_fill_price > 0 else updated.price
             pos.quantity = updated.filled_qty if updated.filled_qty > 0 else pos.quantity
+            pos.opened_at = updated.updated_at or updated.created_at or now_utc
             pos.entry_order = updated
             self._dirty = True
             # Place TP/SL orders on the exchange
@@ -129,6 +167,34 @@ class PositionTracker:
                 file=sys.stderr,
             )
 
+    def _tracked_exchange_keys(self) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        for pos in self._positions:
+            if pos.status not in (PositionStatus.PENDING_ENTRY, PositionStatus.OPEN):
+                continue
+            side = "LONG" if pos.signal.position_type is PositionType.LONG else "SHORT"
+            keys.add((_symbol_for_api(pos.signal.ticker), side))
+        return keys
+
+    @staticmethod
+    def _exchange_position_keys(raw_positions: list[dict[str, Any]]) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        for row in raw_positions:
+            symbol = str(row.get("symbol", ""))
+            if not symbol:
+                continue
+            try:
+                amount = float(row.get("positionAmt", 0))
+            except (TypeError, ValueError):
+                continue
+            if abs(amount) <= 0:
+                continue
+            side = str(row.get("positionSide", "BOTH"))
+            if side not in {"LONG", "SHORT"}:
+                side = "LONG" if amount > 0 else "SHORT"
+            keys.add((symbol, side))
+        return keys
+
     # -- Exit fill detection ---------------------------------------------------
 
     def _query_order(self, ticker: str, order: ExchangeOrder) -> ExchangeOrder:
@@ -147,7 +213,7 @@ class PositionTracker:
         except Exception:
             pass  # may already be canceled
 
-    def _check_exit_fills(self, pos: LivePosition) -> None:
+    def _check_exit_fills(self, pos: LivePosition, now_utc: datetime) -> bool | None:
         tp_filled = False
         sl_filled = False
 
@@ -161,7 +227,7 @@ class PositionTracker:
                     f"[{pos.position_id}] Failed to query TP order: {exc}",
                     file=sys.stderr,
                 )
-                return
+                return None
 
         if pos.sl_order is not None:
             try:
@@ -173,10 +239,10 @@ class PositionTracker:
                     f"[{pos.position_id}] Failed to query SL order: {exc}",
                     file=sys.stderr,
                 )
-                return
+                return None
 
         if not tp_filled and not sl_filled:
-            return
+            return False
 
         # One side filled — cancel the other
         if tp_filled and pos.sl_order is not None and pos.sl_order.status is OrderStatus.NEW:
@@ -185,11 +251,55 @@ class PositionTracker:
         if sl_filled and pos.tp_order is not None and pos.tp_order.status is OrderStatus.NEW:
             self._cancel_order_safe(pos.signal.ticker, pos.tp_order)
 
-        # Compute PnL
-        if tp_filled:
-            exit_price = pos.tp_order.stop_price if pos.tp_order else pos.fill_price
-        else:
-            exit_price = pos.sl_order.stop_price if pos.sl_order else pos.fill_price
+        exit_reason = "TP" if tp_filled else "SL"
+        exit_order = pos.tp_order if tp_filled else pos.sl_order
+        self._finalize_close(pos, exit_order, exit_reason, now_utc)
+        return True
+
+    def _check_timeout(self, pos: LivePosition, now_utc: datetime) -> bool:
+        if pos.opened_at is None:
+            return False
+
+        holding_hours = pos.signal.max_holding_hours
+        if holding_hours is None:
+            holding_hours = self._config.max_holding_hours
+
+        deadline = pos.opened_at + timedelta(hours=holding_hours)
+        if now_utc < deadline:
+            return False
+
+        if pos.tp_order is not None and pos.tp_order.status is OrderStatus.NEW:
+            self._cancel_order_safe(pos.signal.ticker, pos.tp_order)
+        if pos.sl_order is not None and pos.sl_order.status is OrderStatus.NEW:
+            self._cancel_order_safe(pos.signal.ticker, pos.sl_order)
+
+        try:
+            exit_order = self._executor.close_position_market(pos)
+        except Exception as exc:
+            print(
+                f"[{pos.position_id}] Timeout close failed for {pos.signal.ticker}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+
+        self._finalize_close(pos, exit_order, "TIMEOUT", now_utc)
+        return True
+
+    def _finalize_close(
+        self,
+        pos: LivePosition,
+        exit_order: ExchangeOrder | None,
+        exit_reason: str,
+        now_utc: datetime,
+    ) -> None:
+        exit_price = pos.fill_price
+        if exit_order is not None:
+            if exit_order.avg_fill_price > 0:
+                exit_price = exit_order.avg_fill_price
+            elif exit_order.stop_price > 0:
+                exit_price = exit_order.stop_price
+            elif exit_order.price > 0:
+                exit_price = exit_order.price
 
         net_pnl, gross_pnl, fee_drag = compute_pnl(
             pos.fill_price,
@@ -202,10 +312,13 @@ class PositionTracker:
         pos.gross_pnl_pct = gross_pnl
         pos.fee_drag_pct = fee_drag
         pos.status = PositionStatus.CLOSED
-        pos.closed_at = datetime.now(UTC)
+        pos.closed_at = (
+            exit_order.updated_at if exit_order is not None and exit_order.updated_at is not None
+            else exit_order.created_at if exit_order is not None and exit_order.created_at is not None
+            else now_utc
+        )
         self._dirty = True
 
-        exit_reason = "TP" if tp_filled else "SL"
         print(
             f"[{pos.position_id}] {pos.signal.ticker} closed via {exit_reason} "
             f"@ {exit_price:.4f} | PnL: {net_pnl:+.2f}%",
@@ -285,6 +398,7 @@ class PositionTracker:
                 "entry_price": sig.entry_price,
                 "fill_timeout_seconds": sig.fill_timeout_seconds,
                 "entry_delay_seconds": sig.entry_delay_seconds,
+                "max_holding_hours": sig.max_holding_hours,
             }
 
         return {
@@ -296,6 +410,7 @@ class PositionTracker:
             "sl_order": _order_dict(pos.sl_order),
             "fill_price": pos.fill_price,
             "quantity": pos.quantity,
+            "opened_at": pos.opened_at.isoformat() if pos.opened_at is not None else None,
         }
 
     @staticmethod
@@ -332,6 +447,7 @@ class PositionTracker:
                 entry_price=sig_data.get("entry_price"),
                 fill_timeout_seconds=sig_data.get("fill_timeout_seconds", 3600),
                 entry_delay_seconds=sig_data.get("entry_delay_seconds", 5),
+                max_holding_hours=sig_data.get("max_holding_hours"),
             )
             return LivePosition(
                 signal=signal,
@@ -342,6 +458,10 @@ class PositionTracker:
                 sl_order=_parse_order(data.get("sl_order")),
                 fill_price=data.get("fill_price", 0),
                 quantity=data.get("quantity", 0),
+                opened_at=(
+                    datetime.fromisoformat(data["opened_at"])
+                    if data.get("opened_at") is not None else None
+                ),
             )
         except (KeyError, ValueError) as exc:
             print(f"Failed to deserialize position: {exc}", file=sys.stderr)

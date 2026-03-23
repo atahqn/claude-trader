@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any
 
 from backtester.data import _symbol_for_api
@@ -13,6 +14,7 @@ from .models import (
     LiveConfig,
     LivePosition,
     OrderSide,
+    OrderStatus,
     PositionStatus,
 )
 
@@ -44,9 +46,19 @@ class OrderExecutor:
         else:
             entry_price = self._client.get_mark_price(signal.ticker)
 
-        # Compute quantity
-        raw_qty = self._config.position_size_usdt / entry_price
-        quantity = self._round_quantity(api_symbol, raw_qty)
+        quantity, required_notional = self._compute_entry_quantity(
+            api_symbol,
+            entry_price,
+            use_market_filter=signal.entry_price is None,
+        )
+        if required_notional > self._config.position_size_usdt + 1e-9:
+            available_balance = self._client.get_available_balance()
+            if available_balance + 1e-9 < required_notional:
+                raise ValueError(
+                    f"{signal.ticker} requires {required_notional:.2f} USDT after "
+                    f"exchange min-notional rounding, but only "
+                    f"{available_balance:.2f} USDT is available"
+                )
 
         # Determine order side and position side (hedge mode)
         side = OrderSide.BUY if signal.position_type is PositionType.LONG else OrderSide.SELL
@@ -102,12 +114,40 @@ class OrderExecutor:
 
         position.tp_order = self._client.place_take_profit_market(
             signal.ticker, close_side, tp_price, position_side,
-            quantity=position.quantity,
         )
         position.sl_order = self._client.place_stop_market(
             signal.ticker, close_side, sl_price, position_side,
-            quantity=position.quantity,
         )
+
+    def close_position_market(self, position: LivePosition) -> ExchangeOrder:
+        """Close an open position immediately with an opposing market order."""
+        signal = position.signal
+        api_symbol = _symbol_for_api(signal.ticker)
+        if api_symbol not in self._symbol_info:
+            self._load_symbol_info(api_symbol)
+
+        quantity = self._round_quantity(
+            api_symbol,
+            position.quantity,
+            use_market_filter=True,
+        )
+        if quantity <= 0:
+            raise ValueError(f"Cannot close {signal.ticker}: rounded quantity is zero")
+
+        close_side = (
+            OrderSide.SELL if signal.position_type is PositionType.LONG else OrderSide.BUY
+        )
+        position_side = "LONG" if signal.position_type is PositionType.LONG else "SHORT"
+
+        exit_order = self._client.place_market_order(
+            signal.ticker,
+            close_side,
+            quantity,
+            position_side,
+        )
+        if exit_order.status is not OrderStatus.FILLED or exit_order.avg_fill_price <= 0:
+            exit_order = self._client.get_order(signal.ticker, exit_order.order_id)
+        return exit_order
 
     # -- Helpers ---------------------------------------------------------------
 
@@ -119,17 +159,135 @@ class OrderExecutor:
                 return
         raise ValueError(f"Symbol {api_symbol} not found in exchange info")
 
-    def _round_quantity(self, api_symbol: str, qty: float) -> float:
+    def _compute_entry_quantity(
+        self,
+        api_symbol: str,
+        entry_price: float,
+        *,
+        use_market_filter: bool,
+    ) -> tuple[float, float]:
+        raw_qty = self._config.position_size_usdt / entry_price
+        quantity = self._round_quantity(
+            api_symbol,
+            raw_qty,
+            use_market_filter=use_market_filter,
+        )
+
+        min_qty = self._minimum_quantity(api_symbol, use_market_filter=use_market_filter)
+        min_notional = self._minimum_notional(api_symbol)
+
+        if min_qty > 0:
+            quantity = max(quantity, min_qty)
+        if min_notional > 0 and quantity * entry_price + 1e-9 < min_notional:
+            quantity = max(quantity, min_notional / entry_price)
+
+        quantity = self._round_quantity_up(
+            api_symbol,
+            quantity,
+            use_market_filter=use_market_filter,
+        )
+        if quantity <= 0:
+            raise ValueError(f"Cannot size {api_symbol}: rounded quantity is zero")
+
+        required_notional = quantity * entry_price
+        if min_notional > 0 and required_notional + 1e-9 < min_notional:
+            raise ValueError(
+                f"{api_symbol} requires at least {min_notional:.2f} USDT notional, "
+                f"but rounded quantity {quantity} only yields {required_notional:.2f} USDT"
+            )
+        return quantity, required_notional
+
+    def _round_quantity(
+        self,
+        api_symbol: str,
+        qty: float,
+        *,
+        use_market_filter: bool = False,
+    ) -> float:
+        return self._round_quantity_with_mode(
+            api_symbol,
+            qty,
+            use_market_filter=use_market_filter,
+            rounding=ROUND_DOWN,
+        )
+
+    def _round_quantity_up(
+        self,
+        api_symbol: str,
+        qty: float,
+        *,
+        use_market_filter: bool = False,
+    ) -> float:
+        return self._round_quantity_with_mode(
+            api_symbol,
+            qty,
+            use_market_filter=use_market_filter,
+            rounding=ROUND_UP,
+        )
+
+    def _round_quantity_with_mode(
+        self,
+        api_symbol: str,
+        qty: float,
+        *,
+        use_market_filter: bool,
+        rounding: str,
+    ) -> float:
         info = self._symbol_info.get(api_symbol)
         if info is None:
             return qty
-        for f in info.get("filters", []):
+
+        qty_filter = self._quantity_filter(api_symbol, use_market_filter=use_market_filter)
+        if qty_filter is None:
+            return qty
+
+        step = Decimal(str(qty_filter.get("stepSize", "0")))
+        if step <= 0:
+            return qty
+
+        dec_qty = Decimal(str(qty))
+        if dec_qty <= 0:
+            return 0.0
+
+        rounded = (dec_qty / step).to_integral_value(rounding=rounding) * step
+        if rounded <= 0:
+            return 0.0
+        return float(rounded)
+
+    def _quantity_filter(
+        self,
+        api_symbol: str,
+        *,
+        use_market_filter: bool,
+    ) -> dict[str, Any] | None:
+        info = self._symbol_info.get(api_symbol)
+        if info is None:
+            return None
+        filters = info.get("filters", [])
+        if use_market_filter:
+            for f in filters:
+                if f["filterType"] == "MARKET_LOT_SIZE":
+                    return f
+        for f in filters:
             if f["filterType"] == "LOT_SIZE":
-                step = float(f["stepSize"])
-                if step > 0:
-                    precision = len(f["stepSize"].rstrip("0").split(".")[-1])
-                    return round(qty - (qty % step), precision)
-        return qty
+                return f
+        return None
+
+    def _minimum_quantity(self, api_symbol: str, *, use_market_filter: bool) -> float:
+        qty_filter = self._quantity_filter(api_symbol, use_market_filter=use_market_filter)
+        if qty_filter is None:
+            return 0.0
+        return float(qty_filter.get("minQty", 0) or 0)
+
+    def _minimum_notional(self, api_symbol: str) -> float:
+        info = self._symbol_info.get(api_symbol)
+        if info is None:
+            return 0.0
+        for f in info.get("filters", []):
+            if f["filterType"] in {"MIN_NOTIONAL", "NOTIONAL"}:
+                value = f.get("minNotional", f.get("notional", 0))
+                return float(value or 0)
+        return 0.0
 
     def _round_price(self, api_symbol: str, price: float) -> float:
         info = self._symbol_info.get(api_symbol)

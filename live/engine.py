@@ -44,7 +44,9 @@ class LiveEngine:
         self._futures_client = BinanceFuturesClient(self._config)
         self._market_client = LiveMarketClient()
         self._executor = OrderExecutor(self._futures_client, self._config)
-        self._tracker = PositionTracker(self._futures_client, self._executor)
+        self._tracker = PositionTracker(self._futures_client, self._executor, self._config)
+        self._tracker.load_state()
+        self._tracker.reconcile_with_exchange()
 
         # Setup signal generator
         self._generator.setup(self._market_client)
@@ -63,6 +65,7 @@ class LiveEngine:
             f"LiveEngine started | "
             f"size={self._config.position_size_usdt} USDT | "
             f"max_positions={self._config.max_concurrent_positions} | "
+            f"hold_max={self._config.max_holding_hours}h | "
             f"testnet={self._config.testnet}",
             file=sys.stderr,
         )
@@ -77,6 +80,8 @@ class LiveEngine:
         try:
             self._loop()
         finally:
+            if self._tracker is not None:
+                self._tracker.save_state(force=True)
             self._generator.teardown()
             signal.signal(signal.SIGINT, original_handler)
             print("LiveEngine stopped.", file=sys.stderr)
@@ -94,7 +99,8 @@ class LiveEngine:
             now_utc = self._futures_client.server_now()
 
             # 1. Check for fills on existing positions
-            self._tracker.check_fills()
+            self._tracker.check_fills(now_utc)
+            self._tracker.save_state()
 
             # 2. Pre-poll: capital check at ~xx:59:50
             if self._should_pre_poll(now_utc):
@@ -103,6 +109,7 @@ class LiveEngine:
             # 3. Signal poll: check signals at xx:00:01
             if self._should_signal_poll(now_utc, check_interval):
                 self._do_signal_poll(now_utc)
+                self._tracker.save_state()
 
             # 4. Sleep until next check
             time.sleep(check_interval)
@@ -131,6 +138,7 @@ class LiveEngine:
         assert self._futures_client is not None
         assert self._tracker is not None
 
+        self._tracker.reconcile_with_exchange()
         upcoming_hour = (now_utc.hour + 1) % 24
         self._last_pre_poll_hour = upcoming_hour
 
@@ -175,6 +183,7 @@ class LiveEngine:
         assert self._tracker is not None
         assert self._futures_client is not None
 
+        self._tracker.reconcile_with_exchange()
         current_hour = now_utc.hour
         self._last_signal_poll_hour = current_hour
 
@@ -226,11 +235,25 @@ class LiveEngine:
                 file=sys.stderr,
             )
 
-        random.shuffle(signals)
-        for sig in signals[:max_entries]:
+        executable_signals: list[Signal] = []
+        external_skipped = 0
+        for sig in signals:
+            if self._tracker.has_external_conflict(sig):
+                external_skipped += 1
+                print(
+                    f"  Skipping {sig.ticker}: existing untracked exchange exposure",
+                    file=sys.stderr,
+                )
+                continue
+            executable_signals.append(sig)
+
+        random.shuffle(executable_signals)
+        for sig in executable_signals[:max_entries]:
             self._execute_signal(sig)
 
-        skipped = len(signals) - max_entries
+        skipped = len(executable_signals) - max_entries
+        if external_skipped > 0:
+            print(f"  {external_skipped} signal(s) skipped (untracked exchange exposure)", file=sys.stderr)
         if skipped > 0:
             reason = "no open slots" if affordable >= open_slots else "insufficient capital"
             print(f"  {skipped} signal(s) skipped ({reason})", file=sys.stderr)
@@ -254,6 +277,7 @@ class LiveEngine:
         try:
             position = self._executor.execute_signal(sig)
             self._tracker.add_position(position)
+            self._tracker.save_state()
             print(
                 f"[{position.position_id}] Signal executed: "
                 f"{sig.position_type.value} {sig.ticker} "

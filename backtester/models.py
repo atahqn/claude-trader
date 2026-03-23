@@ -46,6 +46,7 @@ class Signal:
     entry_price: float | None = None
     fill_timeout_seconds: int = 3600
     entry_delay_seconds: int = 5
+    max_holding_hours: int | None = None
 
     metadata: dict = field(default_factory=dict)
 
@@ -54,6 +55,8 @@ class Signal:
             raise ValueError("at least one of tp_pct or tp_price is required")
         if self.sl_pct is None and self.sl_price is None:
             raise ValueError("at least one of sl_pct or sl_price is required")
+        if self.max_holding_hours is not None and self.max_holding_hours <= 0:
+            raise ValueError("max_holding_hours must be positive when set")
 
 
 @dataclass(slots=True, frozen=True)

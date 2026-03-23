@@ -3,7 +3,7 @@ from __future__ import annotations
 import random as _random_module
 from collections import Counter
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from itertools import groupby
 from typing import Any
 
@@ -20,6 +20,56 @@ from .models import (
     TradeResult,
 )
 from .resolver import compute_pnl, compute_tp_sl_prices, resolve_exit
+
+
+def _effective_max_holding_hours(signal: Signal, default_hours: int) -> int:
+    holding_hours = signal.max_holding_hours if signal.max_holding_hours is not None else default_hours
+    if holding_hours <= 0:
+        raise ValueError("max holding hours must be positive")
+    return holding_hours
+
+
+def _resolve_timeout_exit(
+    signal: Signal,
+    client: BinanceClient,
+    timeout_time: datetime,
+    entry_price: float,
+) -> tuple[float, datetime, ResolutionLevel]:
+    """Approximate a live timeout close using the first trade after the deadline."""
+    ticker = signal.ticker
+
+    timeout_trades = client.fetch_agg_trades(
+        ticker,
+        timeout_time,
+        timeout_time + timedelta(minutes=5),
+    )
+    first_trade = next((t for t in timeout_trades if t.timestamp >= timeout_time), None)
+    if first_trade is not None:
+        return first_trade.price, first_trade.timestamp, ResolutionLevel.TRADE
+
+    minute_start = timeout_time.replace(second=0, microsecond=0)
+    minute_candles = client.fetch_klines(
+        ticker,
+        "1m",
+        minute_start,
+        minute_start + timedelta(minutes=2),
+    )
+    minute_candle = next((c for c in minute_candles if c.close_time >= timeout_time), None)
+    if minute_candle is not None:
+        return minute_candle.close, minute_candle.close_time, ResolutionLevel.MINUTE
+
+    hour_start = timeout_time.replace(minute=0, second=0, microsecond=0)
+    hour_candles = client.fetch_klines(
+        ticker,
+        "1h",
+        hour_start,
+        hour_start + timedelta(hours=2),
+    )
+    hour_candle = next((c for c in hour_candles if c.close_time >= timeout_time), None)
+    if hour_candle is not None:
+        return hour_candle.close, hour_candle.close_time, ResolutionLevel.HOUR
+
+    return entry_price, timeout_time, ResolutionLevel.TRADE
 
 
 def backtest_signal(
@@ -86,7 +136,8 @@ def backtest_signal(
     )
 
     # ----- Step 3: Fetch 1h candles for resolution window -----
-    resolution_end = entry_time + timedelta(hours=max_hours)
+    holding_hours = _effective_max_holding_hours(signal, max_hours)
+    resolution_end = entry_time + timedelta(hours=holding_hours)
     hour_candles = client.fetch_klines(ticker, "1h", entry_time, resolution_end)
 
     # ----- Step 4: Resolve exit (3-level hierarchy) -----
@@ -104,6 +155,7 @@ def backtest_signal(
         entry_time,
         minute_fetcher,
         agg_trade_fetcher,
+        end_time=resolution_end,
     )
 
     # ----- Step 5: Build result -----
@@ -115,13 +167,12 @@ def backtest_signal(
     else:
         # Timeout: no exit within max_hours
         exit_reason = ExitReason.TIMEOUT
-        if hour_candles:
-            exit_price = hour_candles[-1].close
-            exit_time = hour_candles[-1].close_time
-        else:
-            exit_price = entry_price
-            exit_time = resolution_end
-        resolution_level = ResolutionLevel.HOUR
+        exit_price, exit_time, resolution_level = _resolve_timeout_exit(
+            signal,
+            client,
+            resolution_end,
+            entry_price,
+        )
 
     net_pnl, gross_pnl, fee_drag = compute_pnl(
         entry_price, exit_price, signal.position_type,

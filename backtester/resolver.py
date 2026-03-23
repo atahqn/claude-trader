@@ -133,6 +133,7 @@ def resolve_exit(
     entry_time: datetime,
     minute_fetcher: MinuteFetcher,
     agg_trade_fetcher: AggTradeFetcher,
+    end_time: datetime | None = None,
 ) -> ExitResolution | None:
     """3-level hierarchical exit resolution: HOUR -> MINUTE -> TRADE.
 
@@ -157,10 +158,19 @@ def resolve_exit(
     if first_hour_result is not None:
         return first_hour_result
 
+    if end_time is not None and end_time <= first_hour_end:
+        return None
+
     # --- Subsequent hours ---
+    final_hour_start = (
+        end_time.replace(minute=0, second=0, microsecond=0)
+        if end_time is not None else None
+    )
     for candle in hour_candles:
         if candle.open_time < first_hour_end:
             continue
+        if final_hour_start is not None and candle.open_time >= final_hour_start:
+            break
         outcome = barrier_outcome(candle, position_type, tp_price, sl_price)
         if outcome == ExitReason.TIMEOUT:
             # Neither barrier hit this hour
@@ -176,6 +186,19 @@ def resolve_exit(
         )
         if nested is not None:
             return nested
+
+    if end_time is not None and final_hour_start is not None and end_time > final_hour_start:
+        trailing = _resolve_partial_interval(
+            final_hour_start,
+            end_time,
+            position_type,
+            tp_price,
+            sl_price,
+            minute_fetcher,
+            agg_trade_fetcher,
+        )
+        if trailing is not None:
+            return trailing
 
     return None
 
@@ -225,6 +248,37 @@ def _resolve_candles_minute(
             return nested
         # Fallback: SL at minute close
         return ExitResolution(ExitReason.SL, candle.close_time, sl_price, ResolutionLevel.MINUTE)
+    return None
+
+
+def _resolve_partial_interval(
+    start_time: datetime,
+    end_time: datetime,
+    position_type: PositionType,
+    tp_price: float,
+    sl_price: float,
+    minute_fetcher: MinuteFetcher,
+    agg_trade_fetcher: AggTradeFetcher,
+) -> ExitResolution | None:
+    """Resolve a trailing partial-hour interval without looking past *end_time*."""
+    if start_time >= end_time:
+        return None
+
+    full_minute_end = end_time.replace(second=0, microsecond=0)
+    if start_time < full_minute_end:
+        minutes = minute_fetcher(start_time, full_minute_end)
+        nested = _resolve_candles_minute(
+            minutes, position_type, tp_price, sl_price, agg_trade_fetcher,
+        )
+        if nested is not None:
+            return nested
+
+    if full_minute_end < end_time:
+        trades = agg_trade_fetcher(full_minute_end, end_time)
+        return resolve_with_agg_trades(
+            trades, position_type, tp_price, sl_price, full_minute_end,
+        )
+
     return None
 
 

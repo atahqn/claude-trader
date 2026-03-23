@@ -9,7 +9,8 @@ Configuration via --config, env vars, or ~/.claude_trader/live_config.json:
     BINANCE_TESTNET=true            (use testnet)
     BINANCE_POSITION_SIZE=100       (USDT per trade)
     BINANCE_MAX_POSITIONS=3         (concurrent positions)
-    BINANCE_POLL_INTERVAL=60        (seconds between signal checks)
+    BINANCE_MAX_HOLDING_HOURS=168   (max holding time per trade)
+    BINANCE_ORDER_CHECK_INTERVAL=5  (seconds between engine checks)
 """
 
 import argparse
@@ -29,7 +30,7 @@ def main() -> None:
     parser.add_argument("--leverage", type=float, default=1.0, help="Leverage multiplier (default: 1)")
     parser.add_argument("--size", type=float, default=None, help="Position size in USDT (overrides config)")
     parser.add_argument("--max-positions", type=int, default=None, help="Max concurrent positions (overrides config)")
-    parser.add_argument("--poll-interval", type=float, default=60.0, help="Seconds between polls (default: 60)")
+    parser.add_argument("--max-holding-hours", type=int, default=None, help="Max holding time per trade (overrides config)")
     args = parser.parse_args()
 
     # Load base config from an explicit file or the default env/file lookup.
@@ -43,8 +44,8 @@ def main() -> None:
         overrides["position_size_usdt"] = args.size
     if args.max_positions is not None:
         overrides["max_concurrent_positions"] = args.max_positions
-    if args.poll_interval != 60.0:
-        overrides["poll_interval_seconds"] = args.poll_interval
+    if args.max_holding_hours is not None:
+        overrides["max_holding_hours"] = args.max_holding_hours
 
     if overrides:
         config = LiveConfig(
@@ -53,7 +54,7 @@ def main() -> None:
             base_url=config.base_url,
             position_size_usdt=overrides.get("position_size_usdt", config.position_size_usdt),
             max_concurrent_positions=overrides.get("max_concurrent_positions", config.max_concurrent_positions),
-            poll_interval_seconds=overrides.get("poll_interval_seconds", config.poll_interval_seconds),
+            max_holding_hours=overrides.get("max_holding_hours", config.max_holding_hours),
             order_check_interval_seconds=config.order_check_interval_seconds,
             testnet=overrides.get("testnet", config.testnet),
         )
@@ -69,7 +70,8 @@ def main() -> None:
         f"  Leverage: {args.leverage}x\n"
         f"  Size:     {config.position_size_usdt} USDT\n"
         f"  Max pos:  {config.max_concurrent_positions}\n"
-        f"  Poll:     {config.poll_interval_seconds}s\n"
+        f"  Hold max: {config.max_holding_hours}h\n"
+        f"  Checks:   {config.order_check_interval_seconds}s\n"
         f"  Testnet:  {config.testnet}\n",
         file=sys.stderr,
     )
