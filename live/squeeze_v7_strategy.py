@@ -1,42 +1,28 @@
-"""Live signal generator: Squeeze V6 Strategy (SHORT + LONG).
+"""Live signal generator: Squeeze V7 Strategy (SHORT + LONG).
 
-Extends V5 by adding squeeze LONG signals in strong bull markets.
+Identical to V6 except LONG TP/SL widened from 3.0/1.5 to 4.0/2.0.
+Wider stops in bull markets prevent premature stop-outs on normal pullbacks
+and let winners run further. Trade WR increases from 59% to 63%.
 
 Architecture:
   Two sub-signals from the SAME structural event (BB/KC squeeze release):
 
-  1. SQUEEZE SHORT (unchanged from V5):
+  1. SQUEEZE SHORT (unchanged from V5/V6):
     - 7+ bar compression, release with negative momentum
     - RSI >= 30 (not oversold), ATR ratio <= 1.3
     - TP: 2.0%, SL: 1.0%, Cooldown: 12h
 
-  2. SQUEEZE LONG (new in V6):
+  2. SQUEEZE LONG (V7: wider TP/SL):
     - 7+ bar compression, release with POSITIVE momentum
     - ret_72h >= 6% (STRONG BULL regime only)
     - RSI <= 70 (not overbought), ATR ratio <= 1.3
-    - TP: 3.0%, SL: 1.5%, Cooldown: 12h
-    - Wider TP captures larger upward moves in bull trends
-
-  The LONG signal uses a strict bull regime gate because squeeze upward
-  expansions are only reliable in clear uptrends. Without the gate,
-  squeeze LONG loses money (tested: -15.53% across 31 weeks).
+    - TP: 4.0%, SL: 2.0%, Cooldown: 12h  ← changed from V6 (3.0/1.5)
 
   VALIDATION (31 1-week windows, Apr 2024 — Mar 2026):
-    V6 combined (CB_R6T30):
-      Weekly win rate: 74% (23/31)
-      Total PNL: +98.27%
-      Worst week: -8.00%
-      Trades: 185 (153 SHORT + 32 LONG)
-
-    vs V5 SHORT-only:
-      Weekly win rate: 71% (22/31) → 74% (+3pp)
-      Total PNL: +69.04% → +98.27% (+42%)
-      SHORT PNL: +69.04% (unchanged)
-      LONG PNL: +29.23% (new)
-      LONG trade win rate: 59.4%
-
-  V6 LONG-only (R6_T30):
-    PNL: +29.23%, Trade WR: 59.4%, Worst week: -3.0%, 32 trades
+    V7 (SH_T40):
+      All 31 windows: +111.40% PNL, 77.4% WkWR (24/31), worst -9.00%
+      Holdout (7 unseen windows): +32.03% PNL, 85.7% WkWR (6/7), worst -3.85%
+      vs V6: +98.27% → +111.40% (+13% improvement)
 
 Look-ahead bias prevention:
   - All signals fire at candle close_time (end of candle period)
@@ -143,24 +129,25 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-class SqueezeV6Strategy(SignalGenerator):
-    """Squeeze V6: SHORT + LONG live signal generator.
+class SqueezeV7Strategy(SignalGenerator):
+    """Squeeze V7: SHORT + LONG live signal generator.
 
     SHORT: squeeze breakout with negative momentum (all regimes)
     LONG:  squeeze breakout with positive momentum (bull regime only, ret_72h >= 6%)
+           TP/SL widened to 4.0/2.0 (from V6's 3.0/1.5)
     """
 
     def __init__(
         self,
         leverage: float = 1.0,
-        # SHORT params (V5 unchanged)
+        # SHORT params (unchanged from V5/V6)
         short_tp: float = 2.0,
         short_sl: float = 1.0,
         short_cooldown_h: float = 12.0,
         short_rsi_floor: float = 30.0,
-        # LONG params (new in V6)
-        long_tp: float = 3.0,
-        long_sl: float = 1.5,
+        # LONG params (V7: wider TP/SL)
+        long_tp: float = 4.0,
+        long_sl: float = 2.0,
         long_cooldown_h: float = 12.0,
         long_rsi_cap: float = 70.0,
         long_regime_min: float = 6.0,
@@ -188,7 +175,7 @@ class SqueezeV6Strategy(SignalGenerator):
     def setup(self, client: LiveMarketClient) -> None:
         self._client = client
         print(
-            f"SqueezeV6 initialized | "
+            f"SqueezeV7 initialized | "
             f"symbols={len(SYMBOLS)} | leverage={self.leverage}x | "
             f"SHORT TP/SL={self.short_tp}/{self.short_sl}% "
             f"CD={self.short_cooldown_h}h RSI>={self.short_rsi_floor} | "
@@ -285,7 +272,7 @@ class SqueezeV6Strategy(SignalGenerator):
                 market_type=MarketType.FUTURES,
                 taker_fee_rate=0.0005,
                 metadata={
-                    "strategy": "squeeze_v6_short",
+                    "strategy": "squeeze_v7_short",
                     "mom": round(float(mom), 6),
                     "rsi": round(float(rsi), 1),
                     "atr_ratio": round(float(atr_ratio), 2),
@@ -310,7 +297,7 @@ class SqueezeV6Strategy(SignalGenerator):
                 market_type=MarketType.FUTURES,
                 taker_fee_rate=0.0005,
                 metadata={
-                    "strategy": "squeeze_v6_long",
+                    "strategy": "squeeze_v7_long",
                     "mom": round(float(mom), 6),
                     "rsi": round(float(rsi), 1),
                     "atr_ratio": round(float(atr_ratio), 2),

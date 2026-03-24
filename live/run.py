@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""Run the V5 Squeeze-Only strategy live.
+"""Run the current live trading strategy.
 
 Usage:
-    python -m live.run_squeeze_v5 [--config PATH] [--testnet] [--leverage N] [--size USDT]
+    python -m live.run [--config PATH] [--testnet] [--leverage N] [--size USDT]
 
-Configuration via --config, env vars, or ~/.claude_trader/live_config.json:
-    BINANCE_API_KEY, BINANCE_API_SECRET (required)
-    BINANCE_TESTNET=true            (use testnet)
-    BINANCE_POSITION_SIZE=100       (USDT per trade)
-    BINANCE_MAX_POSITIONS=3         (concurrent positions)
-    BINANCE_MAX_HOLDING_HOURS=168   (max holding time per trade)
-    BINANCE_ORDER_CHECK_INTERVAL=5  (seconds between engine checks)
+Current strategy: Squeeze V7 (SHORT + LONG, wider LONG stops)
 """
 
 import argparse
@@ -20,11 +14,11 @@ sys.path.insert(0, "/home/caner/claude_trader")
 
 from live.engine import LiveEngine
 from live.models import LiveConfig
-from live.squeeze_v5_strategy import SqueezeV5Strategy
+from live.squeeze_v7_strategy import SqueezeV7Strategy
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Squeeze V5 - Live Trader")
+    parser = argparse.ArgumentParser(description="Live Trader — Squeeze V7")
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
     parser.add_argument("--testnet", action="store_true", help="Use Binance testnet")
     parser.add_argument("--leverage", type=float, default=1.0, help="Leverage multiplier (default: 1)")
@@ -57,14 +51,15 @@ def main() -> None:
             testnet=overrides.get("testnet", config.testnet),
         )
 
-    strategy = SqueezeV5Strategy(leverage=args.leverage)
+    strategy = SqueezeV7Strategy(leverage=args.leverage)
     engine = LiveEngine(generator=strategy, config=config)
 
     print(
-        f"Starting Squeeze V5 Strategy\n"
-        f"  Strategy: Squeeze SHORT-only (7+ bars, RSI>=30, ATR_ratio<=1.3)\n"
-        f"  TP/SL:    2.0% / 1.0% (2:1 RR)\n"
-        f"  Cooldown: 12h per symbol\n"
+        f"Starting Squeeze V7 Strategy\n"
+        f"  Strategy: Squeeze SHORT + LONG\n"
+        f"  SHORT:    TP/SL=2.0/1.0% (all regimes, mom<0, RSI>=30)\n"
+        f"  LONG:     TP/SL=4.0/2.0% (bull only: ret_72h>=6%, mom>0, RSI<=70)\n"
+        f"  Shared:   min_squeeze=7 bars, ATR_ratio<=1.3, cooldown=12h\n"
         f"  Leverage: {args.leverage}x\n"
         f"  Size:     {config.position_size_usdt} USDT\n"
         f"  Max pos:  {config.max_concurrent_positions}\n"
