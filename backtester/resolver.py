@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random as _random_module
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
@@ -123,6 +124,7 @@ def resolve_with_agg_trades(
 # Type aliases for fetcher callbacks
 MinuteFetcher = Callable[[datetime, datetime], list[Candle]]
 AggTradeFetcher = Callable[[datetime, datetime], list[AggTrade]]
+ApproximationLogger = Callable[[str], None]
 
 
 def resolve_exit(
@@ -134,11 +136,27 @@ def resolve_exit(
     minute_fetcher: MinuteFetcher,
     agg_trade_fetcher: AggTradeFetcher,
     end_time: datetime | None = None,
+    approximate: bool = False,
+    rng: _random_module.Random | None = None,
+    logger: ApproximationLogger | None = None,
 ) -> ExitResolution | None:
     """3-level hierarchical exit resolution: HOUR -> MINUTE -> TRADE.
 
     Ported from kriptistan execution.py resolve_exit_hierarchical.
     """
+    if approximate:
+        return resolve_exit_approximate(
+            hour_candles,
+            position_type,
+            tp_price,
+            sl_price,
+            entry_time,
+            minute_fetcher,
+            end_time=end_time,
+            rng=rng,
+            logger=logger,
+        )
+
     # --- First hour: entry may be mid-hour, protect partial minute with trades ---
     first_hour_end = entry_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
@@ -203,6 +221,90 @@ def resolve_exit(
     return None
 
 
+def resolve_exit_approximate(
+    hour_candles: list[Candle],
+    position_type: PositionType,
+    tp_price: float,
+    sl_price: float,
+    entry_time: datetime,
+    minute_fetcher: MinuteFetcher,
+    end_time: datetime | None = None,
+    rng: _random_module.Random | None = None,
+    logger: ApproximationLogger | None = None,
+) -> ExitResolution | None:
+    """Approximate exit resolution using hour/minute candles only.
+
+    Ambiguous minute candles are resolved randomly because aggTrades are disabled.
+    """
+    if rng is None:
+        rng = _random_module.Random()
+    if logger is None:
+        logger = print
+
+    first_hour_end = entry_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    entry_minute_start = entry_time.replace(second=0, microsecond=0)
+
+    same_hour_minutes = minute_fetcher(entry_minute_start, first_hour_end)
+    first_hour_result = _resolve_hour_interval_approximate(
+        same_hour_minutes,
+        position_type,
+        tp_price,
+        sl_price,
+        first_hour_end,
+        rng,
+        logger,
+    )
+    if first_hour_result is not None:
+        return first_hour_result
+
+    if end_time is not None and end_time <= first_hour_end:
+        return None
+
+    final_hour_start = (
+        end_time.replace(minute=0, second=0, microsecond=0)
+        if end_time is not None else None
+    )
+    for candle in hour_candles:
+        if candle.open_time < first_hour_end:
+            continue
+        if final_hour_start is not None and candle.open_time >= final_hour_start:
+            break
+        outcome = barrier_outcome(candle, position_type, tp_price, sl_price)
+        if outcome == ExitReason.TIMEOUT:
+            continue
+        if outcome in (ExitReason.TP, ExitReason.SL):
+            exit_price = tp_price if outcome is ExitReason.TP else sl_price
+            return ExitResolution(outcome, candle.close_time, exit_price, ResolutionLevel.HOUR)
+
+        hour_minutes = minute_fetcher(candle.open_time, candle.close_time)
+        nested = _resolve_candles_minute_approximate(
+            hour_minutes,
+            position_type,
+            tp_price,
+            sl_price,
+            rng,
+            logger,
+        )
+        if nested is not None:
+            return nested
+
+    if end_time is not None and final_hour_start is not None and end_time > final_hour_start:
+        trailing = _resolve_partial_interval_approximate(
+            final_hour_start,
+            end_time,
+            position_type,
+            tp_price,
+            sl_price,
+            minute_fetcher,
+            rng,
+            logger,
+        )
+        if trailing is not None:
+            return trailing
+
+    return None
+
+
 def _resolve_hour_interval(
     candles: list[Candle],
     position_type: PositionType,
@@ -251,6 +353,62 @@ def _resolve_candles_minute(
     return None
 
 
+def _resolve_hour_interval_approximate(
+    candles: list[Candle],
+    position_type: PositionType,
+    tp_price: float,
+    sl_price: float,
+    close_time: datetime,
+    rng: _random_module.Random,
+    logger: ApproximationLogger,
+) -> ExitResolution | None:
+    """Resolve an interval of minute candles without trade-level data."""
+    outcome = _barrier_outcome_for_candles(candles, position_type, tp_price, sl_price)
+    if outcome == ExitReason.TIMEOUT:
+        return None
+    if outcome in (ExitReason.TP, ExitReason.SL):
+        exit_price = tp_price if outcome is ExitReason.TP else sl_price
+        return ExitResolution(outcome, close_time, exit_price, ResolutionLevel.HOUR)
+    nested = _resolve_candles_minute_approximate(
+        candles,
+        position_type,
+        tp_price,
+        sl_price,
+        rng,
+        logger,
+    )
+    if nested is not None:
+        return nested
+    return ExitResolution(ExitReason.SL, close_time, sl_price, ResolutionLevel.HOUR)
+
+
+def _resolve_candles_minute_approximate(
+    candles: list[Candle],
+    position_type: PositionType,
+    tp_price: float,
+    sl_price: float,
+    rng: _random_module.Random,
+    logger: ApproximationLogger,
+) -> ExitResolution | None:
+    """Walk minute candles and randomize when the minute itself is ambiguous."""
+    for candle in candles:
+        outcome = barrier_outcome(candle, position_type, tp_price, sl_price)
+        if outcome == ExitReason.TIMEOUT:
+            continue
+        if outcome in (ExitReason.TP, ExitReason.SL):
+            exit_price = tp_price if outcome is ExitReason.TP else sl_price
+            return ExitResolution(outcome, candle.close_time, exit_price, ResolutionLevel.MINUTE)
+
+        random_outcome = rng.choice([ExitReason.TP, ExitReason.SL])
+        logger(
+            "[approximate] cannot resolve TP/SL within 1 minute without aggTrades; "
+            f"picked {random_outcome.value} randomly for candle ending {candle.close_time.isoformat()}"
+        )
+        exit_price = tp_price if random_outcome is ExitReason.TP else sl_price
+        return ExitResolution(random_outcome, candle.close_time, exit_price, ResolutionLevel.MINUTE)
+    return None
+
+
 def _resolve_partial_interval(
     start_time: datetime,
     end_time: datetime,
@@ -278,6 +436,37 @@ def _resolve_partial_interval(
         return resolve_with_agg_trades(
             trades, position_type, tp_price, sl_price, full_minute_end,
         )
+
+    return None
+
+
+def _resolve_partial_interval_approximate(
+    start_time: datetime,
+    end_time: datetime,
+    position_type: PositionType,
+    tp_price: float,
+    sl_price: float,
+    minute_fetcher: MinuteFetcher,
+    rng: _random_module.Random,
+    logger: ApproximationLogger,
+) -> ExitResolution | None:
+    """Resolve a trailing partial-hour interval without aggTrades."""
+    if start_time >= end_time:
+        return None
+
+    full_minute_end = end_time.replace(second=0, microsecond=0)
+    if start_time < full_minute_end:
+        minutes = minute_fetcher(start_time, full_minute_end)
+        nested = _resolve_candles_minute_approximate(
+            minutes,
+            position_type,
+            tp_price,
+            sl_price,
+            rng,
+            logger,
+        )
+        if nested is not None:
+            return nested
 
     return None
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from marketdata import MarketDataRequest
+
 if TYPE_CHECKING:
     from backtester.models import Signal
 
@@ -22,6 +24,14 @@ class SignalGenerator(ABC):
         Use this to warm up indicators, fetch initial data, etc.
         Override if needed; default is a no-op.
         """
+
+    def market_data_request(self) -> MarketDataRequest:
+        """Declare the datasets this strategy needs.
+
+        The default stays on the current fast path: OHLCV only.
+        Futures-native datasets are opt-in per strategy.
+        """
+        return MarketDataRequest.ohlcv_only()
 
     @abstractmethod
     def poll(self) -> Signal | list[Signal] | None:

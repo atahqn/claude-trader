@@ -31,6 +31,8 @@ _DEFAULT_RETRY_DELAY = 15.0
 _MAX_RETRY_DELAY = 300.0
 _RETRYABLE_STATUS_CODES = {418, 429}
 _RECV_WINDOW = 5000
+_MAX_TIMESTAMP_RETRIES = 1
+_CLOCK_JUMP_THRESHOLD_MS = 1000
 
 
 def _from_millis(ms: int) -> datetime:
@@ -98,7 +100,9 @@ class BinanceFuturesClient:
         self._base_url = config.base_url
         self._rate_limiter = _RateLimiter(limit_per_minute=2400)
         self._time_offset_ms: int = 0
-        self._last_time_sync: float = 0.0
+        self._last_time_sync_monotonic: float = 0.0
+        self._last_sync_wall_ms: int = 0
+        self._last_sync_monotonic_ms: int = 0
         self._sync_server_time()
 
     # -- Time sync -------------------------------------------------------------
@@ -113,7 +117,9 @@ class BinanceFuturesClient:
             local_after = int(time.time() * 1000)
             local_mid = (local_before + local_after) // 2
             self._time_offset_ms = server_time - local_mid
-            self._last_time_sync = time.time()
+            self._last_time_sync_monotonic = time.monotonic()
+            self._last_sync_wall_ms = int(time.time() * 1000)
+            self._last_sync_monotonic_ms = int(time.monotonic() * 1000)
             if abs(self._time_offset_ms) > 500:
                 print(
                     f"Clock offset: {self._time_offset_ms:+d}ms (synced with Binance)",
@@ -122,24 +128,62 @@ class BinanceFuturesClient:
         except Exception as exc:
             print(f"Failed to sync server time: {exc}", file=sys.stderr)
 
+    def _clock_jump_detected(self) -> bool:
+        if self._last_sync_monotonic_ms <= 0:
+            return False
+        wall_delta = int(time.time() * 1000) - self._last_sync_wall_ms
+        monotonic_delta = int(time.monotonic() * 1000) - self._last_sync_monotonic_ms
+        return abs(wall_delta - monotonic_delta) > _CLOCK_JUMP_THRESHOLD_MS
+
+    def _ensure_time_sync(self, *, force: bool = False) -> None:
+        if force or self._last_time_sync_monotonic <= 0:
+            self._sync_server_time()
+            return
+        if time.monotonic() - self._last_time_sync_monotonic > _TIME_SYNC_INTERVAL:
+            self._sync_server_time()
+            return
+        if self._clock_jump_detected():
+            print("Detected local clock jump; re-syncing with Binance.", file=sys.stderr)
+            self._sync_server_time()
+
+    def _timestamp_ms(self) -> int:
+        return int(time.time() * 1000) + self._time_offset_ms
+
     def server_now(self) -> datetime:
         """Return current UTC time corrected for local clock drift."""
-        if time.time() - self._last_time_sync > _TIME_SYNC_INTERVAL:
-            self._sync_server_time()
-        ms = int(time.time() * 1000) + self._time_offset_ms
+        self._ensure_time_sync()
+        ms = self._timestamp_ms()
         return datetime.fromtimestamp(ms / 1000, tz=UTC)
 
     # -- Signing ---------------------------------------------------------------
 
     def _sign(self, params: dict[str, Any]) -> dict[str, Any]:
-        if time.time() - self._last_time_sync > _TIME_SYNC_INTERVAL:
-            self._sync_server_time()
-        params["timestamp"] = int(time.time() * 1000) + self._time_offset_ms
-        params["recvWindow"] = _RECV_WINDOW
-        query = urlencode(params)
+        self._ensure_time_sync()
+        signed_params = dict(params)
+        signed_params["timestamp"] = self._timestamp_ms()
+        signed_params["recvWindow"] = _RECV_WINDOW
+        query = urlencode(signed_params)
         signature = hmac.new(self._api_secret, query.encode(), hashlib.sha256).hexdigest()
-        params["signature"] = signature
-        return params
+        signed_params["signature"] = signature
+        return signed_params
+
+    @staticmethod
+    def _read_error_body(exc: HTTPError) -> tuple[int | None, str]:
+        error_body = ""
+        try:
+            error_body = exc.read().decode()
+        except Exception:
+            return None, error_body
+
+        try:
+            payload = json.loads(error_body)
+        except json.JSONDecodeError:
+            return None, error_body
+
+        code = payload.get("code")
+        if isinstance(code, int):
+            return code, error_body
+        return None, error_body
 
     # -- HTTP ------------------------------------------------------------------
 
@@ -154,39 +198,45 @@ class BinanceFuturesClient:
     ) -> Any:
         if params is None:
             params = {}
-        if signed:
-            params = self._sign(params)
-        query = urlencode(params)
-
-        if method == "GET":
-            url = f"{self._base_url}{path}?{query}"
-            body = None
-        else:
-            url = f"{self._base_url}{path}"
-            body = query.encode()
 
         headers = {"X-MBX-APIKEY": self._api_key}
-        if body is not None:
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
 
         next_delay = _DEFAULT_RETRY_DELAY
         attempt = 1
+        timestamp_retry_count = 0
 
         while True:
+            request_params = self._sign(params) if signed else dict(params)
+            query = urlencode(request_params)
+            if method == "GET":
+                url = f"{self._base_url}{path}?{query}"
+                body = None
+            else:
+                url = f"{self._base_url}{path}"
+                body = query.encode()
+
+            request_headers = dict(headers)
+            if body is not None:
+                request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+
             self._rate_limiter.acquire(weight)
-            req = Request(url, data=body, headers=headers, method=method)
+            req = Request(url, data=body, headers=request_headers, method=method)
             try:
                 with urlopen(req) as response:
                     payload = json.loads(response.read())
                     _sync_rate_limiter(self._rate_limiter, response.headers)
                     return payload
             except HTTPError as exc:
+                error_code, error_body = self._read_error_body(exc)
+                if signed and error_code == -1021 and timestamp_retry_count < _MAX_TIMESTAMP_RETRIES:
+                    timestamp_retry_count += 1
+                    print(
+                        f"Binance rejected timestamp on {path}; re-syncing server time and retrying.",
+                        file=sys.stderr,
+                    )
+                    self._ensure_time_sync(force=True)
+                    continue
                 if exc.code not in _RETRYABLE_STATUS_CODES:
-                    error_body = ""
-                    try:
-                        error_body = exc.read().decode()
-                    except Exception:
-                        pass
                     raise RuntimeError(
                         f"Binance API error {exc.code} on {method} {path}: {error_body}"
                     ) from exc

@@ -12,6 +12,12 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from marketdata.models import (
+    FundingRate,
+    MarketDataBundle,
+    MarketDataRequest,
+)
+
 from .models import AggTrade, Candle, MarketType
 
 _DEFAULT_RETRY_DELAY = 15.0
@@ -113,6 +119,15 @@ def _parse_agg_trade(row: dict[str, Any]) -> AggTrade:
         timestamp=_from_millis(row["T"]),
         price=float(row["p"]),
         quantity=float(row["q"]),
+    )
+
+
+def _parse_funding_rate(row: dict[str, Any]) -> FundingRate:
+    mark_price_raw = row.get("markPrice")
+    return FundingRate(
+        timestamp=_from_millis(int(row["fundingTime"])),
+        funding_rate=float(row["fundingRate"]),
+        mark_price=float(mark_price_raw) if mark_price_raw not in (None, "") else None,
     )
 
 
@@ -270,7 +285,161 @@ class BinanceClient:
 
         return all_trades
 
+    def fetch_funding_rates(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[FundingRate]:
+        self._require_futures_dataset("funding rates")
+        return self._fetch_timeseries(
+            path="/fapi/v1/fundingRate",
+            params={"symbol": _symbol_for_api(symbol)},
+            start=start,
+            end=end,
+            limit=1000,
+            time_field="fundingTime",
+            weight=1,
+            parser=_parse_funding_rate,
+        )
+
+    def fetch_mark_price_klines(
+        self,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[Candle]:
+        self._require_futures_dataset("mark price klines")
+        return self._fetch_kline_series(
+            path="/fapi/v1/markPriceKlines",
+            symbol=symbol,
+            interval=interval,
+            start=start,
+            end=end,
+            weight=1,
+        )
+
+    def fetch_premium_index_klines(
+        self,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[Candle]:
+        self._require_futures_dataset("premium index klines")
+        return self._fetch_kline_series(
+            path="/fapi/v1/premiumIndexKlines",
+            symbol=symbol,
+            interval=interval,
+            start=start,
+            end=end,
+            weight=1,
+        )
+
+    def fetch_market_data_bundle(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        request: MarketDataRequest,
+    ) -> MarketDataBundle:
+        from marketdata.bundle import build_market_data_bundle
+
+        return build_market_data_bundle(self, symbols, start, end, request)
+
+    def fetch_market_context_bundle(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        request: MarketDataRequest,
+    ):
+        from marketdata.context import fetch_market_context_bundle
+
+        return fetch_market_context_bundle(self, symbols, start, end, request)
+
     # -- Internal ------------------------------------------------------------
+
+    def _require_futures_dataset(self, label: str) -> None:
+        if self.market_type is not MarketType.FUTURES:
+            raise ValueError(f"{label} are only available for Binance futures")
+
+    def _fetch_kline_series(
+        self,
+        *,
+        path: str,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        weight: int,
+    ) -> list[Candle]:
+        api_symbol = _symbol_for_api(symbol)
+        batch_limit = 1500
+        all_candles: list[Candle] = []
+        cursor_ms = _to_millis(start)
+        end_ms = _to_millis(end)
+
+        while cursor_ms < end_ms:
+            params: dict[str, Any] = {
+                "symbol": api_symbol,
+                "interval": interval,
+                "limit": batch_limit,
+                "startTime": cursor_ms,
+                "endTime": end_ms,
+            }
+            payload = self._get_json(path, params, weight=weight)
+            if not payload:
+                break
+            batch = [_parse_kline(row) for row in payload]
+            all_candles.extend(batch)
+            if len(batch) < batch_limit:
+                break
+            cursor_ms = _to_millis(batch[-1].open_time) + 1
+
+        return all_candles
+
+    def _fetch_timeseries(
+        self,
+        *,
+        path: str,
+        params: dict[str, Any],
+        start: datetime,
+        end: datetime,
+        limit: int,
+        time_field: str,
+        weight: int,
+        parser: Any,
+    ) -> list[Any]:
+        rows: list[Any] = []
+        cursor_ms = _to_millis(start)
+        end_ms = _to_millis(end)
+
+        while cursor_ms < end_ms:
+            request_params = dict(params)
+            request_params["startTime"] = cursor_ms
+            request_params["endTime"] = end_ms
+            request_params["limit"] = limit
+            payload = self._get_json(path, request_params, weight=weight)
+            if not payload:
+                break
+
+            last_ms: int | None = None
+            for raw in payload:
+                raw_ms = int(raw[time_field])
+                if raw_ms < cursor_ms:
+                    continue
+                if raw_ms >= end_ms:
+                    continue
+                rows.append(parser(raw))
+                last_ms = raw_ms
+
+            if len(payload) < limit or last_ms is None:
+                break
+            cursor_ms = last_ms + 1
+
+        return rows
 
     def _get_json(self, path: str, params: dict[str, Any], *, weight: int) -> Any:
         # In-memory cache

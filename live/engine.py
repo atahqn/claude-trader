@@ -11,9 +11,11 @@ from backtester.models import Signal
 
 from .auth_client import BinanceFuturesClient, LiveMarketClient
 from .executor import OrderExecutor
-from .models import LiveConfig
+from .models import LiveConfig, PositionStatus
 from .signal_generator import SignalGenerator
 from .tracker import PositionTracker
+
+_INTENSIVE_POLL_LEAD_SECONDS = 120.0
 
 
 class LiveEngine:
@@ -48,6 +50,8 @@ class LiveEngine:
         self._tracker.load_state()
         self._tracker.reconcile_with_exchange()
 
+        market_request = self._generator.market_data_request()
+
         # Setup signal generator
         self._generator.setup(self._market_client)
 
@@ -66,6 +70,7 @@ class LiveEngine:
             f"size={self._config.position_size_usdt} USDT | "
             f"max_positions={self._config.max_concurrent_positions} | "
             f"hold_max={self._config.max_holding_hours}h | "
+            f"market_data={','.join(sorted(req.value for req in market_request.datasets))} | "
             f"testnet={self._config.testnet}",
             file=sys.stderr,
         )
@@ -112,7 +117,7 @@ class LiveEngine:
                 self._tracker.save_state()
 
             # 4. Sleep until next check
-            time.sleep(check_interval)
+            time.sleep(self._sleep_interval_seconds(now_utc, check_interval))
 
     # -- Two-phase hourly polling ----------------------------------------------
 
@@ -132,6 +137,30 @@ class LiveEngine:
             if self._last_signal_poll_hour != current_hour:
                 return True
         return False
+
+    def _has_local_active_positions(self) -> bool:
+        assert self._tracker is not None
+        return any(
+            pos.status in (PositionStatus.PENDING_ENTRY, PositionStatus.OPEN)
+            for pos in self._tracker.positions
+        )
+
+    def _sleep_interval_seconds(self, now_utc: datetime, check_interval: float) -> float:
+        """Use coarse idle polling until the last 2 minutes before candle close."""
+        if self._has_local_active_positions():
+            return check_interval
+
+        seconds_past_hour = (
+            now_utc.minute * 60
+            + now_utc.second
+            + now_utc.microsecond / 1_000_000
+        )
+        seconds_until_hour = max(0.0, 3600.0 - seconds_past_hour)
+        if seconds_until_hour <= _INTENSIVE_POLL_LEAD_SECONDS:
+            return check_interval
+
+        coarse_sleep = seconds_until_hour - _INTENSIVE_POLL_LEAD_SECONDS
+        return max(check_interval, coarse_sleep)
 
     def _do_pre_poll(self, now_utc: datetime) -> None:
         """Check available capital before the hourly candle close."""
