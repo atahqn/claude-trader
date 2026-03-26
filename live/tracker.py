@@ -24,6 +24,7 @@ from .models import (
 
 _STATE_DIR = Path.home() / ".claude_trader"
 _STATE_PATH = _STATE_DIR / "live_state.json"
+_POSITION_AMOUNT_EPSILON = 0.5
 
 
 class PositionTracker:
@@ -187,7 +188,7 @@ class PositionTracker:
                 amount = float(row.get("positionAmt", 0))
             except (TypeError, ValueError):
                 continue
-            if abs(amount) <= 0:
+            if abs(amount) <= _POSITION_AMOUNT_EPSILON:
                 continue
             side = str(row.get("positionSide", "BOTH"))
             if side not in {"LONG", "SHORT"}:
@@ -213,9 +214,77 @@ class PositionTracker:
         except Exception:
             pass  # may already be canceled
 
+    @staticmethod
+    def _position_side(pos: LivePosition) -> str:
+        return "LONG" if pos.signal.position_type is PositionType.LONG else "SHORT"
+
+    def _has_open_exchange_position(self, pos: LivePosition) -> bool | None:
+        """Return whether the exchange still reports an open position for *pos*."""
+        try:
+            raw_positions = self._client.get_position_info(pos.signal.ticker)
+        except Exception as exc:
+            print(
+                f"[{pos.position_id}] Failed to query exchange position: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+        api_symbol = _symbol_for_api(pos.signal.ticker)
+        target_side = self._position_side(pos)
+        for row in raw_positions:
+            if str(row.get("symbol", "")) != api_symbol:
+                continue
+            try:
+                amount = float(row.get("positionAmt", 0))
+            except (TypeError, ValueError):
+                continue
+            if abs(amount) <= _POSITION_AMOUNT_EPSILON:
+                continue
+
+            side = str(row.get("positionSide", "BOTH"))
+            if side in {"LONG", "SHORT"}:
+                if side == target_side:
+                    return True
+                continue
+            if target_side == "LONG" and amount > _POSITION_AMOUNT_EPSILON:
+                return True
+            if target_side == "SHORT" and amount < -_POSITION_AMOUNT_EPSILON:
+                return True
+
+        return False
+
+    @staticmethod
+    def _infer_exchange_exit(pos: LivePosition) -> tuple[str, ExchangeOrder | None]:
+        canceled_statuses = {
+            OrderStatus.CANCELED,
+            OrderStatus.EXPIRED,
+            OrderStatus.REJECTED,
+        }
+        tp_canceled = (
+            pos.tp_order is not None
+            and pos.tp_order.status in canceled_statuses
+        )
+        sl_canceled = (
+            pos.sl_order is not None
+            and pos.sl_order.status in canceled_statuses
+        )
+
+        if tp_canceled and sl_canceled:
+            return "EXTERNAL", None
+        if sl_canceled and pos.tp_order is not None:
+            return "TP", pos.tp_order
+        if tp_canceled and pos.sl_order is not None:
+            return "SL", pos.sl_order
+        if pos.tp_order is not None and pos.tp_order.avg_fill_price > 0:
+            return "TP", pos.tp_order
+        if pos.sl_order is not None and pos.sl_order.avg_fill_price > 0:
+            return "SL", pos.sl_order
+        return "EXTERNAL", pos.tp_order or pos.sl_order
+
     def _check_exit_fills(self, pos: LivePosition, now_utc: datetime) -> bool | None:
         tp_filled = False
         sl_filled = False
+        query_failed = False
 
         if pos.tp_order is not None:
             try:
@@ -227,7 +296,7 @@ class PositionTracker:
                     f"[{pos.position_id}] Failed to query TP order: {exc}",
                     file=sys.stderr,
                 )
-                return None
+                query_failed = True
 
         if pos.sl_order is not None:
             try:
@@ -239,22 +308,31 @@ class PositionTracker:
                     f"[{pos.position_id}] Failed to query SL order: {exc}",
                     file=sys.stderr,
                 )
-                return None
+                query_failed = True
 
-        if not tp_filled and not sl_filled:
-            return False
+        if tp_filled or sl_filled:
+            # One side filled — cancel the other
+            if tp_filled and pos.sl_order is not None and pos.sl_order.status is OrderStatus.NEW:
+                self._cancel_order_safe(pos.signal.ticker, pos.sl_order)
 
-        # One side filled — cancel the other
-        if tp_filled and pos.sl_order is not None and pos.sl_order.status is OrderStatus.NEW:
-            self._cancel_order_safe(pos.signal.ticker, pos.sl_order)
+            if sl_filled and pos.tp_order is not None and pos.tp_order.status is OrderStatus.NEW:
+                self._cancel_order_safe(pos.signal.ticker, pos.tp_order)
 
-        if sl_filled and pos.tp_order is not None and pos.tp_order.status is OrderStatus.NEW:
-            self._cancel_order_safe(pos.signal.ticker, pos.tp_order)
+            exit_reason = "TP" if tp_filled else "SL"
+            exit_order = pos.tp_order if tp_filled else pos.sl_order
+            self._finalize_close(pos, exit_order, exit_reason, now_utc)
+            return True
 
-        exit_reason = "TP" if tp_filled else "SL"
-        exit_order = pos.tp_order if tp_filled else pos.sl_order
-        self._finalize_close(pos, exit_order, exit_reason, now_utc)
-        return True
+        exchange_open = self._has_open_exchange_position(pos)
+        if exchange_open is False:
+            exit_reason, exit_order = self._infer_exchange_exit(pos)
+            self._finalize_close(pos, exit_order, exit_reason, now_utc)
+            return True
+
+        if query_failed or exchange_open is None:
+            return None
+
+        return False
 
     def _check_timeout(self, pos: LivePosition, now_utc: datetime) -> bool:
         if pos.opened_at is None:
