@@ -45,8 +45,10 @@ from .auth_client import LiveMarketClient
 from .signal_generator import SignalGenerator
 
 SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+    "ETH/USDT", "SOL/USDT", "BNB/USDT",
     "XRP/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT",
+    "ENA/USDT", "INJ/USDT", "NEAR/USDT", "ALGO/USDT",
+    "RENDER/USDT", "WIF/USDT", "ADA/USDT", "APT/USDT",
 ]
 
 _LOOKBACK_BARS = 100
