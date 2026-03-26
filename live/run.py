@@ -4,7 +4,7 @@
 Usage:
     python -m live.run [--config PATH] [--testnet] [--leverage N] [--size USDT]
 
-Current strategy: Squeeze V7 (SHORT + LONG, wider LONG stops)
+Current strategy: Squeeze V8 (SHORT + LONG, wider SHORT stops + relaxed filters)
 """
 
 import argparse
@@ -14,11 +14,11 @@ sys.path.insert(0, "/home/caner/claude_trader")
 
 from live.engine import LiveEngine
 from live.models import LiveConfig
-from live.squeeze_v7_strategy import SqueezeV7Strategy
+from live.squeeze_v8_strategy import SqueezeV8Strategy
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Live Trader — Squeeze V7")
+    parser = argparse.ArgumentParser(description="Live Trader — Squeeze V8")
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
     parser.add_argument("--testnet", action="store_true", help="Use Binance testnet")
     parser.add_argument("--leverage", type=float, default=1.0, help="Leverage multiplier (default: 1)")
@@ -51,15 +51,15 @@ def main() -> None:
             testnet=overrides.get("testnet", config.testnet),
         )
 
-    strategy = SqueezeV7Strategy(leverage=args.leverage)
+    strategy = SqueezeV8Strategy(leverage=args.leverage)
     engine = LiveEngine(generator=strategy, config=config)
 
     print(
-        f"Starting Squeeze V7 Strategy\n"
+        f"Starting Squeeze V8 Strategy\n"
         f"  Strategy: Squeeze SHORT + LONG\n"
-        f"  SHORT:    TP/SL=2.0/1.0% (all regimes, mom<0, RSI>=30)\n"
+        f"  SHORT:    TP/SL=3.0/1.5% (all regimes, mom<0, RSI>=25, ATR<=1.5)\n"
         f"  LONG:     TP/SL=4.0/2.0% (bull only: ret_72h>=6%, mom>0, RSI<=70)\n"
-        f"  Shared:   min_squeeze=7 bars, ATR_ratio<=1.3, cooldown=12h\n"
+        f"  Shared:   min_squeeze=7 bars, cooldown=12h\n"
         f"  Leverage: {args.leverage}x\n"
         f"  Size:     {config.position_size_usdt} USDT\n"
         f"  Max pos:  {config.max_concurrent_positions}\n"
