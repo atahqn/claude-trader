@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 import signal
 import sys
@@ -162,6 +163,19 @@ class LiveEngine:
         coarse_sleep = seconds_until_hour - _INTENSIVE_POLL_LEAD_SECONDS
         return max(check_interval, coarse_sleep)
 
+    def _configured_leverage(self) -> float:
+        leverage = getattr(self._generator, "leverage", 1.0)
+        try:
+            leverage = float(leverage)
+        except (TypeError, ValueError):
+            return 1.0
+        return leverage if leverage > 0 else 1.0
+
+    def _effective_buying_power(self, available_balance: float) -> float:
+        leverage = self._configured_leverage()
+        gross_buying_power = max(0.0, available_balance) * leverage
+        return math.floor(gross_buying_power / 100.0) * 100.0
+
     def _do_pre_poll(self, now_utc: datetime) -> None:
         """Check available capital before the hourly candle close."""
         assert self._futures_client is not None
@@ -189,11 +203,17 @@ class LiveEngine:
             balance = self._futures_client.get_available_balance()
             self._pre_poll_balance = balance
             needed = self._config.position_size_usdt
-            print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
-            if balance < needed:
+            buying_power = self._effective_buying_power(balance)
+            print(
+                f"Available balance: {balance:.2f} USDT | "
+                f"Leveraged buying power: {buying_power:.2f} USDT "
+                f"(leverage={self._configured_leverage():.2f}x, rounded down to 100)",
+                file=sys.stderr,
+            )
+            if buying_power + 1e-9 < needed:
                 print(
                     f"Insufficient capital: need {needed:.2f} USDT, "
-                    f"have {balance:.2f} USDT — will skip signal poll",
+                    f"leveraged buying power is {buying_power:.2f} USDT — will skip signal poll",
                     file=sys.stderr,
                 )
             elif open_slots <= 0:
@@ -238,17 +258,24 @@ class LiveEngine:
             except Exception as exc:
                 print(f"Could not fetch balance: {exc} — skipping", file=sys.stderr)
                 return
-        print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
+        buying_power = self._effective_buying_power(balance)
+        print(
+            f"Available balance: {balance:.2f} USDT | "
+            f"Leveraged buying power: {buying_power:.2f} USDT "
+            f"(leverage={self._configured_leverage():.2f}x, rounded down to 100)",
+            file=sys.stderr,
+        )
 
-        if balance < needed:
+        if buying_power + 1e-9 < needed:
             print(
-                f"Insufficient capital: need {needed:.2f} USDT — skipping",
+                f"Insufficient capital: need {needed:.2f} USDT, "
+                f"leveraged buying power is {buying_power:.2f} USDT — skipping",
                 file=sys.stderr,
             )
             return
 
         # Capital can cover at most this many new positions
-        affordable = int(balance // needed)
+        affordable = int(buying_power // needed)
         max_entries = min(open_slots, affordable)
 
         signals = self._poll_generator()
