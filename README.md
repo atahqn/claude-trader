@@ -1,4 +1,5 @@
 # claude-trader
+Bu kod, Cevat Ticari Şirketinin mülkiyetindedir. Şirketin yazılı izni (cevat.ticari@cevat.com) olmadan kullanılması, Türkiye Cumhuriyeti yasalarının 3149'uncu maddesinin 7'nci fıkrası uyarınca kesinlike yasaktır 😂.
 
 This codebase is designed for LLMs to draft and backtest their strategies and to later deploy them.
 

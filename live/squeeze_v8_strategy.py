@@ -44,10 +44,12 @@ from datetime import UTC, datetime, timedelta
 
 import numpy as np
 
+from backtester.indicators import required_warmup
 from backtester.models import Candle, Signal
 from backtester.preview import SourcePeriodGate, floor_boundary, interval_to_seconds
 from backtester.squeeze_signals import emit_squeeze_entry_signals
 from backtester.strategies.squeeze_v7 import (
+    SQUEEZE_V7_FEATURE_COLUMNS,
     _SqueezeV7PreviewState,
     _safe_feature_value,
 )
@@ -63,7 +65,7 @@ SYMBOLS = [
 ]
 
 _LOOKBACK_BARS = 100
-_WARMUP_BARS = 80
+_WARMUP_BARS = required_warmup(SQUEEZE_V7_FEATURE_COLUMNS)
 _SUPPORTED_POLL_INTERVALS = {"1h", "30m", "15m", "5m", "1m"}
 
 
@@ -211,7 +213,12 @@ class SqueezeV8Strategy(SignalGenerator):
                     state.commit(candle)
                     self._last_committed_hour[symbol] = candle_hour
 
-        if state.last_row is None or state.candle_count < _WARMUP_BARS:
+        if state.last_row is None:
+            return []
+        if (
+            state.candle_count < _WARMUP_BARS
+            and (np.isnan(state.last_row.mom_slope) or np.isnan(state.last_row.atr_ratio))
+        ):
             return []
 
         # Get the current candle to evaluate
@@ -307,7 +314,7 @@ class SqueezeV8Strategy(SignalGenerator):
             end=now,
         )
 
-        if len(candles) < _WARMUP_BARS + 1:
+        if len(candles) < _WARMUP_BARS:
             return []
 
         rows = []
@@ -330,7 +337,7 @@ class SqueezeV8Strategy(SignalGenerator):
         last_idx = len(df) - 1
         if df.iloc[last_idx]["close_time"] > now:
             last_idx -= 1
-        if last_idx < _WARMUP_BARS:
+        if last_idx + 1 < _WARMUP_BARS:
             return []
 
         row = df.iloc[last_idx]

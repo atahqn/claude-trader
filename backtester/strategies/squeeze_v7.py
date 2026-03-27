@@ -7,6 +7,13 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from ..indicators import (
+    compute_indicator_frame,
+    compute_rsi_from_ewm_means,
+    linear_regression_slope,
+    required_warmup,
+    true_range_value,
+)
 from ..models import Candle
 from ..preview import SourcePeriodGate, interval_to_seconds, iter_preview_snapshots
 from ..squeeze_signals import emit_squeeze_entry_signals
@@ -36,6 +43,17 @@ SQUEEZE_V7_SYMBOLS = [
 _SUPPORTED_SQUEEZE_INTERVALS = {"1h", "30m", "15m", "5m", "1m"}
 _RSI_ALPHA = 1 / 14
 _EMA20_ALPHA = 2 / 21
+SQUEEZE_V7_FEATURE_COLUMNS = (
+    "rsi_14",
+    "atr_14",
+    "atr_72_avg",
+    "atr_ratio",
+    "ret_72h",
+    "squeeze_on",
+    "squeeze_count",
+    "mom_slope",
+)
+_SQUEEZE_V7_WARMUP_BARS = required_warmup(SQUEEZE_V7_FEATURE_COLUMNS)
 
 
 @dataclass(slots=True, frozen=True)
@@ -58,7 +76,7 @@ class SqueezeV7Config:
     atr_ratio_max: float = 1.3
     taker_fee_rate: float = 0.0005
     market_type: MarketType = MarketType.FUTURES
-    warmup_bars: int = 80
+    warmup_bars: int = _SQUEEZE_V7_WARMUP_BARS
 
     def __post_init__(self) -> None:
         if self.analysis_interval != "1h":
@@ -179,9 +197,9 @@ class _SqueezeV7PreviewState:
                 min_periods=14,
             )
 
-        rsi = _compute_rsi(gain_mean, loss_mean)
+        rsi = compute_rsi_from_ewm_means(gain_mean, loss_mean)
 
-        tr_value = _true_range(candle, prev_close)
+        tr_value = true_range_value(candle.high, candle.low, prev_close)
         atr_14 = np.nan
         if len(self.tr_tail) == 13:
             atr_14 = (sum(self.tr_tail) + tr_value) / 14.0
@@ -207,7 +225,7 @@ class _SqueezeV7PreviewState:
             bb_std = float(np.std(closes_20, ddof=1))
             bb_upper = bb_mean + 2 * bb_std
             bb_lower = bb_mean - 2 * bb_std
-            mom_slope = _linear_slope(closes_20)
+            mom_slope = linear_regression_slope(closes_20)
 
         _ema20, ema_num, ema_den, ema_count = _ewm_next(
             self.ema_num,
@@ -301,98 +319,8 @@ def _ewm_next(
     return mean, next_num, next_den, next_count
 
 
-def _compute_rsi(gain_mean: float, loss_mean: float) -> float:
-    if np.isnan(gain_mean) or np.isnan(loss_mean):
-        return np.nan
-    if loss_mean == 0.0:
-        if gain_mean == 0.0:
-            return np.nan
-        return 100.0
-    rs = gain_mean / loss_mean
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def _true_range(candle: Candle, prev_close: float | None) -> float:
-    if prev_close is None:
-        return candle.high - candle.low
-    return max(
-        candle.high - candle.low,
-        abs(candle.high - prev_close),
-        abs(candle.low - prev_close),
-    )
-
-
-_SLOPE_XS_20 = np.arange(20, dtype=float)
-_SLOPE_XS_20_SUM = float(_SLOPE_XS_20.sum())
-_SLOPE_XS_20_DOT = float(np.dot(_SLOPE_XS_20, _SLOPE_XS_20))
-_SLOPE_DENOM_20 = 20 * _SLOPE_XS_20_DOT - _SLOPE_XS_20_SUM ** 2
-
-
-def _linear_slope(values: list[float]) -> float:
-    count = len(values)
-    if count == 20:
-        ys = np.asarray(values, dtype=float)
-        numerator = 20 * float(np.dot(_SLOPE_XS_20, ys)) - _SLOPE_XS_20_SUM * float(ys.sum())
-        if _SLOPE_DENOM_20 == 0.0:
-            return 0.0
-        return numerator / _SLOPE_DENOM_20
-    xs = np.arange(count, dtype=float)
-    ys = np.asarray(values, dtype=float)
-    numerator = count * float(np.dot(xs, ys)) - float(xs.sum()) * float(ys.sum())
-    denominator = count * float(np.dot(xs, xs)) - float(xs.sum()) ** 2
-    if denominator == 0.0:
-        return 0.0
-    return numerator / denominator
-
 def build_squeeze_v7_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    df = frame.copy()
-    if df.empty:
-        return df
-
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, min_periods=14).mean()
-    loss = (-delta).clip(lower=0).ewm(alpha=1 / 14, min_periods=14).mean()
-    df["rsi_14"] = 100 - (100 / (1 + gain / loss))
-
-    tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift(1)).abs(),
-            (low - close.shift(1)).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    df["atr_14"] = tr.rolling(14).mean()
-    df["atr_72_avg"] = df["atr_14"].rolling(72).mean()
-    df["atr_ratio"] = df["atr_14"] / df["atr_72_avg"]
-    df["ret_72h"] = close.pct_change(72) * 100
-
-    bb_ma = close.rolling(20).mean()
-    bb_std = close.rolling(20).std()
-    df["bb_upper"] = bb_ma + 2 * bb_std
-    df["bb_lower"] = bb_ma - 2 * bb_std
-
-    ema_20 = close.ewm(span=20).mean()
-    df["kc_upper"] = ema_20 + 1.5 * df["atr_14"]
-    df["kc_lower"] = ema_20 - 1.5 * df["atr_14"]
-    df["squeeze_on"] = (df["bb_lower"] > df["kc_lower"]) & (df["bb_upper"] < df["kc_upper"])
-
-    count = 0
-    squeeze_counts: list[int] = []
-    for squeeze_on in df["squeeze_on"]:
-        count = count + 1 if squeeze_on else 0
-        squeeze_counts.append(count)
-    df["squeeze_count"] = squeeze_counts
-
-    df["mom_slope"] = close.rolling(20).apply(
-        lambda values: np.polyfit(range(len(values)), values, 1)[0],
-        raw=True,
-    )
-    return df
+    return compute_indicator_frame(frame, SQUEEZE_V7_FEATURE_COLUMNS)
 
 
 def build_squeeze_v7_feature_frames(
@@ -431,7 +359,8 @@ def _generate_symbol_signals(
     last_short: datetime | None = None
     last_long: datetime | None = None
 
-    for index in range(max(config.warmup_bars, 1), len(frame)):
+    first_eval_index = max(min(config.warmup_bars - 1, len(frame) - 1), 1)
+    for index in range(first_eval_index, len(frame)):
         row = frame.iloc[index]
         prev = frame.iloc[index - 1]
         close_time = row["close_time"]
@@ -497,11 +426,15 @@ def _generate_symbol_preview_signals(
             state.commit(snapshot.skipped_candle)
 
         step: _SqueezeV7PreviewStep | None = None
-        if (
-            state.last_row is not None
-            and state.candle_count >= warmup_bars
-            and start <= snapshot.signal_time < end
-        ):
+        last_row = state.last_row
+        state_ready = (
+            last_row is not None
+            and (
+                state.candle_count >= warmup_bars
+                or (not np.isnan(last_row.mom_slope) and not np.isnan(last_row.atr_ratio))
+            )
+        )
+        if state_ready and start <= snapshot.signal_time < end:
             step = state.preview(partial_candle)
             row = step.row
             prev = state.last_row
