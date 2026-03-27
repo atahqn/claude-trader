@@ -8,21 +8,10 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from marketdata import MarketDataRequest, MarketContextBundle, SymbolMarketContext
 
 from .models import AggTrade, Candle, Signal
+from .preview import interval_to_timedelta
 
 if TYPE_CHECKING:
     from .data import BinanceClient
-
-
-def _interval_to_timedelta(interval: str) -> timedelta:
-    unit = interval[-1]
-    value = int(interval[:-1])
-    if unit == "m":
-        return timedelta(minutes=value)
-    if unit == "h":
-        return timedelta(hours=value)
-    if unit == "d":
-        return timedelta(days=value)
-    raise ValueError(f"unsupported interval format: {interval}")
 
 
 def _normalize_time(dt: datetime) -> datetime:
@@ -67,12 +56,18 @@ class PreparedMarketContext:
     fetch_start: datetime
     request: MarketDataRequest
     bundle: MarketContextBundle
+    poll_candles: dict[str, list[Candle]] = field(default_factory=dict)
     _hourly_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
+    _poll_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         self._hourly_candles = {
             symbol: _frame_to_candles(context.frame)
             for symbol, context in self.bundle.by_symbol.items()
+        }
+        self._poll_candles = {
+            symbol: list(rows)
+            for symbol, rows in self.poll_candles.items()
         }
 
     @property
@@ -97,6 +92,23 @@ class PreparedMarketContext:
             if candle.open_time >= start and candle.open_time < end
         ]
 
+    def slice_poll_candles(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[Candle]:
+        candles = self._poll_candles.get(symbol)
+        if candles is None:
+            candles = self._hourly_candles.get(symbol, [])
+        if not candles:
+            return []
+        return [
+            candle
+            for candle in candles
+            if candle.open_time >= start and candle.open_time < end
+        ]
+
 
 def prepare_market_context(
     symbols: list[str],
@@ -111,7 +123,7 @@ def prepare_market_context(
     if request is None:
         request = MarketDataRequest.ohlcv_only()
     if warmup is None:
-        warmup = _interval_to_timedelta(request.ohlcv_interval) * warmup_bars
+        warmup = interval_to_timedelta(request.ohlcv_interval) * warmup_bars
     if warmup < timedelta(0):
         raise ValueError("warmup must be non-negative")
 
@@ -122,12 +134,18 @@ def prepare_market_context(
 
     fetch_start = start - warmup
     bundle = client.fetch_market_context_bundle(symbols, fetch_start, end, request)
+    poll_candles: dict[str, list[Candle]] = {}
+    poll_interval = request.effective_poll_ohlcv_interval
+    if poll_interval != request.ohlcv_interval:
+        for symbol in symbols:
+            poll_candles[symbol] = client.fetch_klines(symbol, poll_interval, fetch_start, end)
     return PreparedMarketContext(
         start=start,
         end=end,
         fetch_start=fetch_start,
         request=request,
         bundle=bundle,
+        poll_candles=poll_candles,
     )
 
 

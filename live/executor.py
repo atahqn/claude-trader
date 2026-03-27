@@ -51,14 +51,15 @@ class OrderExecutor:
             entry_price,
             use_market_filter=signal.entry_price is None,
         )
-        if required_notional > self._config.position_size_usdt + 1e-9:
-            available_balance = self._client.get_available_balance()
-            if available_balance + 1e-9 < required_notional:
-                raise ValueError(
-                    f"{signal.ticker} requires {required_notional:.2f} USDT after "
-                    f"exchange min-notional rounding, but only "
-                    f"{available_balance:.2f} USDT is available"
-                )
+        effective_leverage = self._effective_leverage(signal)
+        required_margin = required_notional / effective_leverage
+        available_balance = self._client.get_available_balance()
+        if available_balance + 1e-9 < required_margin:
+            raise ValueError(
+                f"{signal.ticker} requires {required_notional:.2f} USDT notional "
+                f"({required_margin:.2f} USDT margin at {effective_leverage:.2f}x), "
+                f"but only {available_balance:.2f} USDT is available"
+            )
 
         # Determine order side and position side (hedge mode)
         side = OrderSide.BUY if signal.position_type is PositionType.LONG else OrderSide.SELL
@@ -158,6 +159,14 @@ class OrderExecutor:
                 self._symbol_info[api_symbol] = s
                 return
         raise ValueError(f"Symbol {api_symbol} not found in exchange info")
+
+    @staticmethod
+    def _effective_leverage(signal: Signal) -> float:
+        try:
+            leverage = float(signal.leverage)
+        except (TypeError, ValueError):
+            return 1.0
+        return leverage if leverage > 0 else 1.0
 
     def _compute_entry_quantity(
         self,

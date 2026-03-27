@@ -23,6 +23,15 @@ from .pipeline import BacktestExecutionSession, PreparedMarketContext
 from .resolver import compute_pnl, compute_tp_sl_prices, resolve_exit
 
 
+_APPROXIMATE_ENTRY_INTERVALS: tuple[tuple[str, timedelta], ...] = (
+    ("1h", timedelta(hours=1)),
+    ("30m", timedelta(minutes=30)),
+    ("15m", timedelta(minutes=15)),
+    ("5m", timedelta(minutes=5)),
+    ("1m", timedelta(minutes=1)),
+)
+
+
 def _effective_max_holding_hours(signal: Signal, default_hours: int) -> int:
     holding_hours = signal.max_holding_hours if signal.max_holding_hours is not None else default_hours
     if holding_hours <= 0:
@@ -79,21 +88,66 @@ def _resolve_entry_approximate(
     signal: Signal,
     session: BacktestExecutionSession,
 ) -> tuple[float, datetime] | None:
-    """Approximate entry using the nearest closed 1h candle price."""
+    """Approximate entry using the last fully closed aligned candle price."""
     ticker = signal.ticker
     delay = timedelta(seconds=signal.entry_delay_seconds)
+    candle_interval, candle_close_time = _select_approximate_entry_candle(signal.signal_date)
+    candle_start = candle_close_time - _interval_duration(candle_interval)
 
-    candle_start = signal.signal_date - timedelta(hours=1)
-    candle_end = signal.signal_date + timedelta(hours=1)
-    candles = session.fetch_hourly_candles(ticker, candle_start, candle_end)
-    candle = next((c for c in candles if c.close_time >= signal.signal_date), None)
-    if candle is None:
-        candle = candles[-1] if candles else None
+    if candle_interval == "1h":
+        candles = session.fetch_hourly_candles(ticker, candle_start, candle_close_time)
+        candle = next((c for c in reversed(candles) if c.close_time <= candle_close_time), None)
+    else:
+        minute_candles = session.fetch_minute_candles(ticker, candle_start, candle_close_time)
+        candle = _aggregate_entry_candle(minute_candles, candle_start, candle_close_time)
+
     if candle is None:
         return None
 
     entry_time = signal.signal_date + delay
     return candle.close, entry_time
+
+
+def _select_approximate_entry_candle(signal_time: datetime) -> tuple[str, datetime]:
+    candle_close_time = signal_time.replace(second=0, microsecond=0)
+    minute = candle_close_time.minute
+    for interval, duration in _APPROXIMATE_ENTRY_INTERVALS:
+        duration_minutes = int(duration.total_seconds() // 60)
+        if duration_minutes == 60:
+            if minute == 0:
+                return interval, candle_close_time
+            continue
+        if minute % duration_minutes == 0:
+            return interval, candle_close_time
+    return "1m", candle_close_time
+
+
+def _interval_duration(interval: str) -> timedelta:
+    for name, duration in _APPROXIMATE_ENTRY_INTERVALS:
+        if name == interval:
+            return duration
+    raise ValueError(f"unsupported interval: {interval}")
+
+
+def _aggregate_entry_candle(
+    candles: list[Any],
+    open_time: datetime,
+    close_time: datetime,
+) -> Any | None:
+    if not candles:
+        return None
+
+    first = candles[0]
+    last = candles[-1]
+    return type(first)(
+        open_time=open_time,
+        close_time=close_time,
+        open=first.open,
+        high=max(candle.high for candle in candles),
+        low=min(candle.low for candle in candles),
+        close=last.close,
+        volume=sum(candle.volume for candle in candles),
+    )
 
 
 def _ensure_session(

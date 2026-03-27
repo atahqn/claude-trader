@@ -4,10 +4,12 @@ This codebase is designed for LLMs to draft and backtest their strategies and to
 
 ## Strategy Status
 
-- Latest recommended strategy iteration: **V7**
-- Current deployed/live implementation baseline: **V6** (`live/squeeze_v6_strategy.py`) with `V6B` (`live/squeeze_v6b_strategy.py`) also available
-- V7 is a minimal update over V6: the SHORT logic is unchanged, and the LONG signal keeps the same squeeze + bull-regime rules but widens TP/SL from **3.0% / 1.5%** to **4.0% / 2.0%**
-- Treat [`STRATEGY_EVOLUTION.md`](STRATEGY_EVOLUTION.md) as the source of truth for research history, current recommendation, and evaluation caveats
+- Recommended strategy iteration: **V8**
+- Recommended trading space:
+  `ETH/USDT`, `SOL/USDT`, `BNB/USDT`, `XRP/USDT`, `DOGE/USDT`,
+  `AVAX/USDT`, `LINK/USDT`, `ENA/USDT`, `INJ/USDT`, `NEAR/USDT`,
+  `ALGO/USDT`, `RENDER/USDT`, `WIF/USDT`, `ADA/USDT`, `APT/USDT`
+- Treat [`STRATEGY_EVOLUTION.md`](STRATEGY_EVOLUTION.md) as the source of truth for research history and evaluation caveats
 
 ## Backtester Architecture
 

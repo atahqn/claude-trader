@@ -13,6 +13,7 @@ from backtester.resolver import compute_pnl
 from .auth_client import BinanceFuturesClient
 from .executor import OrderExecutor
 from .models import (
+    AccountTrade,
     ExchangeOrder,
     LiveConfig,
     LivePosition,
@@ -25,6 +26,7 @@ from .models import (
 _STATE_DIR = Path.home() / ".claude_trader"
 _STATE_PATH = _STATE_DIR / "live_state.json"
 _POSITION_AMOUNT_EPSILON = 0.5
+_UNSET = object()
 
 
 class PositionTracker:
@@ -218,6 +220,10 @@ class PositionTracker:
     def _position_side(pos: LivePosition) -> str:
         return "LONG" if pos.signal.position_type is PositionType.LONG else "SHORT"
 
+    @staticmethod
+    def _close_side(pos: LivePosition) -> OrderSide:
+        return OrderSide.SELL if pos.signal.position_type is PositionType.LONG else OrderSide.BUY
+
     def _has_open_exchange_position(self, pos: LivePosition) -> bool | None:
         """Return whether the exchange still reports an open position for *pos*."""
         try:
@@ -255,31 +261,92 @@ class PositionTracker:
 
     @staticmethod
     def _infer_exchange_exit(pos: LivePosition) -> tuple[str, ExchangeOrder | None]:
-        canceled_statuses = {
-            OrderStatus.CANCELED,
-            OrderStatus.EXPIRED,
-            OrderStatus.REJECTED,
-        }
-        tp_canceled = (
+        if (
             pos.tp_order is not None
-            and pos.tp_order.status in canceled_statuses
-        )
-        sl_canceled = (
+            and (
+                pos.tp_order.status is OrderStatus.FILLED
+                or pos.tp_order.avg_fill_price > 0
+            )
+        ):
+            return "TP", pos.tp_order
+        if (
             pos.sl_order is not None
-            and pos.sl_order.status in canceled_statuses
-        )
+            and (
+                pos.sl_order.status is OrderStatus.FILLED
+                or pos.sl_order.avg_fill_price > 0
+            )
+        ):
+            return "SL", pos.sl_order
+        return "EXTERNAL", None
 
-        if tp_canceled and sl_canceled:
-            return "EXTERNAL", None
-        if sl_canceled and pos.tp_order is not None:
-            return "TP", pos.tp_order
-        if tp_canceled and pos.sl_order is not None:
-            return "SL", pos.sl_order
-        if pos.tp_order is not None and pos.tp_order.avg_fill_price > 0:
-            return "TP", pos.tp_order
-        if pos.sl_order is not None and pos.sl_order.avg_fill_price > 0:
-            return "SL", pos.sl_order
-        return "EXTERNAL", pos.tp_order or pos.sl_order
+    def _resolve_external_exit_from_trades(
+        self,
+        pos: LivePosition,
+        now_utc: datetime,
+    ) -> tuple[str, float, datetime] | None:
+        if pos.opened_at is None or pos.quantity <= 0:
+            return None
+
+        try:
+            trades = self._client.get_account_trades(
+                pos.signal.ticker,
+                start_time=pos.opened_at,
+                end_time=now_utc,
+                limit=100,
+            )
+        except Exception as exc:
+            print(
+                f"[{pos.position_id}] Failed to query account trades: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+        target_side = self._position_side(pos)
+        close_side = self._close_side(pos)
+        relevant: list[AccountTrade] = []
+        for trade in trades:
+            if trade.time < pos.opened_at or trade.time > now_utc:
+                continue
+            if trade.side is not close_side:
+                continue
+            if trade.position_side in {"LONG", "SHORT"} and trade.position_side != target_side:
+                continue
+            relevant.append(trade)
+
+        if not relevant:
+            return None
+
+        relevant.sort(key=lambda trade: (trade.time, trade.trade_id))
+        qty_needed = max(pos.quantity, 0.0)
+        qty_epsilon = max(1e-9, qty_needed * 1e-6)
+        total_qty = 0.0
+        total_notional = 0.0
+        exit_time: datetime | None = None
+        matched_order_ids: set[int] = set()
+
+        for trade in relevant:
+            remaining = qty_needed - total_qty
+            if remaining <= qty_epsilon:
+                break
+            used_qty = min(trade.quantity, remaining)
+            if used_qty <= 0:
+                continue
+            total_qty += used_qty
+            total_notional += trade.price * used_qty
+            exit_time = trade.time
+            if trade.order_id > 0:
+                matched_order_ids.add(trade.order_id)
+
+        if total_qty <= qty_epsilon or total_qty + qty_epsilon < qty_needed or exit_time is None:
+            return None
+
+        exit_reason = "EXTERNAL"
+        if pos.tp_order is not None and pos.tp_order.order_id > 0 and pos.tp_order.order_id in matched_order_ids:
+            exit_reason = "TP"
+        elif pos.sl_order is not None and pos.sl_order.order_id > 0 and pos.sl_order.order_id in matched_order_ids:
+            exit_reason = "SL"
+
+        return exit_reason, total_notional / total_qty, exit_time
 
     def _check_exit_fills(self, pos: LivePosition, now_utc: datetime) -> bool | None:
         tp_filled = False
@@ -326,7 +393,29 @@ class PositionTracker:
         exchange_open = self._has_open_exchange_position(pos)
         if exchange_open is False:
             exit_reason, exit_order = self._infer_exchange_exit(pos)
-            self._finalize_close(pos, exit_order, exit_reason, now_utc)
+            if exit_reason == "EXTERNAL":
+                recovered = self._resolve_external_exit_from_trades(pos, now_utc)
+                if recovered is not None:
+                    recovered_reason, exit_price, exit_time = recovered
+                    self._finalize_close(
+                        pos,
+                        None,
+                        recovered_reason,
+                        now_utc,
+                        resolved_exit_price=exit_price,
+                        resolved_closed_at=exit_time,
+                    )
+                else:
+                    self._finalize_close(
+                        pos,
+                        None,
+                        "EXTERNAL",
+                        now_utc,
+                        resolved_exit_price=None,
+                        resolved_closed_at=now_utc,
+                    )
+            else:
+                self._finalize_close(pos, exit_order, exit_reason, now_utc)
             return True
 
         if query_failed or exchange_open is None:
@@ -369,37 +458,57 @@ class PositionTracker:
         exit_order: ExchangeOrder | None,
         exit_reason: str,
         now_utc: datetime,
+        *,
+        resolved_exit_price: float | None | object = _UNSET,
+        resolved_closed_at: datetime | object = _UNSET,
     ) -> None:
-        exit_price = pos.fill_price
-        if exit_order is not None:
-            if exit_order.avg_fill_price > 0:
-                exit_price = exit_order.avg_fill_price
-            elif exit_order.stop_price > 0:
-                exit_price = exit_order.stop_price
-            elif exit_order.price > 0:
-                exit_price = exit_order.price
+        if resolved_exit_price is _UNSET:
+            exit_price: float | None = None
+            if exit_order is not None:
+                if exit_order.avg_fill_price > 0:
+                    exit_price = exit_order.avg_fill_price
+                elif exit_order.price > 0:
+                    exit_price = exit_order.price
+                elif exit_reason in {"TP", "SL"} and exit_order.stop_price > 0:
+                    exit_price = exit_order.stop_price
+            if exit_price is None and exit_reason != "EXTERNAL":
+                exit_price = pos.fill_price
+        else:
+            exit_price = resolved_exit_price
 
-        net_pnl, gross_pnl, fee_drag = compute_pnl(
-            pos.fill_price,
-            exit_price,
-            pos.signal.position_type,
-            leverage=pos.signal.leverage,
-            taker_fee_rate=pos.signal.taker_fee_rate,
-        )
+        if exit_price is not None:
+            net_pnl, gross_pnl, fee_drag = compute_pnl(
+                pos.fill_price,
+                exit_price,
+                pos.signal.position_type,
+                leverage=pos.signal.leverage,
+                taker_fee_rate=pos.signal.taker_fee_rate,
+            )
+        else:
+            net_pnl = None
+            gross_pnl = None
+            fee_drag = None
+
+        pos.exit_price = exit_price
         pos.pnl_pct = net_pnl
         pos.gross_pnl_pct = gross_pnl
         pos.fee_drag_pct = fee_drag
         pos.status = PositionStatus.CLOSED
-        pos.closed_at = (
-            exit_order.updated_at if exit_order is not None and exit_order.updated_at is not None
-            else exit_order.created_at if exit_order is not None and exit_order.created_at is not None
-            else now_utc
-        )
+        if resolved_closed_at is _UNSET:
+            pos.closed_at = (
+                exit_order.updated_at if exit_order is not None and exit_order.updated_at is not None
+                else exit_order.created_at if exit_order is not None and exit_order.created_at is not None
+                else now_utc
+            )
+        else:
+            pos.closed_at = resolved_closed_at
         self._dirty = True
 
+        exit_price_text = f"{exit_price:.4f}" if exit_price is not None else "unknown"
+        pnl_text = f"{net_pnl:+.2f}%" if net_pnl is not None else "unknown"
         print(
             f"[{pos.position_id}] {pos.signal.ticker} closed via {exit_reason} "
-            f"@ {exit_price:.4f} | PnL: {net_pnl:+.2f}%",
+            f"@ {exit_price_text} | PnL: {pnl_text}",
             file=sys.stderr,
         )
         try:

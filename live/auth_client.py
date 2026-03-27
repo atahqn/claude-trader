@@ -17,9 +17,11 @@ from backtester.data import (
     _retry_delay,
     _symbol_for_api,
     _sync_rate_limiter,
+    _to_millis,
 )
 
 from .models import (
+    AccountTrade,
     ExchangeOrder,
     LiveConfig,
     OrderSide,
@@ -85,6 +87,22 @@ def _parse_algo_order(raw: dict[str, Any]) -> ExchangeOrder:
         created_at=_from_millis(int(raw["createTime"])) if "createTime" in raw else None,
         updated_at=_from_millis(int(raw["updateTime"])) if "updateTime" in raw else None,
         algo_id=int(raw["algoId"]),
+    )
+
+
+def _parse_account_trade(raw: dict[str, Any]) -> AccountTrade:
+    return AccountTrade(
+        trade_id=int(raw.get("id", 0)),
+        order_id=int(raw.get("orderId", 0)),
+        symbol=str(raw["symbol"]),
+        side=OrderSide(raw["side"]),
+        price=float(raw.get("price", 0)),
+        quantity=float(raw.get("qty", raw.get("quantity", 0))),
+        time=_from_millis(int(raw["time"])),
+        realized_pnl=float(raw.get("realizedPnl", 0)),
+        commission=float(raw.get("commission", 0)),
+        commission_asset=str(raw.get("commissionAsset", "")),
+        position_side=str(raw.get("positionSide", "BOTH")),
     )
 
 
@@ -350,7 +368,29 @@ class BinanceFuturesClient:
         params: dict[str, Any] = {}
         if symbol is not None:
             params["symbol"] = _symbol_for_api(symbol)
-        return self._request("GET", "/fapi/v2/positionRisk", params, weight=5)
+        return self._request("GET", "/fapi/v3/positionRisk", params, weight=5)
+
+    def get_account_trades(
+        self,
+        symbol: str,
+        *,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        order_id: int | None = None,
+        limit: int = 100,
+    ) -> list[AccountTrade]:
+        params: dict[str, Any] = {
+            "symbol": _symbol_for_api(symbol),
+            "limit": max(1, min(limit, 100)),
+        }
+        if start_time is not None:
+            params["startTime"] = _to_millis(start_time)
+        if end_time is not None:
+            params["endTime"] = _to_millis(end_time)
+        if order_id is not None:
+            params["orderId"] = order_id
+        raw = self._request("GET", "/fapi/v1/userTrades", params, weight=5)
+        return [_parse_account_trade(row) for row in raw]
 
     def get_account_info(self) -> dict[str, Any]:
         return self._request("GET", "/fapi/v2/account", {}, weight=5)

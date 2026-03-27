@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import math
 import random
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from backtester.models import Signal
+from backtester.preview import floor_boundary, interval_to_seconds
+from marketdata import MarketDataRequest
 
 from .auth_client import BinanceFuturesClient, LiveMarketClient
 from .executor import OrderExecutor
@@ -17,6 +18,7 @@ from .signal_generator import SignalGenerator
 from .tracker import PositionTracker
 
 _INTENSIVE_POLL_LEAD_SECONDS = 120.0
+_PRE_POLL_LEAD_SECONDS = 10.0
 
 
 class LiveEngine:
@@ -31,9 +33,12 @@ class LiveEngine:
         self._generator = generator
         self._running = False
 
-        # Two-phase hourly polling state
-        self._last_pre_poll_hour: int | None = None
-        self._last_signal_poll_hour: int | None = None
+        # Two-phase interval-aware polling state
+        self._market_request = MarketDataRequest.ohlcv_only()
+        self._poll_interval = "1h"
+        self._poll_interval_seconds = float(interval_to_seconds("1h"))
+        self._last_pre_poll_boundary: datetime | None = None
+        self._last_signal_poll_boundary: datetime | None = None
         self._pre_poll_balance: float | None = None  # set by pre-poll, read by signal poll
 
         # Built during start()
@@ -52,6 +57,7 @@ class LiveEngine:
         self._tracker.reconcile_with_exchange()
 
         market_request = self._generator.market_data_request()
+        self._configure_market_schedule(market_request)
 
         # Setup signal generator
         self._generator.setup(self._market_client)
@@ -71,6 +77,8 @@ class LiveEngine:
             f"size={self._config.position_size_usdt} USDT | "
             f"max_positions={self._config.max_concurrent_positions} | "
             f"hold_max={self._config.max_holding_hours}h | "
+            f"analysis_interval={market_request.ohlcv_interval} | "
+            f"poll_interval={market_request.effective_poll_ohlcv_interval} | "
             f"market_data={','.join(sorted(req.value for req in market_request.datasets))} | "
             f"testnet={self._config.testnet}",
             file=sys.stderr,
@@ -120,23 +128,47 @@ class LiveEngine:
             # 4. Sleep until next check
             time.sleep(self._sleep_interval_seconds(now_utc, check_interval))
 
-    # -- Two-phase hourly polling ----------------------------------------------
+    # -- Interval-aware signal polling ------------------------------------------
+
+    def _configure_market_schedule(self, market_request: MarketDataRequest) -> None:
+        self._market_request = market_request
+        self._poll_interval = market_request.effective_poll_ohlcv_interval
+        self._poll_interval_seconds = float(
+            interval_to_seconds(market_request.effective_poll_ohlcv_interval)
+        )
+
+    def _current_poll_boundary(self, now_utc: datetime) -> datetime:
+        return floor_boundary(now_utc, self._poll_interval)
+
+    def _next_poll_boundary(self, now_utc: datetime) -> datetime:
+        return self._current_poll_boundary(now_utc) + timedelta(seconds=self._poll_interval_seconds)
+
+    def _intensive_poll_lead_seconds(self, check_interval: float) -> float:
+        return min(
+            _INTENSIVE_POLL_LEAD_SECONDS,
+            max(check_interval, self._poll_interval_seconds / 6.0),
+        )
+
+    def _pre_poll_lead_seconds(self, check_interval: float) -> float:
+        return min(
+            _PRE_POLL_LEAD_SECONDS,
+            max(check_interval, self._poll_interval_seconds / 6.0),
+        )
 
     def _should_pre_poll(self, now_utc: datetime) -> bool:
-        """True once per hour at ~xx:59:50."""
-        if now_utc.minute == 59 and now_utc.second >= 50:
-            # The upcoming hour is (current_hour + 1) % 24
-            upcoming_hour = (now_utc.hour + 1) % 24
-            if self._last_pre_poll_hour != upcoming_hour:
-                return True
+        """True once per poll interval shortly before the next poll boundary."""
+        next_boundary = self._next_poll_boundary(now_utc)
+        lead = self._pre_poll_lead_seconds(self._config.order_check_interval_seconds)
+        if next_boundary - timedelta(seconds=lead) <= now_utc < next_boundary:
+            return self._last_pre_poll_boundary != next_boundary
         return False
 
     def _should_signal_poll(self, now_utc: datetime, check_interval: float) -> bool:
-        """True once per hour at xx:00:01."""
-        if now_utc.minute == 0 and now_utc.second <= 1 + check_interval:
-            current_hour = now_utc.hour
-            if self._last_signal_poll_hour != current_hour:
-                return True
+        """True once per poll interval immediately after the boundary."""
+        boundary = self._current_poll_boundary(now_utc)
+        elapsed = (now_utc - boundary).total_seconds()
+        if 0.0 <= elapsed <= 1.0 + check_interval:
+            return self._last_signal_poll_boundary != boundary
         return False
 
     def _has_local_active_positions(self) -> bool:
@@ -147,20 +179,19 @@ class LiveEngine:
         )
 
     def _sleep_interval_seconds(self, now_utc: datetime, check_interval: float) -> float:
-        """Use coarse idle polling until the last 2 minutes before candle close."""
+        """Use coarse idle polling until the lead-up window before the next poll boundary."""
         if self._has_local_active_positions():
             return check_interval
 
-        seconds_past_hour = (
-            now_utc.minute * 60
-            + now_utc.second
-            + now_utc.microsecond / 1_000_000
+        seconds_until_boundary = max(
+            0.0,
+            (self._next_poll_boundary(now_utc) - now_utc).total_seconds(),
         )
-        seconds_until_hour = max(0.0, 3600.0 - seconds_past_hour)
-        if seconds_until_hour <= _INTENSIVE_POLL_LEAD_SECONDS:
+        lead = self._intensive_poll_lead_seconds(check_interval)
+        if seconds_until_boundary <= lead:
             return check_interval
 
-        coarse_sleep = seconds_until_hour - _INTENSIVE_POLL_LEAD_SECONDS
+        coarse_sleep = seconds_until_boundary - lead
         return max(check_interval, coarse_sleep)
 
     def _configured_leverage(self) -> float:
@@ -173,24 +204,29 @@ class LiveEngine:
 
     def _effective_buying_power(self, available_balance: float) -> float:
         leverage = self._configured_leverage()
-        gross_buying_power = max(0.0, available_balance) * leverage
-        return math.floor(gross_buying_power / 100.0) * 100.0
+        return max(0.0, available_balance) * leverage
+
+    def _affordable_entries(self, available_balance: float) -> int:
+        needed = self._config.position_size_usdt
+        if needed <= 0:
+            return 0
+        return int(self._effective_buying_power(available_balance) // needed)
 
     def _do_pre_poll(self, now_utc: datetime) -> None:
-        """Check available capital before the hourly candle close."""
+        """Check available capital shortly before the next signal poll boundary."""
         assert self._futures_client is not None
         assert self._tracker is not None
 
         self._tracker.reconcile_with_exchange()
-        upcoming_hour = (now_utc.hour + 1) % 24
-        self._last_pre_poll_hour = upcoming_hour
+        next_boundary = self._next_poll_boundary(now_utc)
+        self._last_pre_poll_boundary = next_boundary
 
         open_count = self._tracker.open_count
         open_slots = self._config.max_concurrent_positions - open_count
 
         print(
             f"\n--- Pre-poll check {now_utc.strftime('%H:%M:%S')} UTC "
-            f"(next candle closes at {upcoming_hour:02d}:00) ---",
+            f"(next signal poll at {next_boundary.strftime('%H:%M:%S')}) ---",
             file=sys.stderr,
         )
         print(
@@ -204,13 +240,15 @@ class LiveEngine:
             self._pre_poll_balance = balance
             needed = self._config.position_size_usdt
             buying_power = self._effective_buying_power(balance)
+            affordable = self._affordable_entries(balance)
             print(
                 f"Available balance: {balance:.2f} USDT | "
                 f"Leveraged buying power: {buying_power:.2f} USDT "
-                f"(leverage={self._configured_leverage():.2f}x, rounded down to 100)",
+                f"(leverage={self._configured_leverage():.2f}x) | "
+                f"Affordable entries: {affordable}",
                 file=sys.stderr,
             )
-            if buying_power + 1e-9 < needed:
+            if affordable <= 0:
                 print(
                     f"Insufficient capital: need {needed:.2f} USDT, "
                     f"leveraged buying power is {buying_power:.2f} USDT — will skip signal poll",
@@ -228,17 +266,17 @@ class LiveEngine:
             print(f"Could not fetch balance: {exc}", file=sys.stderr)
 
     def _do_signal_poll(self, now_utc: datetime) -> None:
-        """Check for signals right after the hourly candle closes."""
+        """Check for signals immediately after the strategy poll boundary."""
         assert self._tracker is not None
         assert self._futures_client is not None
 
         self._tracker.reconcile_with_exchange()
-        current_hour = now_utc.hour
-        self._last_signal_poll_hour = current_hour
+        boundary = self._current_poll_boundary(now_utc)
+        self._last_signal_poll_boundary = boundary
 
         print(
             f"\n--- Signal poll {now_utc.strftime('%H:%M:%S')} UTC "
-            f"(candle {current_hour:02d}:00 closed) ---",
+            f"(boundary {boundary.strftime('%H:%M:%S')}) ---",
             file=sys.stderr,
         )
 
@@ -250,7 +288,7 @@ class LiveEngine:
 
         # Use pre-poll balance if available, otherwise fetch now (e.g. engine just started)
         needed = self._config.position_size_usdt
-        if self._last_pre_poll_hour == current_hour and self._pre_poll_balance is not None:
+        if self._last_pre_poll_boundary == boundary and self._pre_poll_balance is not None:
             balance = self._pre_poll_balance
         else:
             try:
@@ -259,14 +297,16 @@ class LiveEngine:
                 print(f"Could not fetch balance: {exc} — skipping", file=sys.stderr)
                 return
         buying_power = self._effective_buying_power(balance)
+        affordable = self._affordable_entries(balance)
         print(
             f"Available balance: {balance:.2f} USDT | "
             f"Leveraged buying power: {buying_power:.2f} USDT "
-            f"(leverage={self._configured_leverage():.2f}x, rounded down to 100)",
+            f"(leverage={self._configured_leverage():.2f}x) | "
+            f"Affordable entries: {affordable}",
             file=sys.stderr,
         )
 
-        if buying_power + 1e-9 < needed:
+        if affordable <= 0:
             print(
                 f"Insufficient capital: need {needed:.2f} USDT, "
                 f"leveraged buying power is {buying_power:.2f} USDT — skipping",
@@ -275,10 +315,9 @@ class LiveEngine:
             return
 
         # Capital can cover at most this many new positions
-        affordable = int(buying_power // needed)
         max_entries = min(open_slots, affordable)
 
-        signals = self._poll_generator()
+        signals = self._poll_generator(now_utc)
 
         if not signals:
             print("No signals this hour.", file=sys.stderr)
@@ -314,8 +353,9 @@ class LiveEngine:
             reason = "no open slots" if affordable >= open_slots else "insufficient capital"
             print(f"  {skipped} signal(s) skipped ({reason})", file=sys.stderr)
 
-    def _poll_generator(self) -> list[Signal]:
+    def _poll_generator(self, now_utc: datetime) -> list[Signal]:
         try:
+            self._generator.set_poll_time(now_utc)
             result = self._generator.poll()
         except Exception as exc:
             print(f"Signal generator error: {exc}", file=sys.stderr)

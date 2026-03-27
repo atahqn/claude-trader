@@ -27,16 +27,29 @@ class MarketDataRequest:
         default_factory=lambda: frozenset({DataRequirement.OHLCV})
     )
     ohlcv_interval: str = "1h"
+    poll_ohlcv_interval: str | None = None
 
     def __post_init__(self) -> None:
         if not self.datasets:
             raise ValueError("at least one dataset is required")
+        if self.poll_ohlcv_interval is not None and DataRequirement.OHLCV not in self.datasets:
+            raise ValueError("poll_ohlcv_interval requires OHLCV in datasets")
+
+    @property
+    def effective_poll_ohlcv_interval(self) -> str:
+        return self.poll_ohlcv_interval or self.ohlcv_interval
 
     @classmethod
-    def ohlcv_only(cls, interval: str = "1h") -> "MarketDataRequest":
+    def ohlcv_only(
+        cls,
+        interval: str = "1h",
+        *,
+        poll_interval: str | None = None,
+    ) -> "MarketDataRequest":
         return cls(
             datasets=frozenset({DataRequirement.OHLCV}),
             ohlcv_interval=interval,
+            poll_ohlcv_interval=poll_interval,
         )
 
 

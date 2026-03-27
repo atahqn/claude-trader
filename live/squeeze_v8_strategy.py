@@ -23,11 +23,18 @@ Architecture:
     - RSI <= 70 (not overbought), ATR ratio <= 1.5
     - TP: 4.0%, SL: 2.0%, Cooldown: 12h
 
+Polling:
+  - analysis interval stays 1h
+  - poll interval defaults to 1h, preserving the old close-only behavior
+  - when poll interval is lower (for example 15m or 5m), the strategy evaluates
+    Binance's current in-progress 1h candle snapshot at those poll boundaries
+  - uses incremental _SqueezeV7PreviewState per symbol for O(1) indicator updates
+
 Look-ahead bias prevention:
-  - All signals fire at candle close_time (end of candle period)
-  - All indicators backward-looking: rolling(), ewm(), shift(1), pct_change()
-  - ret_72h = close.pct_change(72) — backward-looking 72-bar return
-  - Entry executes via market order after signal
+  - close-only mode uses the last fully closed 1h candle
+  - preview mode uses the currently visible 1h candle snapshot from Binance
+  - all indicators remain backward-looking: rolling(), ewm(), pct_change()
+  - entry executes via market order after signal
 """
 
 from __future__ import annotations
@@ -36,9 +43,14 @@ import sys
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
-import pandas as pd
 
-from backtester.models import MarketType, PositionType, Signal
+from backtester.models import Candle, Signal
+from backtester.preview import SourcePeriodGate, floor_boundary, interval_to_seconds
+from backtester.squeeze_signals import emit_squeeze_entry_signals
+from backtester.strategies.squeeze_v7 import (
+    _SqueezeV7PreviewState,
+    _safe_feature_value,
+)
 
 from .auth_client import LiveMarketClient
 from .signal_generator import SignalGenerator
@@ -52,82 +64,7 @@ SYMBOLS = [
 
 _LOOKBACK_BARS = 100
 _WARMUP_BARS = 80
-
-
-def _candles_to_df(candles: list) -> pd.DataFrame:
-    rows = []
-    for c in candles:
-        rows.append({
-            "open_time": c.open_time,
-            "close_time": c.close_time,
-            "open": c.open,
-            "high": c.high,
-            "low": c.low,
-            "close": c.close,
-            "volume": c.volume,
-        })
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    return df.sort_values("open_time").reset_index(drop=True)
-
-
-def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute indicators for squeeze detection. All backward-looking."""
-    df = df.copy()
-    c = df["close"]
-    h = df["high"]
-    l = df["low"]
-
-    # RSI 14 (Wilder smoothing)
-    delta = c.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, min_periods=14).mean()
-    loss = (-delta).clip(lower=0).ewm(alpha=1/14, min_periods=14).mean()
-    df["rsi_14"] = 100 - (100 / (1 + gain / loss))
-
-    # ATR 14
-    tr = pd.concat([
-        h - l,
-        (h - c.shift(1)).abs(),
-        (l - c.shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    df["atr_14"] = tr.rolling(14).mean()
-
-    # ATR ratio: current volatility vs 72-bar average
-    df["atr_72_avg"] = df["atr_14"].rolling(72).mean()
-    df["atr_ratio"] = df["atr_14"] / df["atr_72_avg"]
-
-    # 72-hour return (backward-looking)
-    df["ret_72h"] = c.pct_change(72) * 100
-
-    # Bollinger Bands (20, 2)
-    bb_ma = c.rolling(20).mean()
-    bb_std = c.rolling(20).std()
-    df["bb_upper"] = bb_ma + 2 * bb_std
-    df["bb_lower"] = bb_ma - 2 * bb_std
-
-    # Keltner Channel (20 EMA, 1.5 ATR)
-    ema_20 = c.ewm(span=20).mean()
-    df["kc_upper"] = ema_20 + 1.5 * df["atr_14"]
-    df["kc_lower"] = ema_20 - 1.5 * df["atr_14"]
-
-    # Squeeze detection (BB inside KC)
-    df["squeeze_on"] = (df["bb_lower"] > df["kc_lower"]) & (df["bb_upper"] < df["kc_upper"])
-
-    # Consecutive squeeze count
-    cnt = 0
-    counts = []
-    for s in df["squeeze_on"]:
-        cnt = cnt + 1 if s else 0
-        counts.append(cnt)
-    df["squeeze_count"] = counts
-
-    # Momentum slope (20-bar linear regression)
-    df["mom_slope"] = c.rolling(20).apply(
-        lambda x: np.polyfit(range(len(x)), x, 1)[0], raw=True
-    )
-
-    return df
+_SUPPORTED_POLL_INTERVALS = {"1h", "30m", "15m", "5m", "1m"}
 
 
 class SqueezeV8Strategy(SignalGenerator):
@@ -141,6 +78,8 @@ class SqueezeV8Strategy(SignalGenerator):
 
     def __init__(
         self,
+        analysis_interval: str = "1h",
+        poll_interval: str | None = None,
         leverage: float = 1.0,
         # SHORT params (V8: wider TP/SL, lower RSI floor)
         short_tp: float = 3.0,
@@ -157,6 +96,18 @@ class SqueezeV8Strategy(SignalGenerator):
         min_squeeze_bars: int = 7,
         atr_ratio_max: float = 1.5,
     ) -> None:
+        if analysis_interval != "1h":
+            raise ValueError("SqueezeV8 live strategy currently supports only 1h analysis_interval")
+        effective_poll_interval = poll_interval or analysis_interval
+        if effective_poll_interval not in _SUPPORTED_POLL_INTERVALS:
+            raise ValueError("poll_interval must be one of 1h, 30m, 15m, 5m, 1m")
+        if interval_to_seconds(analysis_interval) % interval_to_seconds(effective_poll_interval) != 0:
+            raise ValueError("poll_interval must divide analysis_interval exactly")
+
+        self.analysis_interval = analysis_interval
+        self.poll_interval = poll_interval
+        self.enable_short = True
+        self.enable_long = True
         self.leverage = leverage
         self.short_tp = short_tp
         self.short_sl = short_sl
@@ -173,12 +124,17 @@ class SqueezeV8Strategy(SignalGenerator):
         self._client: LiveMarketClient | None = None
         self._last_short: dict[str, datetime] = {}
         self._last_long: dict[str, datetime] = {}
+        self._source_period_gate = SourcePeriodGate()
+        self._states: dict[str, _SqueezeV7PreviewState] = {}
+        self._last_committed_hour: dict[str, datetime] = {}
 
     def setup(self, client: LiveMarketClient) -> None:
         self._client = client
+        self._warm_up_states()
         print(
             f"SqueezeV8 initialized | "
             f"symbols={len(SYMBOLS)} | leverage={self.leverage}x | "
+            f"analysis={self.analysis_interval} | poll={self.effective_poll_interval} | "
             f"SHORT TP/SL={self.short_tp}/{self.short_sl}% "
             f"CD={self.short_cooldown_h}h RSI>={self.short_rsi_floor} | "
             f"LONG TP/SL={self.long_tp}/{self.long_sl}% "
@@ -188,9 +144,35 @@ class SqueezeV8Strategy(SignalGenerator):
             file=sys.stderr,
         )
 
-    def poll(self) -> list[Signal] | None:
+    def _warm_up_states(self) -> None:
         assert self._client is not None
         now = datetime.now(UTC)
+        start = now - timedelta(hours=_LOOKBACK_BARS + 2)
+        for symbol in SYMBOLS:
+            try:
+                candles = self._client.fetch_klines(
+                    symbol=symbol.replace("/", ""),
+                    interval=self.analysis_interval,
+                    start=start,
+                    end=now,
+                )
+                state = _SqueezeV7PreviewState()
+                for candle in candles:
+                    if candle.close_time <= now:
+                        state.commit(candle)
+                        self._last_committed_hour[symbol] = candle.open_time
+                self._states[symbol] = state
+                print(
+                    f"  {symbol}: warmed up {state.candle_count} bars",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                print(f"  {symbol}: warmup failed: {exc}", file=sys.stderr)
+                self._states[symbol] = _SqueezeV7PreviewState()
+
+    def poll(self) -> list[Signal] | None:
+        assert self._client is not None
+        now = self.current_time()
         signals: list[Signal] = []
 
         for symbol in SYMBOLS:
@@ -204,108 +186,187 @@ class SqueezeV8Strategy(SignalGenerator):
 
     def _check_symbol(self, symbol: str, now: datetime) -> list[Signal]:
         assert self._client is not None
-        signals: list[Signal] = []
 
-        # Fetch candles
+        state = self._states.get(symbol)
+        if state is None:
+            return []
+
+        preview_enabled = self.effective_poll_interval != self.analysis_interval
+
+        # Commit any newly closed hourly candles since last commit
+        last_committed = self._last_committed_hour.get(symbol)
+        current_hour = floor_boundary(now, self.analysis_interval)
+        if last_committed is None or last_committed < current_hour:
+            new_candles = self._client.fetch_klines(
+                symbol=symbol.replace("/", ""),
+                interval=self.analysis_interval,
+                start=(last_committed or current_hour - timedelta(hours=2)),
+                end=now,
+            )
+            for candle in new_candles:
+                candle_hour = candle.open_time
+                if candle.close_time <= now and (
+                    last_committed is None or candle_hour > last_committed
+                ):
+                    state.commit(candle)
+                    self._last_committed_hour[symbol] = candle_hour
+
+        if state.last_row is None or state.candle_count < _WARMUP_BARS:
+            return []
+
+        # Get the current candle to evaluate
+        if preview_enabled:
+            # Fetch the current open 1h candle snapshot from Binance
+            candles = self._client.fetch_klines(
+                symbol=symbol.replace("/", ""),
+                interval=self.analysis_interval,
+                start=current_hour,
+                end=now + timedelta(hours=1),
+            )
+            if not candles:
+                return []
+            eval_candle = candles[-1]
+            if eval_candle.close_time <= now:
+                # Hour already closed, was committed above — nothing to preview
+                return []
+        else:
+            # Non-preview: evaluate the last committed candle
+            if state.last_row is None:
+                return []
+            eval_candle = Candle(
+                open_time=state.last_row.open_time,
+                close_time=state.last_row.close_time,
+                open=0.0,
+                high=0.0,
+                low=0.0,
+                close=state.prev_close or 0.0,
+                volume=0.0,
+            )
+            # For non-preview, use the committed last_row directly
+            row = state.last_row
+            prev_row = state.last_row  # Need the row before last_row
+            # Non-preview path: we need the previous bar's squeeze_count.
+            # Since we only have the last committed row, we use it as "current"
+            # and need the one before it. Fall back to pandas for non-preview.
+            return self._check_symbol_pandas(symbol, now)
+
+        # Preview path: evaluate partial candle with incremental state
+        step = state.preview(eval_candle)
+        row = step.row
+        prev = state.last_row
+
+        if np.isnan(row.mom_slope) or np.isnan(row.atr_ratio):
+            return []
+
+        atr_ratio = _safe_feature_value(row.atr_ratio, 1.0)
+        if atr_ratio > self.atr_ratio_max:
+            return []
+
+        if prev.squeeze_count < self.min_squeeze_bars or row.squeeze_on:
+            return []
+
+        rsi = _safe_feature_value(row.rsi_14, 50.0)
+        ret_72h = _safe_feature_value(row.ret_72h, 0.0)
+        mom = _safe_feature_value(row.mom_slope, 0.0)
+
+        source_hour_start = eval_candle.open_time
+        emitted, self._last_short[symbol], self._last_long[symbol] = emit_squeeze_entry_signals(
+            signal_date=now,
+            symbol=symbol,
+            config=self,
+            strategy_name="squeeze_v8",
+            prev_squeeze_count=int(prev.squeeze_count),
+            squeeze_on=row.squeeze_on,
+            mom=mom,
+            rsi=rsi,
+            atr_ratio=atr_ratio,
+            ret_72h=ret_72h,
+            last_short=self._last_short.get(symbol),
+            last_long=self._last_long.get(symbol),
+            source_period_start=source_hour_start,
+            source_period_gate=self._source_period_gate,
+            short_gate_key=symbol,
+            long_gate_key=symbol,
+        )
+        return emitted
+
+    def _check_symbol_pandas(self, symbol: str, now: datetime) -> list[Signal]:
+        """Fallback for non-preview (hourly) polling: full pandas recompute.
+
+        Only used when poll_interval == analysis_interval (default 1h mode).
+        """
+        assert self._client is not None
+        import pandas as pd
+        from backtester.strategies.squeeze_v7 import build_squeeze_v7_feature_frame
+
         start = now - timedelta(hours=_LOOKBACK_BARS + 2)
         candles = self._client.fetch_klines(
             symbol=symbol.replace("/", ""),
-            interval="1h",
+            interval=self.analysis_interval,
             start=start,
             end=now,
         )
 
         if len(candles) < _WARMUP_BARS + 1:
-            return signals
+            return []
 
-        df = _candles_to_df(candles)
-        df = _compute_indicators(df)
+        rows = []
+        for c in candles:
+            rows.append({
+                "open_time": c.open_time,
+                "close_time": c.close_time,
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+                "volume": c.volume,
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return []
+        df = df.sort_values("open_time").reset_index(drop=True)
+        df = build_squeeze_v7_feature_frame(df)
 
-        # Evaluate last completed candle
         last_idx = len(df) - 1
         if df.iloc[last_idx]["close_time"] > now:
             last_idx -= 1
         if last_idx < _WARMUP_BARS:
-            return signals
+            return []
 
         row = df.iloc[last_idx]
         prev = df.iloc[last_idx - 1]
 
-        # Check required indicators
         if pd.isna(row.get("mom_slope")) or pd.isna(row.get("atr_ratio")):
-            return signals
+            return []
 
         rsi = row.get("rsi_14", 50)
         if pd.isna(rsi):
             rsi = 50
-
         atr_ratio = row.get("atr_ratio", 1.0)
         if pd.isna(atr_ratio):
             atr_ratio = 1.0
-
         ret_72h = row.get("ret_72h", 0)
         if pd.isna(ret_72h):
             ret_72h = 0
 
-        # ATR ratio gate: skip in elevated volatility
         if atr_ratio > self.atr_ratio_max:
-            return signals
-
-        # Squeeze breakout: previous bar in squeeze for 7+ bars, current NOT in squeeze
+            return []
         if prev["squeeze_count"] < self.min_squeeze_bars or row["squeeze_on"]:
-            return signals
+            return []
 
         mom = row["mom_slope"]
-
-        # ── SHORT signal: negative momentum + RSI not deeply oversold ────
-        last_s = self._last_short.get(symbol)
-        short_ok = (last_s is None or
-                    (now - last_s).total_seconds() >= self.short_cooldown_h * 3600)
-
-        if short_ok and mom < 0 and rsi >= self.short_rsi_floor:
-            self._last_short[symbol] = now
-            signals.append(Signal(
-                signal_date=datetime.now(UTC),
-                position_type=PositionType.SHORT,
-                ticker=symbol,
-                tp_pct=self.short_tp,
-                sl_pct=self.short_sl,
-                leverage=self.leverage,
-                market_type=MarketType.FUTURES,
-                taker_fee_rate=0.0005,
-                metadata={
-                    "strategy": "squeeze_v8_short",
-                    "mom": round(float(mom), 6),
-                    "rsi": round(float(rsi), 1),
-                    "atr_ratio": round(float(atr_ratio), 2),
-                    "sq_count": int(prev["squeeze_count"]),
-                },
-            ))
-
-        # ── LONG signal: positive momentum + bull regime + RSI not overbought ──
-        last_l = self._last_long.get(symbol)
-        long_ok = (last_l is None or
-                   (now - last_l).total_seconds() >= self.long_cooldown_h * 3600)
-
-        if long_ok and mom > 0 and rsi <= self.long_rsi_cap and ret_72h >= self.long_regime_min:
-            self._last_long[symbol] = now
-            signals.append(Signal(
-                signal_date=datetime.now(UTC),
-                position_type=PositionType.LONG,
-                ticker=symbol,
-                tp_pct=self.long_tp,
-                sl_pct=self.long_sl,
-                leverage=self.leverage,
-                market_type=MarketType.FUTURES,
-                taker_fee_rate=0.0005,
-                metadata={
-                    "strategy": "squeeze_v8_long",
-                    "mom": round(float(mom), 6),
-                    "rsi": round(float(rsi), 1),
-                    "atr_ratio": round(float(atr_ratio), 2),
-                    "ret_72h": round(float(ret_72h), 1),
-                    "sq_count": int(prev["squeeze_count"]),
-                },
-            ))
-
-        return signals
+        emitted, self._last_short[symbol], self._last_long[symbol] = emit_squeeze_entry_signals(
+            signal_date=now,
+            symbol=symbol,
+            config=self,
+            strategy_name="squeeze_v8",
+            prev_squeeze_count=int(prev["squeeze_count"]),
+            squeeze_on=bool(row["squeeze_on"]),
+            mom=float(mom),
+            rsi=float(rsi),
+            atr_ratio=float(atr_ratio),
+            ret_72h=float(ret_72h),
+            last_short=self._last_short.get(symbol),
+            last_long=self._last_long.get(symbol),
+        )
+        return emitted

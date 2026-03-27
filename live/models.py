@@ -38,6 +38,21 @@ class PositionStatus(StrEnum):
 
 
 @dataclass(slots=True, frozen=True)
+class AccountTrade:
+    trade_id: int
+    order_id: int
+    symbol: str
+    side: OrderSide
+    price: float
+    quantity: float
+    time: datetime
+    realized_pnl: float = 0.0
+    commission: float = 0.0
+    commission_asset: str = ""
+    position_side: str = "BOTH"
+
+
+@dataclass(slots=True, frozen=True)
 class ExchangeOrder:
     order_id: int
     symbol: str
@@ -65,9 +80,10 @@ class LivePosition:
     fill_price: float = 0.0
     quantity: float = 0.0
     opened_at: datetime | None = None
-    pnl_pct: float = 0.0
-    gross_pnl_pct: float = 0.0
-    fee_drag_pct: float = 0.0
+    exit_price: float | None = None
+    pnl_pct: float | None = None
+    gross_pnl_pct: float | None = None
+    fee_drag_pct: float | None = None
     closed_at: datetime | None = None
 
 
