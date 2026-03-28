@@ -62,6 +62,10 @@ all work through per-signal `backtest_signal()` fetches:
 `backtest_signal()` remains available as the compatibility fallback for direct
 single-signal evaluation.
 
+When using Bybit market data, exact trade-level replay is not available through
+the old `aggTrades` path. Prefer `approximate=True` evaluation/backtests unless
+you add a separate Bybit-compatible exact execution source.
+
 ### Evaluation Standard
 
 Going forward, new strategy evaluation should use the shared evaluator and the
@@ -87,14 +91,21 @@ The live layer is responsible for:
 Configuration can be loaded from environment variables or
 `~/.claude_trader/live_config.json`. The live runner scripts also accept
 `--config /path/to/live_config.json` to read a specific JSON config file.
+For repo-local secrets, copy `live/local_keys.example.py` to
+`live/local_keys.py`; that file is gitignored and can expose
+`TESTNET_BOT_KEY`, `TESTNET_BOT_SECRET`, `MAINNET_BOT_KEY`,
+`MAINNET_BOT_SECRET`.
 
 Environment variables:
 
-- `BINANCE_API_KEY`
-- `BINANCE_API_SECRET`
-- `BINANCE_BASE_URL`
-- `BINANCE_POSITION_SIZE`
-- `BINANCE_MAX_POSITIONS`
-- `BINANCE_MAX_HOLDING_HOURS`
-- `BINANCE_ORDER_CHECK_INTERVAL`
-- `BINANCE_TESTNET`
+- `BYBIT_API_KEY`
+- `BYBIT_API_SECRET`
+- `BYBIT_BASE_URL`
+- `BYBIT_POSITION_SIZE`
+- `BYBIT_MAX_POSITIONS`
+- `BYBIT_MAX_HOLDING_HOURS`
+- `BYBIT_ORDER_CHECK_INTERVAL`
+- `BYBIT_TESTNET`
+
+Before placing any order, run a non-trading smoke test:
+`py -3 -m live.check_bybit_keys --testnet`

@@ -1,6 +1,6 @@
-"""Live trading runtime primitives for Binance Futures."""
+"""Live trading runtime primitives for Bybit linear futures."""
 
-from .auth_client import BinanceFuturesClient, LiveMarketClient
+from .auth_client import BybitFuturesClient, LiveMarketClient
 from .engine import LiveEngine
 from .executor import OrderExecutor
 from .models import (
@@ -16,7 +16,7 @@ from .signal_generator import SignalGenerator
 from .tracker import PositionTracker
 
 __all__ = [
-    "BinanceFuturesClient",
+    "BybitFuturesClient",
     "ExchangeOrder",
     "LiveConfig",
     "LiveEngine",

@@ -11,11 +11,11 @@ from .models import (
 )
 
 if TYPE_CHECKING:
-    from backtester.data import BinanceClient
+    from backtester.data import BybitClient
 
 
 def build_market_data_bundle(
-    client: "BinanceClient",
+    client: "BybitClient",
     symbols: list[str],
     start: datetime,
     end: datetime,
@@ -43,7 +43,7 @@ def build_market_data_bundle(
 
 
 def _fetch_dataset(
-    client: "BinanceClient",
+    client: "BybitClient",
     requirement: DataRequirement,
     symbol: str,
     start: datetime,

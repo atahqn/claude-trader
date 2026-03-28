@@ -17,7 +17,7 @@ from .models import (
 )
 
 if TYPE_CHECKING:
-    from backtester.data import BinanceClient
+    from backtester.data import BybitClient
 
 
 @dataclass(slots=True)
@@ -68,7 +68,7 @@ def build_market_context_bundle(raw_bundle: MarketDataBundle) -> MarketContextBu
 
 
 def fetch_market_context_bundle(
-    client: "BinanceClient",
+    client: "BybitClient",
     symbols: list[str],
     start: datetime,
     end: datetime,

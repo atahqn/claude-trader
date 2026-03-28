@@ -20,7 +20,7 @@ from .pipeline import BacktestExecutionSession, prepare_market_context
 if TYPE_CHECKING:
     from live.signal_generator import SignalGenerator
 
-    from .data import BinanceClient
+    from .data import BybitClient
 
 
 # ---------------------------------------------------------------------------
@@ -149,17 +149,17 @@ class StrategyEvaluator:
         self,
         symbols: list[str],
         config: PortfolioConfig = PortfolioConfig(),
-        client: BinanceClient | None = None,
+        client: BybitClient | None = None,
         cooldown_warmup: timedelta = timedelta(days=14),
     ) -> None:
         self._symbols = symbols
         self._config = config
         self._cooldown_warmup = cooldown_warmup
         if client is None:
-            from .data import BinanceClient as _BinanceClient
+            from .data import BybitClient as _BybitClient
 
-            client = _BinanceClient()
-        self._client: BinanceClient = client
+            client = _BybitClient()
+        self._client: BybitClient = client
 
     def evaluate(
         self,

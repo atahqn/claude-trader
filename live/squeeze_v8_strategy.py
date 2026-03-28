@@ -27,12 +27,12 @@ Polling:
   - analysis interval stays 1h
   - poll interval defaults to 1h, preserving the old close-only behavior
   - when poll interval is lower (for example 15m or 5m), the strategy evaluates
-    Binance's current in-progress 1h candle snapshot at those poll boundaries
+    Bybit's current in-progress 1h candle snapshot at those poll boundaries
   - uses incremental _SqueezeV7PreviewState per symbol for O(1) indicator updates
 
 Look-ahead bias prevention:
   - close-only mode uses the last fully closed 1h candle
-  - preview mode uses the currently visible 1h candle snapshot from Binance
+  - preview mode uses the currently visible 1h candle snapshot from Bybit
   - all indicators remain backward-looking: rolling(), ewm(), pct_change()
   - entry executes via market order after signal
 """
@@ -226,7 +226,7 @@ class SqueezeV8Strategy(SignalGenerator):
 
         # Get the current candle to evaluate
         if preview_enabled:
-            # Fetch the current open 1h candle snapshot from Binance
+            # Fetch the current open 1h candle snapshot from Bybit
             candles = self._client.fetch_klines(
                 symbol=symbol.replace("/", ""),
                 interval=self.analysis_interval,

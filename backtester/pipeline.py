@@ -15,7 +15,7 @@ from .models import AggTrade, Candle
 from .preview import interval_to_timedelta
 
 if TYPE_CHECKING:
-    from .data import BinanceClient
+    from .data import BybitClient
 
 
 def _normalize_time(dt: datetime) -> datetime:
@@ -187,7 +187,7 @@ def prepare_market_context(
     start: datetime,
     end: datetime,
     *,
-    client: "BinanceClient | None" = None,
+    client: "BybitClient | None" = None,
     request: MarketDataRequest | None = None,
     warmup: timedelta | None = None,
     warmup_bars: int = 0,
@@ -200,9 +200,9 @@ def prepare_market_context(
         raise ValueError("warmup must be non-negative")
 
     if client is None:
-        from .data import BinanceClient
+        from .data import BybitClient
 
-        client = BinanceClient()
+        client = BybitClient()
 
     fetch_start = start - warmup
     bundle = client.fetch_market_context_bundle(symbols, fetch_start, end, request)

@@ -25,6 +25,21 @@ _MAX_RETRY_DELAY = 300.0
 _RETRYABLE_STATUS_CODES = {418, 429}
 
 _CACHE_ROOT = Path.home() / ".claude_trader" / "cache"
+_BYBIT_INTERVAL_MAP = {
+    "1m": "1",
+    "3m": "3",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "2h": "120",
+    "4h": "240",
+    "6h": "360",
+    "12h": "720",
+    "1d": "D",
+    "1w": "W",
+    "1M": "M",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -101,15 +116,38 @@ def _from_millis(ms: int) -> datetime:
     return datetime.fromtimestamp(ms / 1000, tz=UTC)
 
 
-def _parse_kline(row: list[Any]) -> Candle:
+def _interval_to_bybit(interval: str) -> str:
+    mapped = _BYBIT_INTERVAL_MAP.get(interval)
+    if mapped is None:
+        raise ValueError(f"unsupported interval for Bybit: {interval}")
+    return mapped
+
+
+def _interval_to_timedelta(interval: str) -> timedelta:
+    unit = interval[-1]
+    value = int(interval[:-1])
+    if unit == "m":
+        return timedelta(minutes=value)
+    if unit == "h":
+        return timedelta(hours=value)
+    if unit == "d":
+        return timedelta(days=value)
+    if unit == "w":
+        return timedelta(weeks=value)
+    raise ValueError(f"unsupported interval for Bybit: {interval}")
+
+
+def _parse_kline(row: list[Any], interval: str) -> Candle:
+    open_time = _from_millis(int(row[0]))
+    close_time = open_time + _interval_to_timedelta(interval)
     return Candle(
-        open_time=_from_millis(row[0]),
-        close_time=_from_millis(row[6]),
+        open_time=open_time,
+        close_time=close_time,
         open=float(row[1]),
         high=float(row[2]),
         low=float(row[3]),
         close=float(row[4]),
-        volume=float(row[5]),
+        volume=float(row[5]) if len(row) > 5 else 0.0,
     )
 
 
@@ -125,7 +163,7 @@ def _parse_agg_trade(row: dict[str, Any]) -> AggTrade:
 def _parse_funding_rate(row: dict[str, Any]) -> FundingRate:
     mark_price_raw = row.get("markPrice")
     return FundingRate(
-        timestamp=_from_millis(int(row["fundingTime"])),
+        timestamp=_from_millis(int(row.get("fundingRateTimestamp", row.get("fundingTime")))),
         funding_rate=float(row["fundingRate"]),
         mark_price=float(mark_price_raw) if mark_price_raw not in (None, "") else None,
     )
@@ -140,6 +178,16 @@ def _sync_rate_limiter(rate_limiter: _RateLimiter, headers: Any) -> None:
     if headers is None:
         return
     used = headers.get("X-MBX-USED-WEIGHT-1m")
+    if used is None:
+        limit_status = headers.get("X-Bapi-Limit-Status")
+        limit = headers.get("X-Bapi-Limit")
+        if limit_status is not None and limit is not None:
+            try:
+                rate_limiter.limit_per_minute = int(limit) * 60
+                rate_limiter.sync_from_server(int(limit) - int(limit_status))
+                return
+            except (ValueError, TypeError):
+                pass
     if used is not None:
         try:
             rate_limiter.sync_from_server(int(used))
@@ -159,39 +207,32 @@ def _retry_delay(exc: HTTPError, fallback: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# BinanceClient
+# BybitClient
 # ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
-class BinanceClient:
+class BybitClient:
     market_type: MarketType = MarketType.FUTURES
     cache_root: Path = _CACHE_ROOT
+    base_url: str = "https://api.bybit.com"
     _disk_cache: _DiskCache = field(init=False, repr=False)
     _mem_cache: dict[str, Any] = field(init=False, repr=False, default_factory=dict)
     _rate_limiter: _RateLimiter = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._disk_cache = _DiskCache(self.cache_root)
-        limit = 2400 if self.market_type is MarketType.FUTURES else 6000
+        limit = 1200
         self._rate_limiter = _RateLimiter(limit_per_minute=limit)
 
     @property
     def _base_url(self) -> str:
-        if self.market_type is MarketType.FUTURES:
-            return "https://fapi.binance.com"
-        return "https://api.binance.com"
+        return self.base_url
 
     @property
-    def _klines_path(self) -> str:
+    def _category(self) -> str:
         if self.market_type is MarketType.FUTURES:
-            return "/fapi/v1/klines"
-        return "/api/v3/klines"
-
-    @property
-    def _agg_trades_path(self) -> str:
-        if self.market_type is MarketType.FUTURES:
-            return "/fapi/v1/aggTrades"
-        return "/api/v3/aggTrades"
+            return "linear"
+        return "spot"
 
     # -- Public API ----------------------------------------------------------
 
@@ -202,30 +243,45 @@ class BinanceClient:
         start: datetime,
         end: datetime,
     ) -> list[Candle]:
-        """Fetch klines with automatic pagination (batch of 1500)."""
+        """Fetch Bybit klines with automatic pagination."""
         api_symbol = _symbol_for_api(symbol)
-        batch_limit = 1500 if self.market_type is MarketType.FUTURES else 1000
+        bybit_interval = _interval_to_bybit(interval)
+        batch_limit = 1000
         all_candles: list[Candle] = []
         cursor_ms = _to_millis(start)
         end_ms = _to_millis(end)
 
         while cursor_ms < end_ms:
             params: dict[str, Any] = {
+                "category": self._category,
                 "symbol": api_symbol,
-                "interval": interval,
+                "interval": bybit_interval,
                 "limit": batch_limit,
-                "startTime": cursor_ms,
-                "endTime": end_ms,
+                "start": cursor_ms,
+                "end": end_ms,
             }
-            payload = self._get_json(self._klines_path, params, weight=2)
-            if not payload:
+            payload = self._get_json("/v5/market/kline", params, weight=1)
+            raw_rows = payload.get("list", [])
+            if not raw_rows:
                 break
-            batch = [_parse_kline(row) for row in payload]
+            batch = sorted(
+                (
+                    _parse_kline(row, interval)
+                    for row in raw_rows
+                ),
+                key=lambda candle: candle.open_time,
+            )
+            batch = [
+                candle
+                for candle in batch
+                if candle.open_time >= start and candle.open_time < end
+            ]
+            if not batch:
+                break
             all_candles.extend(batch)
-            if len(batch) < batch_limit:
+            if len(raw_rows) < batch_limit:
                 break
-            # Advance cursor past last candle
-            cursor_ms = _to_millis(batch[-1].open_time) + 1
+            cursor_ms = _to_millis(batch[-1].open_time + _interval_to_timedelta(interval))
 
         return all_candles
 
@@ -235,55 +291,11 @@ class BinanceClient:
         start: datetime,
         end: datetime,
     ) -> list[AggTrade]:
-        """Fetch aggregate trades with fromId pagination and dedup."""
-        api_symbol = _symbol_for_api(symbol)
-        start_ms = _to_millis(start)
-        end_ms = _to_millis(end)
-        all_trades: list[AggTrade] = []
-        seen_ids: set[int] = set()
-
-        # First request uses startTime/endTime
-        params: dict[str, Any] = {
-            "symbol": api_symbol,
-            "startTime": start_ms,
-            "endTime": end_ms,
-            "limit": 1000,
-        }
-        payload = self._get_json(self._agg_trades_path, params, weight=20)
-        if not payload:
-            return all_trades
-
-        while True:
-            next_from_id: int | None = None
-            stop = False
-            for raw in payload:
-                trade = _parse_agg_trade(raw)
-                if trade.trade_id in seen_ids:
-                    continue
-                seen_ids.add(trade.trade_id)
-                trade_ms = _to_millis(trade.timestamp)
-                if trade_ms < start_ms:
-                    next_from_id = trade.trade_id + 1
-                    continue
-                if trade_ms >= end_ms:
-                    stop = True
-                    break
-                all_trades.append(trade)
-                next_from_id = trade.trade_id + 1
-
-            if stop or len(payload) < 1000 or next_from_id is None:
-                break
-
-            params = {
-                "symbol": api_symbol,
-                "fromId": next_from_id,
-                "limit": 1000,
-            }
-            payload = self._get_json(self._agg_trades_path, params, weight=20)
-            if not payload:
-                break
-
-        return all_trades
+        raise NotImplementedError(
+            "Bybit V5 does not expose time-paginated historical public trades "
+            "compatible with the old aggTrades workflow. "
+            "Use approximate=True for Bybit backtests."
+        )
 
     def fetch_funding_rates(
         self,
@@ -293,12 +305,15 @@ class BinanceClient:
     ) -> list[FundingRate]:
         self._require_futures_dataset("funding rates")
         return self._fetch_timeseries(
-            path="/fapi/v1/fundingRate",
-            params={"symbol": _symbol_for_api(symbol)},
+            path="/v5/market/funding/history",
+            params={
+                "category": self._category,
+                "symbol": _symbol_for_api(symbol),
+            },
             start=start,
             end=end,
-            limit=1000,
-            time_field="fundingTime",
+            limit=200,
+            time_field="fundingRateTimestamp",
             weight=1,
             parser=_parse_funding_rate,
         )
@@ -312,7 +327,7 @@ class BinanceClient:
     ) -> list[Candle]:
         self._require_futures_dataset("mark price klines")
         return self._fetch_kline_series(
-            path="/fapi/v1/markPriceKlines",
+            path="/v5/market/mark-price-kline",
             symbol=symbol,
             interval=interval,
             start=start,
@@ -329,7 +344,7 @@ class BinanceClient:
     ) -> list[Candle]:
         self._require_futures_dataset("premium index klines")
         return self._fetch_kline_series(
-            path="/fapi/v1/premiumIndexKlines",
+            path="/v5/market/premium-index-price-kline",
             symbol=symbol,
             interval=interval,
             start=start,
@@ -363,7 +378,7 @@ class BinanceClient:
 
     def _require_futures_dataset(self, label: str) -> None:
         if self.market_type is not MarketType.FUTURES:
-            raise ValueError(f"{label} are only available for Binance futures")
+            raise ValueError(f"{label} are only available for Bybit linear futures")
 
     def _fetch_kline_series(
         self,
@@ -376,27 +391,40 @@ class BinanceClient:
         weight: int,
     ) -> list[Candle]:
         api_symbol = _symbol_for_api(symbol)
-        batch_limit = 1500
+        bybit_interval = _interval_to_bybit(interval)
+        batch_limit = 1000
         all_candles: list[Candle] = []
         cursor_ms = _to_millis(start)
         end_ms = _to_millis(end)
 
         while cursor_ms < end_ms:
             params: dict[str, Any] = {
+                "category": self._category,
                 "symbol": api_symbol,
-                "interval": interval,
+                "interval": bybit_interval,
                 "limit": batch_limit,
-                "startTime": cursor_ms,
-                "endTime": end_ms,
+                "start": cursor_ms,
+                "end": end_ms,
             }
             payload = self._get_json(path, params, weight=weight)
-            if not payload:
+            raw_rows = payload.get("list", [])
+            if not raw_rows:
                 break
-            batch = [_parse_kline(row) for row in payload]
+            batch = sorted(
+                (_parse_kline(row, interval) for row in raw_rows),
+                key=lambda candle: candle.open_time,
+            )
+            batch = [
+                candle
+                for candle in batch
+                if candle.open_time >= start and candle.open_time < end
+            ]
+            if not batch:
+                break
             all_candles.extend(batch)
-            if len(batch) < batch_limit:
+            if len(raw_rows) < batch_limit:
                 break
-            cursor_ms = _to_millis(batch[-1].open_time) + 1
+            cursor_ms = _to_millis(batch[-1].open_time + _interval_to_timedelta(interval))
 
         return all_candles
 
@@ -422,11 +450,12 @@ class BinanceClient:
             request_params["endTime"] = end_ms
             request_params["limit"] = limit
             payload = self._get_json(path, request_params, weight=weight)
-            if not payload:
+            raw_rows = payload.get("list", [])
+            if not raw_rows:
                 break
 
             last_ms: int | None = None
-            for raw in payload:
+            for raw in sorted(raw_rows, key=lambda item: int(item[time_field])):
                 raw_ms = int(raw[time_field])
                 if raw_ms < cursor_ms:
                     continue
@@ -435,7 +464,7 @@ class BinanceClient:
                 rows.append(parser(raw))
                 last_ms = raw_ms
 
-            if len(payload) < limit or last_ms is None:
+            if len(raw_rows) < limit or last_ms is None:
                 break
             cursor_ms = last_ms + 1
 
@@ -449,7 +478,7 @@ class BinanceClient:
 
         # Disk cache
         cache_key = [path] + [f"{k}={params[k]}" for k in sorted(params)]
-        cached = self._disk_cache.get("binance", cache_key)
+        cached = self._disk_cache.get("bybit", cache_key)
         if cached is not None:
             self._mem_cache[mem_key] = cached
             return cached
@@ -465,15 +494,13 @@ class BinanceClient:
             try:
                 with urlopen(url) as response:
                     payload = json.loads(response.read())
-                    _sync_rate_limiter(self._rate_limiter, response.headers)
             except HTTPError as exc:
                 if exc.code not in _RETRYABLE_STATUS_CODES:
                     raise
-                _sync_rate_limiter(self._rate_limiter, exc.headers)
                 delay = _retry_delay(exc, next_delay)
                 symbol = params.get("symbol", "")
                 print(
-                    f"Binance throttled ({exc.code}) on {path} symbol={symbol}; "
+                    f"Bybit throttled ({exc.code}) on {path} symbol={symbol}; "
                     f"waiting {delay:.1f}s before retry {attempt + 1}.",
                     file=sys.stderr,
                 )
@@ -482,6 +509,13 @@ class BinanceClient:
                 attempt += 1
                 continue
 
-            self._disk_cache.set("binance", cache_key, payload)
-            self._mem_cache[mem_key] = payload
-            return payload
+            if payload.get("retCode", 0) != 0:
+                raise RuntimeError(
+                    f"Bybit API error {payload.get('retCode')} on {path}: "
+                    f"{payload.get('retMsg', 'unknown error')}"
+                )
+
+            result = payload.get("result", payload)
+            self._disk_cache.set("bybit", cache_key, result)
+            self._mem_cache[mem_key] = result
+            return result

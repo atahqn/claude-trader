@@ -5,5 +5,8 @@ __pycache__/
 .venv/
 venv/
 .env
+live/local_keys.py
+live_config.local.json
+*.local.json
 live/run_rsi_filtered.py
 live/rsi_filtered_strategy.py

@@ -4,7 +4,7 @@ import random as _random_module
 from datetime import datetime, timedelta
 from typing import Any
 
-from .data import BinanceClient
+from .data import BybitClient
 from .models import (
     BacktestResult,
     ExitReason,
@@ -147,7 +147,7 @@ def _aggregate_entry_candle(
 def _ensure_session(
     *,
     signal: Signal | None = None,
-    client: BinanceClient | None = None,
+    client: BybitClient | None = None,
     session: BacktestExecutionSession | None = None,
     prepared_context: PreparedMarketContext | None = None,
     use_chunk_cache: bool = True,
@@ -158,9 +158,9 @@ def _ensure_session(
     if client is None:
         market_type = signal.market_type if signal is not None else None
         if market_type is None:
-            client = BinanceClient()
+            client = BybitClient()
         else:
-            client = BinanceClient(market_type=market_type)
+            client = BybitClient(market_type=market_type)
 
     return BacktestExecutionSession(
         client=client,
@@ -171,7 +171,7 @@ def _ensure_session(
 
 def backtest_signal(
     signal: Signal,
-    client: BinanceClient | None = None,
+    client: BybitClient | None = None,
     max_hours: int = 168,
     approximate: bool = False,
     rng: _random_module.Random | None = None,
@@ -356,7 +356,7 @@ def _compute_stats(trades: list[TradeResult]) -> dict:
 
 def backtest_signals(
     signals: list[Signal],
-    client: BinanceClient | None = None,
+    client: BybitClient | None = None,
     max_hours: int = 168,
     approximate: bool = False,
     seed: int | None = None,

@@ -8,6 +8,7 @@ Current strategy: Squeeze V8 (SHORT + LONG, wider SHORT stops + relaxed filters)
 """
 
 import argparse
+import os
 import sys
 
 sys.path.insert(0, "/home/caner/claude_trader")
@@ -20,12 +21,16 @@ from live.squeeze_v8_strategy import SqueezeV8Strategy
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live Trader — Squeeze V8")
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
-    parser.add_argument("--testnet", action="store_true", help="Use Binance testnet")
+    parser.add_argument("--testnet", action="store_true", help="Use Bybit testnet")
     parser.add_argument("--leverage", type=float, default=1.0, help="Leverage multiplier (default: 1)")
+    parser.add_argument("--poll-interval", type=str, default=None, help="Optional poll interval override (1h, 30m, 15m, 5m, 1m)")
     parser.add_argument("--size", type=float, default=None, help="Position size in USDT (overrides config)")
     parser.add_argument("--max-positions", type=int, default=None, help="Max concurrent positions (overrides config)")
     parser.add_argument("--max-holding-hours", type=int, default=None, help="Max holding time per trade (overrides config)")
     args = parser.parse_args()
+
+    if args.testnet:
+        os.environ["BYBIT_TESTNET"] = "true"
 
     config = LiveConfig.load(args.config)
 
@@ -51,7 +56,7 @@ def main() -> None:
             testnet=overrides.get("testnet", config.testnet),
         )
 
-    strategy = SqueezeV8Strategy(leverage=args.leverage)
+    strategy = SqueezeV8Strategy(leverage=args.leverage, poll_interval=args.poll_interval)
     engine = LiveEngine(generator=strategy, config=config)
 
     print(
@@ -61,6 +66,7 @@ def main() -> None:
         f"  LONG:     TP/SL=4.0/2.0% (bull only: ret_72h>=6%, mom>0, RSI<=70)\n"
         f"  Shared:   min_squeeze=7 bars, cooldown=12h\n"
         f"  Leverage: {args.leverage}x\n"
+        f"  Poll:     {strategy.effective_poll_interval}\n"
         f"  Size:     {config.position_size_usdt} USDT\n"
         f"  Max pos:  {config.max_concurrent_positions}\n"
         f"  Hold max: {config.max_holding_hours}h\n"

@@ -12,7 +12,7 @@ from .models import (
     Signal,
     TradeResult,
 )
-from .data import BinanceClient
+from .data import BybitClient
 from .engine import backtest_signal, backtest_signals
 from .pipeline import (
     BacktestExecutionSession,
@@ -43,7 +43,7 @@ __all__ = [
     "AggTrade",
     "BacktestResult",
     "BacktestExecutionSession",
-    "BinanceClient",
+    "BybitClient",
     "Candle",
     "ExitReason",
     "ExitResolution",
