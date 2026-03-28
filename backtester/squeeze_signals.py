@@ -14,6 +14,7 @@ def build_squeeze_signal(
     symbol: str,
     config: Any,
     metadata: dict[str, object],
+    size_multiplier: float = 1.0,
 ) -> Signal:
     max_holding_hours = getattr(config, "max_holding_hours", 72)
     return Signal(
@@ -27,6 +28,7 @@ def build_squeeze_signal(
         taker_fee_rate=getattr(config, "taker_fee_rate", 0.0005),
         entry_delay_seconds=5,
         max_holding_hours=max_holding_hours,
+        size_multiplier=size_multiplier,
         metadata=metadata,
     )
 

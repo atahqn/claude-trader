@@ -77,7 +77,7 @@ coded window calendar instead of one-off `*_eval.py` scripts.
 
 The live layer is responsible for:
 
-- loading exchange credentials and runtime settings
+- loading exchange credentials, endpoint selection, and max position size
 - polling signal generators
 - checking capital and position-slot availability before execution
 - submitting entries and protective exits
@@ -87,14 +87,13 @@ The live layer is responsible for:
 Configuration can be loaded from environment variables or
 `~/.claude_trader/live_config.json`. The live runner scripts also accept
 `--config /path/to/live_config.json` to read a specific JSON config file.
+Signal definitions, TP/SL, holding times, and other strategy behavior stay in
+the strategy code and generated signals, not in live config.
 
 Environment variables:
 
 - `BINANCE_API_KEY`
 - `BINANCE_API_SECRET`
 - `BINANCE_BASE_URL`
-- `BINANCE_POSITION_SIZE`
-- `BINANCE_MAX_POSITIONS`
-- `BINANCE_MAX_HOLDING_HOURS`
-- `BINANCE_ORDER_CHECK_INTERVAL`
 - `BINANCE_TESTNET`
+- `BINANCE_MAX_POSITION_SIZE`

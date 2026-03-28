@@ -26,6 +26,7 @@ class OrderExecutor:
         self._client = client
         self._config = config
         self._symbol_info: dict[str, dict[str, Any]] = {}
+        self._current_size_multiplier: float = 1.0
 
     # -- Public ----------------------------------------------------------------
 
@@ -46,6 +47,7 @@ class OrderExecutor:
         else:
             entry_price = self._client.get_mark_price(signal.ticker)
 
+        self._current_size_multiplier = signal.size_multiplier
         quantity, required_notional = self._compute_entry_quantity(
             api_symbol,
             entry_price,
@@ -175,7 +177,7 @@ class OrderExecutor:
         *,
         use_market_filter: bool,
     ) -> tuple[float, float]:
-        raw_qty = self._config.position_size_usdt / entry_price
+        raw_qty = self._config.max_position_size_usdt * self._current_size_multiplier / entry_price
         quantity = self._round_quantity(
             api_symbol,
             raw_qty,

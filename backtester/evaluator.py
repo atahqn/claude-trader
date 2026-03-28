@@ -305,10 +305,11 @@ def _build_summary(
     gross_loss = 0.0
     for wr in wrs:
         for t in wr.backtest.trades:
-            if t.pnl_pct > 0:
-                gross_profit += t.pnl_pct
-            elif t.pnl_pct < 0:
-                gross_loss += abs(t.pnl_pct)
+            weighted = t.pnl_pct * t.signal.size_multiplier
+            if weighted > 0:
+                gross_profit += weighted
+            elif weighted < 0:
+                gross_loss += abs(weighted)
 
     return CategorySummary(
         category=category,

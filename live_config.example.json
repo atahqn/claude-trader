@@ -2,9 +2,5 @@
   "api_key": "YOUR_BINANCE_API_KEY",
   "api_secret": "YOUR_BINANCE_API_SECRET",
   "base_url": "https://fapi.binance.com",
-  "position_size_usdt": 100.0,
-  "max_concurrent_positions": 3,
-  "max_holding_hours": 168,
-  "order_check_interval_seconds": 5.0,
-  "testnet": false
+  "max_position_size_usdt": 100.0
 }

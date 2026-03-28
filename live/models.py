@@ -92,6 +92,18 @@ _CONFIG_PATH = _CONFIG_DIR / "live_config.json"
 
 _PROD_BASE_URL = "https://fapi.binance.com"
 _TESTNET_BASE_URL = "https://testnet.binancefuture.com"
+_ALLOWED_CONFIG_KEYS = frozenset({
+    "api_key",
+    "api_secret",
+    "base_url",
+    "max_position_size_usdt",
+})
+_REMOVED_ENV_VARS = frozenset({
+    "BINANCE_POSITION_SIZE",
+    "BINANCE_MAX_POSITIONS",
+    "BINANCE_MAX_HOLDING_HOURS",
+    "BINANCE_ORDER_CHECK_INTERVAL",
+})
 
 
 @dataclass(slots=True, frozen=True)
@@ -99,14 +111,38 @@ class LiveConfig:
     api_key: str
     api_secret: str
     base_url: str = _PROD_BASE_URL
-    position_size_usdt: float = 100.0
-    max_concurrent_positions: int = 3
-    order_check_interval_seconds: float = 5.0
-    testnet: bool = False
+    max_position_size_usdt: float = 100.0
 
     def __post_init__(self) -> None:
-        if self.testnet and self.base_url == _PROD_BASE_URL:
-            object.__setattr__(self, "base_url", _TESTNET_BASE_URL)
+        if not self.api_key:
+            raise ValueError("api_key must not be empty")
+        if not self.api_secret:
+            raise ValueError("api_secret must not be empty")
+        if not self.base_url:
+            raise ValueError("base_url must not be empty")
+        if self.max_position_size_usdt <= 0:
+            raise ValueError("max_position_size_usdt must be greater than zero")
+
+    @property
+    def is_testnet(self) -> bool:
+        return self.base_url == _TESTNET_BASE_URL
+
+    def with_overrides(
+        self,
+        *,
+        use_testnet: bool = False,
+        max_position_size_usdt: float | None = None,
+    ) -> LiveConfig:
+        return LiveConfig(
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            base_url=_TESTNET_BASE_URL if use_testnet else self.base_url,
+            max_position_size_usdt=(
+                self.max_position_size_usdt
+                if max_position_size_usdt is None
+                else max_position_size_usdt
+            ),
+        )
 
     @staticmethod
     def load(config_path: str | Path | None = None) -> LiveConfig:
@@ -115,29 +151,48 @@ class LiveConfig:
             path = Path(config_path).expanduser()
             if not path.exists():
                 raise FileNotFoundError(f"Config file not found: {path}")
-            data = json.loads(path.read_text())
-            data.pop("max_holding_hours", None)
-            return LiveConfig(**data)
+            return LiveConfig(**_load_config_data(path))
 
         api_key = os.environ.get("BINANCE_API_KEY", "")
         api_secret = os.environ.get("BINANCE_API_SECRET", "")
         if api_key and api_secret:
+            legacy_env = sorted(name for name in _REMOVED_ENV_VARS if name in os.environ)
+            if legacy_env:
+                raise ValueError(
+                    "Unsupported live config env vars are still set: "
+                    + ", ".join(legacy_env)
+                    + ". Keep runtime config limited to credentials, endpoint, "
+                    "and max position size."
+                )
+            use_testnet = os.environ.get("BINANCE_TESTNET", "").lower() in ("1", "true", "yes")
             return LiveConfig(
                 api_key=api_key,
                 api_secret=api_secret,
-                base_url=os.environ.get("BINANCE_BASE_URL", _PROD_BASE_URL),
-                position_size_usdt=float(os.environ.get("BINANCE_POSITION_SIZE", "100")),
-                max_concurrent_positions=int(os.environ.get("BINANCE_MAX_POSITIONS", "3")),
-                order_check_interval_seconds=float(os.environ.get("BINANCE_ORDER_CHECK_INTERVAL", "5")),
-                testnet=os.environ.get("BINANCE_TESTNET", "").lower() in ("1", "true", "yes"),
+                base_url=os.environ.get(
+                    "BINANCE_BASE_URL",
+                    _TESTNET_BASE_URL if use_testnet else _PROD_BASE_URL,
+                ),
+                max_position_size_usdt=float(os.environ.get("BINANCE_MAX_POSITION_SIZE", "100")),
             )
 
         if _CONFIG_PATH.exists():
-            data = json.loads(_CONFIG_PATH.read_text())
-            data.pop("max_holding_hours", None)
-            return LiveConfig(**data)
+            return LiveConfig(**_load_config_data(_CONFIG_PATH))
 
         raise FileNotFoundError(
             f"No API credentials found. Set BINANCE_API_KEY/BINANCE_API_SECRET env vars "
             f"or create {_CONFIG_PATH}"
         )
+
+
+def _load_config_data(path: Path) -> dict[str, object]:
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"Live config at {path} must be a JSON object")
+
+    unexpected = sorted(set(data) - _ALLOWED_CONFIG_KEYS)
+    if unexpected:
+        raise ValueError(
+            f"Unsupported live config fields in {path}: {', '.join(unexpected)}. "
+            f"Allowed fields: {', '.join(sorted(_ALLOWED_CONFIG_KEYS))}."
+        )
+    return data

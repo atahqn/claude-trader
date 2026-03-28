@@ -48,6 +48,8 @@ class Signal:
     entry_delay_seconds: int = 5
     max_holding_hours: int = 72
 
+    size_multiplier: float = 1.0
+
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:

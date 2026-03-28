@@ -313,12 +313,12 @@ def _compute_stats(trades: list[TradeResult]) -> dict:
     resolved = [t for t in trades if t.exit_reason is not ExitReason.UNFILLED]
     total = len(resolved)
 
-    total_pnl = sum(t.pnl_pct for t in resolved)
+    total_pnl = sum(t.pnl_pct * t.signal.size_multiplier for t in resolved)
     avg_pnl = total_pnl / total if total > 0 else 0.0
     win_rate = (wins / total * 100) if total > 0 else 0.0
 
-    gross_wins = sum(t.pnl_pct for t in resolved if t.pnl_pct > 0)
-    gross_losses = abs(sum(t.pnl_pct for t in resolved if t.pnl_pct <= 0))
+    gross_wins = sum(t.pnl_pct * t.signal.size_multiplier for t in resolved if t.pnl_pct > 0)
+    gross_losses = abs(sum(t.pnl_pct * t.signal.size_multiplier for t in resolved if t.pnl_pct <= 0))
     profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else float("inf") if gross_wins > 0 else 0.0
 
     equity = 100.0
@@ -326,7 +326,7 @@ def _compute_stats(trades: list[TradeResult]) -> dict:
     max_dd = 0.0
     equity_curve = [equity]
     for t in resolved:
-        equity *= (1 + t.pnl_pct / 100)
+        equity *= (1 + t.pnl_pct * t.signal.size_multiplier / 100)
         equity_curve.append(equity)
         peak = max(peak, equity)
         dd = (peak - equity) / peak * 100
