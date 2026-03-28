@@ -76,6 +76,7 @@ class SqueezeV7Config:
     atr_ratio_max: float = 1.3
     taker_fee_rate: float = 0.0005
     market_type: MarketType = MarketType.FUTURES
+    max_holding_hours: int | None = None
     warmup_bars: int = _SQUEEZE_V7_WARMUP_BARS
 
     def __post_init__(self) -> None:

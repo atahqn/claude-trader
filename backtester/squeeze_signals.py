@@ -15,6 +15,7 @@ def build_squeeze_signal(
     config: Any,
     metadata: dict[str, object],
 ) -> Signal:
+    max_holding_hours = getattr(config, "max_holding_hours", None)
     return Signal(
         signal_date=signal_date,
         position_type=position_type,
@@ -25,6 +26,7 @@ def build_squeeze_signal(
         market_type=getattr(config, "market_type", MarketType.FUTURES),
         taker_fee_rate=getattr(config, "taker_fee_rate", 0.0005),
         entry_delay_seconds=5,
+        max_holding_hours=max_holding_hours,
         metadata=metadata,
     )
 

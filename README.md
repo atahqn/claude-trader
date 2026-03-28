@@ -5,7 +5,7 @@ This codebase is designed for LLMs to draft and backtest their strategies and to
 
 ## Strategy Status
 
-- Recommended strategy iteration: **V8**
+- Recommended strategy iteration: **V8.1** (V8 signals + 72h max holding time)
 - Recommended trading space:
   `ETH/USDT`, `SOL/USDT`, `BNB/USDT`, `XRP/USDT`, `DOGE/USDT`,
   `AVAX/USDT`, `LINK/USDT`, `ENA/USDT`, `INJ/USDT`, `NEAR/USDT`,

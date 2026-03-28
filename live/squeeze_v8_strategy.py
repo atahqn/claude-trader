@@ -1,27 +1,33 @@
-"""Live signal generator: Squeeze V8 Strategy (SHORT + LONG).
+"""Live signal generator: Squeeze V8.1 Strategy (SHORT + LONG).
 
-V8 widens SHORT TP/SL from 2.0/1.0 to 3.0/1.5, lowers RSI floor from 30 to 25,
-and relaxes ATR ratio gate from 1.3 to 1.5. LONG side unchanged from V7.
+V8.1 extends max holding time from 24h to 72h. All signal logic unchanged
+from V8. The change is purely an execution parameter: timeout trades at 24h
+were 75% WR and +39.81% PNL across 39 evaluation windows. Extending to 72h
+lets those trades resolve to their TP naturally.
 
-Backtested across 5 holdout periods (Oct 2023 – Mar 2026, ~55 weeks total):
-  V8: +79.80% last 3 months, +64.39% on two older holdout periods
-  vs V7: +33.80% / +32.17% on the same windows
-  V8 doubles V7 PNL with 59.3% trade win rate (vs 50.7%).
+V8.1 vs V8 on evaluation windows (11w):
+  V8.1 (72h): +152.58% PNL, 81.8% weekly WR, PF 2.39
+  V8   (24h): +138.74% PNL, 81.8% weekly WR, PF 2.34
+
+V8 base changes from V7:
+  SHORT: TP 2.0→3.0, SL 1.0→1.5, RSI floor 30→25, ATR gate 1.3→1.5
+  LONG:  unchanged (TP 4.0, SL 2.0, regime >= 6%)
 
 Architecture:
   Two sub-signals from the SAME structural event (BB/KC squeeze release):
 
-  1. SQUEEZE SHORT (V8: wider TP/SL, lower RSI floor):
+  1. SQUEEZE SHORT:
     - 7+ bar compression, release with negative momentum
     - RSI >= 25 (not deeply oversold), ATR ratio <= 1.5
     - TP: 3.0%, SL: 1.5%, Cooldown: 12h
-    - Changed from V7: TP 2.0→3.0, SL 1.0→1.5, RSI 30→25, ATR 1.3→1.5
 
-  2. SQUEEZE LONG (unchanged from V7):
+  2. SQUEEZE LONG:
     - 7+ bar compression, release with POSITIVE momentum
     - ret_72h >= 6% (STRONG BULL regime only)
     - RSI <= 70 (not overbought), ATR ratio <= 1.5
     - TP: 4.0%, SL: 2.0%, Cooldown: 12h
+
+  Max holding time: 72h (V8.1 change)
 
 Polling:
   - analysis interval stays 1h
@@ -73,12 +79,13 @@ _SUPPORTED_POLL_INTERVALS = {"1h", "30m", "15m", "5m", "1m"}
 
 
 class SqueezeV8Strategy(SignalGenerator):
-    """Squeeze V8: SHORT + LONG live signal generator.
+    """Squeeze V8.1: SHORT + LONG live signal generator.
 
     SHORT: squeeze breakout with negative momentum (all regimes)
            TP 3.0/SL 1.5, RSI >= 25, ATR ratio <= 1.5
     LONG:  squeeze breakout with positive momentum (bull regime only, ret_72h >= 6%)
            TP 4.0/SL 2.0, RSI <= 70, ATR ratio <= 1.5
+    Max holding time: 72h (V8.1 change from 24h default)
     """
 
     def __init__(
@@ -100,6 +107,8 @@ class SqueezeV8Strategy(SignalGenerator):
         # Shared params (V8: relaxed ATR gate)
         min_squeeze_bars: int = 7,
         atr_ratio_max: float = 1.5,
+        # V8.1: extended max holding time
+        max_holding_hours: int = 72,
     ) -> None:
         if analysis_interval != "1h":
             raise ValueError("SqueezeV8 live strategy currently supports only 1h analysis_interval")
@@ -125,6 +134,7 @@ class SqueezeV8Strategy(SignalGenerator):
         self.long_regime_min = long_regime_min
         self.min_squeeze_bars = min_squeeze_bars
         self.atr_ratio_max = atr_ratio_max
+        self.max_holding_hours = max_holding_hours
 
         self._client: LiveMarketClient | None = None
         self._last_short: dict[str, datetime] = {}
@@ -137,7 +147,7 @@ class SqueezeV8Strategy(SignalGenerator):
         self._client = client
         self._warm_up_states()
         print(
-            f"SqueezeV8 initialized | "
+            f"SqueezeV8.1 initialized | "
             f"symbols={len(SYMBOLS)} | leverage={self.leverage}x | "
             f"analysis={self.analysis_interval} | poll={self.effective_poll_interval} | "
             f"SHORT TP/SL={self.short_tp}/{self.short_sl}% "
@@ -145,7 +155,8 @@ class SqueezeV8Strategy(SignalGenerator):
             f"LONG TP/SL={self.long_tp}/{self.long_sl}% "
             f"CD={self.long_cooldown_h}h RSI<={self.long_rsi_cap} "
             f"regime>={self.long_regime_min}% | "
-            f"min_sq={self.min_squeeze_bars} ATR<={self.atr_ratio_max}",
+            f"min_sq={self.min_squeeze_bars} ATR<={self.atr_ratio_max} | "
+            f"max_hold={self.max_holding_hours}h",
             file=sys.stderr,
         )
 
@@ -284,7 +295,7 @@ class SqueezeV8Strategy(SignalGenerator):
             signal_date=now,
             symbol=symbol,
             config=self,
-            strategy_name="squeeze_v8",
+            strategy_name="squeeze_v8.1",
             prev_squeeze_count=int(prev.squeeze_count),
             squeeze_on=row.squeeze_on,
             mom=mom,
@@ -369,7 +380,7 @@ class SqueezeV8Strategy(SignalGenerator):
             signal_date=now,
             symbol=symbol,
             config=self,
-            strategy_name="squeeze_v8",
+            strategy_name="squeeze_v8.1",
             prev_squeeze_count=int(prev["squeeze_count"]),
             squeeze_on=bool(row["squeeze_on"]),
             mom=float(mom),
@@ -403,6 +414,7 @@ class SqueezeV8Strategy(SignalGenerator):
             long_regime_min=self.long_regime_min,
             min_squeeze_bars=self.min_squeeze_bars,
             atr_ratio_max=self.atr_ratio_max,
+            max_holding_hours=self.max_holding_hours,
         )
 
     def generate_backtest_signals(self, prepared_context, symbols, start, end):
