@@ -1,10 +1,24 @@
 {
-  "api_key": "YOUR_BYBIT_API_KEY",
-  "api_secret": "YOUR_BYBIT_API_SECRET",
+  "api_key_var": "MAINNET_BOT_KEY",
+  "api_secret_var": "MAINNET_BOT_SECRET",
   "base_url": "https://api.bybit.com",
   "position_size_usdt": 100.0,
   "max_concurrent_positions": 3,
   "max_holding_hours": 168,
   "order_check_interval_seconds": 5.0,
-  "testnet": false
+  "testnet": false,
+  "analysis_interval": "1h",
+  "poll_interval": null,
+  "leverage": 1.0,
+  "short_tp": 3.0,
+  "short_sl": 1.5,
+  "short_cooldown_h": 12.0,
+  "short_rsi_floor": 25.0,
+  "long_tp": 4.0,
+  "long_sl": 2.0,
+  "long_cooldown_h": 12.0,
+  "long_rsi_cap": 70.0,
+  "long_regime_min": 6.0,
+  "min_squeeze_bars": 7,
+  "atr_ratio_max": 1.5
 }

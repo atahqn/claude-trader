@@ -56,7 +56,22 @@ def main() -> None:
             testnet=overrides.get("testnet", config.testnet),
         )
 
-    strategy = SqueezeV8Strategy(leverage=args.leverage, poll_interval=args.poll_interval)
+    strategy = SqueezeV8Strategy(
+        analysis_interval=config.analysis_interval,
+        poll_interval=args.poll_interval if args.poll_interval is not None else config.poll_interval,
+        leverage=args.leverage if args.leverage != 1.0 else config.leverage,
+        short_tp=config.short_tp,
+        short_sl=config.short_sl,
+        short_cooldown_h=config.short_cooldown_h,
+        short_rsi_floor=config.short_rsi_floor,
+        long_tp=config.long_tp,
+        long_sl=config.long_sl,
+        long_cooldown_h=config.long_cooldown_h,
+        long_rsi_cap=config.long_rsi_cap,
+        long_regime_min=config.long_regime_min,
+        min_squeeze_bars=config.min_squeeze_bars,
+        atr_ratio_max=config.atr_ratio_max,
+    )
     engine = LiveEngine(generator=strategy, config=config)
 
     print(
@@ -65,7 +80,7 @@ def main() -> None:
         f"  SHORT:    TP/SL=3.0/1.5% (all regimes, mom<0, RSI>=25, ATR<=1.5)\n"
         f"  LONG:     TP/SL=4.0/2.0% (bull only: ret_72h>=6%, mom>0, RSI<=70)\n"
         f"  Shared:   min_squeeze=7 bars, cooldown=12h\n"
-        f"  Leverage: {args.leverage}x\n"
+        f"  Leverage: {strategy.leverage}x\n"
         f"  Poll:     {strategy.effective_poll_interval}\n"
         f"  Size:     {config.position_size_usdt} USDT\n"
         f"  Max pos:  {config.max_concurrent_positions}\n"

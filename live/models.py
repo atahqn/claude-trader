@@ -103,6 +103,43 @@ def _load_local_keys_module() -> ModuleType | None:
         return None
 
 
+def _resolve_secret_reference(name: str, *, required: bool = True) -> str:
+    module = _load_local_keys_module()
+    if module is None:
+        if required:
+            raise FileNotFoundError("live/local_keys.py is required to resolve config secret references")
+        return ""
+    value = getattr(module, name, "")
+    if value:
+        return str(value)
+    if required:
+        raise ValueError(f"Secret variable {name!r} was not found in live/local_keys.py")
+    return ""
+
+
+def _config_from_data(data: dict[str, object]) -> LiveConfig:
+    config_data = dict(data)
+
+    api_key = str(config_data.pop("api_key", "") or "")
+    api_secret = str(config_data.pop("api_secret", "") or "")
+    api_key_var = str(config_data.pop("api_key_var", "") or "")
+    api_secret_var = str(config_data.pop("api_secret_var", "") or "")
+
+    if not api_key and api_key_var:
+        api_key = _resolve_secret_reference(api_key_var)
+    if not api_secret and api_secret_var:
+        api_secret = _resolve_secret_reference(api_secret_var)
+
+    if not api_key or not api_secret:
+        raise ValueError("Config must provide api_key/api_secret or api_key_var/api_secret_var")
+
+    return LiveConfig(
+        api_key=api_key,
+        api_secret=api_secret,
+        **config_data,
+    )
+
+
 def _load_local_keys_config() -> LiveConfig | None:
     module = _load_local_keys_module()
     if module is None:
@@ -141,6 +178,20 @@ class LiveConfig:
     max_holding_hours: int = 168
     order_check_interval_seconds: float = 5.0
     testnet: bool = False
+    analysis_interval: str = "1h"
+    poll_interval: str | None = None
+    leverage: float = 1.0
+    short_tp: float = 3.0
+    short_sl: float = 1.5
+    short_cooldown_h: float = 12.0
+    short_rsi_floor: float = 25.0
+    long_tp: float = 4.0
+    long_sl: float = 2.0
+    long_cooldown_h: float = 12.0
+    long_rsi_cap: float = 70.0
+    long_regime_min: float = 6.0
+    min_squeeze_bars: int = 7
+    atr_ratio_max: float = 1.5
 
     def __post_init__(self) -> None:
         if self.max_holding_hours <= 0:
@@ -156,7 +207,7 @@ class LiveConfig:
             if not path.exists():
                 raise FileNotFoundError(f"Config file not found: {path}")
             data = json.loads(path.read_text())
-            return LiveConfig(**data)
+            return _config_from_data(data)
 
         api_key = os.environ.get("BYBIT_API_KEY", "")
         api_secret = os.environ.get("BYBIT_API_SECRET", "")
@@ -178,7 +229,7 @@ class LiveConfig:
 
         if _CONFIG_PATH.exists():
             data = json.loads(_CONFIG_PATH.read_text())
-            return LiveConfig(**data)
+            return _config_from_data(data)
 
         raise FileNotFoundError(
             f"No API credentials found. Set BYBIT_API_KEY/BYBIT_API_SECRET env vars "

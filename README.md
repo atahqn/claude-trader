@@ -91,6 +91,8 @@ The live layer is responsible for:
 Configuration can be loaded from environment variables or
 `~/.claude_trader/live_config.json`. The live runner scripts also accept
 `--config /path/to/live_config.json` to read a specific JSON config file.
+For a repo-local config template, copy `live_config.local.json` to another
+gitignored `*.local.json` file and adjust values there.
 For repo-local secrets, copy `live/local_keys.example.py` to
 `live/local_keys.py`; that file is gitignored and can expose
 `TESTNET_BOT_KEY`, `TESTNET_BOT_SECRET`, `MAINNET_BOT_KEY`,
