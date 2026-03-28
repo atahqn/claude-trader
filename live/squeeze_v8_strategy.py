@@ -50,8 +50,11 @@ from backtester.preview import SourcePeriodGate, floor_boundary, interval_to_sec
 from backtester.squeeze_signals import emit_squeeze_entry_signals
 from backtester.strategies.squeeze_v7 import (
     SQUEEZE_V7_FEATURE_COLUMNS,
+    SqueezeV7Config,
     _SqueezeV7PreviewState,
     _safe_feature_value,
+    build_squeeze_v7_feature_frames,
+    generate_squeeze_v7_signals,
 )
 
 from .auth_client import LiveMarketClient
@@ -377,3 +380,42 @@ class SqueezeV8Strategy(SignalGenerator):
             last_long=self._last_long.get(symbol),
         )
         return emitted
+
+    # ------------------------------------------------------------------
+    # Backtest interface
+    # ------------------------------------------------------------------
+
+    def _as_backtest_config(self) -> SqueezeV7Config:
+        return SqueezeV7Config(
+            analysis_interval=self.analysis_interval,
+            poll_interval=self.poll_interval,
+            leverage=self.leverage,
+            enable_short=self.enable_short,
+            enable_long=self.enable_long,
+            short_tp=self.short_tp,
+            short_sl=self.short_sl,
+            short_cooldown_h=self.short_cooldown_h,
+            short_rsi_floor=self.short_rsi_floor,
+            long_tp=self.long_tp,
+            long_sl=self.long_sl,
+            long_cooldown_h=self.long_cooldown_h,
+            long_rsi_cap=self.long_rsi_cap,
+            long_regime_min=self.long_regime_min,
+            min_squeeze_bars=self.min_squeeze_bars,
+            atr_ratio_max=self.atr_ratio_max,
+        )
+
+    def generate_backtest_signals(self, prepared_context, symbols, start, end):
+        config = self._as_backtest_config()
+        if config.effective_poll_interval == config.analysis_interval:
+            feats = build_squeeze_v7_feature_frames(
+                prepared_context, symbols=symbols,
+            )
+            return generate_squeeze_v7_signals(
+                prepared_context, config=config, symbols=symbols,
+                feature_frames=feats, start=start, end=end,
+            )
+        return generate_squeeze_v7_signals(
+            prepared_context, config=config, symbols=symbols,
+            start=start, end=end,
+        )

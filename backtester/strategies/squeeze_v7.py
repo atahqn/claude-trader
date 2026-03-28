@@ -478,8 +478,12 @@ def generate_squeeze_v7_signals(
     config: SqueezeV7Config | None = None,
     symbols: list[str] | None = None,
     feature_frames: dict[str, pd.DataFrame] | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
 ) -> list[Signal]:
     active_config = config or SqueezeV7Config()
+    active_start = start if start is not None else prepared_context.start
+    active_end = end if end is not None else prepared_context.end
     if active_config.effective_poll_interval != active_config.analysis_interval:
         if feature_frames is not None:
             raise ValueError("feature_frames are not supported with preview polling")
@@ -495,11 +499,11 @@ def generate_squeeze_v7_signals(
                     prepared_context.slice_poll_candles(
                         symbol,
                         prepared_context.fetch_start,
-                        prepared_context.end,
+                        active_end,
                     ),
                     symbol,
-                    prepared_context.start,
-                    prepared_context.end,
+                    active_start,
+                    active_end,
                     active_config,
                 )
             )
@@ -520,8 +524,8 @@ def generate_squeeze_v7_signals(
             _generate_symbol_signals(
                 frame,
                 symbol,
-                prepared_context.start,
-                prepared_context.end,
+                active_start,
+                active_end,
                 active_config,
             )
         )

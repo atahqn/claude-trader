@@ -8,6 +8,7 @@ from marketdata import MarketDataRequest
 
 if TYPE_CHECKING:
     from backtester.models import Signal
+    from backtester.pipeline import PreparedMarketContext
 
     from .auth_client import LiveMarketClient
 
@@ -63,6 +64,26 @@ class SignalGenerator(ABC):
     @abstractmethod
     def poll(self) -> Signal | list[Signal] | None:
         """Return new signal(s), or ``None`` when the strategy has nothing to do."""
+
+    def generate_backtest_signals(
+        self,
+        prepared_context: PreparedMarketContext,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+    ) -> list[Signal]:
+        """Generate signals for backtesting over a prepared data window.
+
+        Override with a vectorized implementation for performance.
+        Strategies used with ``StrategyEvaluator`` must implement this.
+
+        The *prepared_context* may contain data outside ``[start, end)``
+        (for indicator warmup or trade resolution).  Implementations must
+        only emit signals with ``signal_date`` in ``[start, end)``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement generate_backtest_signals"
+        )
 
     def teardown(self) -> None:
         """Called on engine shutdown.  Override for cleanup; default is a no-op."""

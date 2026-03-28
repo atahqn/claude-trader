@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from marketdata import MarketDataRequest, MarketContextBundle, SymbolMarketContext
+from marketdata import (
+    DataRequirement,
+    MarketContextBundle,
+    MarketDataRequest,
+    SymbolMarketContext,
+)
 
-from .models import AggTrade, Candle, Signal
+from .models import AggTrade, Candle
 from .preview import interval_to_timedelta
 
 if TYPE_CHECKING:
@@ -109,6 +113,74 @@ class PreparedMarketContext:
             if candle.open_time >= start and candle.open_time < end
         ]
 
+    def truncated_to(self, t: datetime) -> PreparedMarketContext:
+        """Return a copy with all data after *t* physically removed.
+
+        ``start`` and ``end`` metadata are preserved unchanged.  The
+        caller controls the signal generation window via explicit
+        ``start``/``end`` args to ``generate_backtest_signals()``, not
+        via this context's metadata.
+
+        Used for look-ahead bias validation only.
+        """
+        truncated_by_symbol: dict[str, SymbolMarketContext] = {}
+        for sym, smc in self.bundle.by_symbol.items():
+            trunc_frame = smc.frame[smc.frame["close_time"] <= t].copy()
+            trunc_raw = _truncate_raw_datasets(smc.raw_datasets, t)
+            truncated_by_symbol[sym] = SymbolMarketContext(
+                symbol=smc.symbol,
+                frame=trunc_frame,
+                request=smc.request,
+                raw_datasets=trunc_raw,
+            )
+        truncated_bundle = MarketContextBundle(
+            request=self.bundle.request,
+            start=self.bundle.start,
+            end=self.bundle.end,
+            by_symbol=truncated_by_symbol,
+        )
+        truncated_poll = {
+            sym: [c for c in candles if c.close_time <= t]
+            for sym, candles in self.poll_candles.items()
+        }
+        return PreparedMarketContext(
+            start=self.start,
+            end=self.end,
+            fetch_start=self.fetch_start,
+            request=self.request,
+            bundle=truncated_bundle,
+            poll_candles=truncated_poll,
+        )
+
+
+def _truncate_raw_datasets(
+    raw: dict[DataRequirement, list[Any]],
+    t: datetime,
+) -> dict[DataRequirement, list[Any]]:
+    """Truncate every raw dataset to entries at or before *t*.
+
+    Raises on unknown dataset types to prevent silent false negatives
+    in look-ahead validation.
+    """
+    truncated: dict[DataRequirement, list[Any]] = {}
+    for req, items in raw.items():
+        if req == DataRequirement.AGG_TRADES:
+            truncated[req] = [i for i in items if i.timestamp <= t]
+        elif req == DataRequirement.FUNDING_RATES:
+            truncated[req] = [i for i in items if i.timestamp <= t]
+        elif req in (
+            DataRequirement.MARK_PRICE_KLINES,
+            DataRequirement.PREMIUM_INDEX_KLINES,
+            DataRequirement.OHLCV,
+        ):
+            truncated[req] = [i for i in items if i.close_time <= t]
+        else:
+            raise ValueError(
+                f"_truncate_raw_datasets: unknown dataset type {req!r}. "
+                f"Add truncation logic before using this in validation."
+            )
+    return truncated
+
 
 def prepare_market_context(
     symbols: list[str],
@@ -147,25 +219,6 @@ def prepare_market_context(
         bundle=bundle,
         poll_candles=poll_candles,
     )
-
-
-def generate_signals_from_prepared_context(
-    prepared_context: PreparedMarketContext,
-    generator: Callable[[SymbolMarketContext, datetime, datetime], list[Signal]],
-    *,
-    symbols: list[str] | None = None,
-) -> list[Signal]:
-    generated: list[Signal] = []
-    selected_symbols = symbols or prepared_context.symbols
-    for symbol in selected_symbols:
-        generated.extend(
-            generator(
-                prepared_context.for_symbol(symbol),
-                prepared_context.start,
-                prepared_context.end,
-            )
-        )
-    return sorted(generated, key=lambda signal: signal.signal_date)
 
 
 T = TypeVar("T")

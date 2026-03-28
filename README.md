@@ -10,6 +10,9 @@ This codebase is designed for LLMs to draft and backtest their strategies and to
   `ETH/USDT`, `SOL/USDT`, `BNB/USDT`, `XRP/USDT`, `DOGE/USDT`,
   `AVAX/USDT`, `LINK/USDT`, `ENA/USDT`, `INJ/USDT`, `NEAR/USDT`,
   `ALGO/USDT`, `RENDER/USDT`, `WIF/USDT`, `ADA/USDT`, `APT/USDT`
+- Canonical evaluation path:
+  `backtester.StrategyEvaluator` with
+  `DEVELOPMENT_WINDOWS`, `EVALUATION_WINDOWS`, or `ALL_WINDOWS`
 - Treat [`STRATEGY_EVOLUTION.md`](STRATEGY_EVOLUTION.md) as the source of truth for research history and evaluation caveats
 
 ## Backtester Architecture
@@ -21,33 +24,54 @@ all work through per-signal `backtest_signal()` fetches:
    Fetch hourly market data once per symbol for the backtest interval plus
    warmup, with optional listing-history futures datasets via
    `MarketDataRequest` (`funding_rates`, `mark_price_klines`,
-   `premium_index_klines`).
+   `premium_index_klines`). If a strategy requests a lower
+   `poll_interval` than its analysis interval, the prepared context also
+   carries the lower-timeframe poll candles needed for preview-style replay.
 2. Feature stage
    Strategies compute aligned symbol-level features once from prepared hourly
    context.
 3. Signal stage
    Strategies generate candidate `Signal` objects from prepared context instead
-   of fetching candles internally.
-4. Portfolio stage
-   `backtest_portfolio(...)` now schedules candidates with the candle-based
-   approximate path first, then resolves only accepted trades exactly.
-5. Execution stage
+   of fetching candles internally. Live strategies that support historical
+   replay expose `generate_backtest_signals(...)` through the shared
+   `SignalGenerator` interface. This supports both close-only replay and
+   lower poll-interval replay such as `1h` analysis with `15m`, `5m`, or
+   `1m` polling.
+4. Evaluation stage
+   `StrategyEvaluator` groups windows into contiguous fetch periods, reuses a
+   shared `BacktestExecutionSession`, and resolves each scored window through
+   `backtest_signals(...)`.
+5. Validation stage
+   `validate_no_lookahead(...)` replays sampled signals against truncated
+   market context to catch future-data leaks in signal generation.
+6. Execution stage
    Exact resolution uses a shared `BacktestExecutionSession` with chunked lazy
    caches for `1m` candles and `aggTrades`, so overlapping trades reuse the
    same exact data windows.
 
 ### New Shared Entry Points
 
+- `backtester.StrategyEvaluator`
+- `backtester.validate_no_lookahead`
 - `backtester.prepare_market_context`
-- `backtester.generate_signals_from_prepared_context`
 - `backtester.BacktestExecutionSession`
+- `backtester.DEVELOPMENT_WINDOWS`
+- `backtester.EVALUATION_WINDOWS`
+- `backtester.ALL_WINDOWS`
 
 `backtest_signal()` remains available as the compatibility fallback for direct
 single-signal evaluation.
 
-`backtest_portfolio(..., legacy_scheduler=True)` keeps the previous
-resolve-while-scheduling behavior if an existing experiment still depends on
-it.
+### Evaluation Standard
+
+Going forward, new strategy evaluation should use the shared evaluator and the
+coded window calendar instead of one-off `*_eval.py` scripts.
+
+- Development: `DEVELOPMENT_WINDOWS`
+- Holdout + secondary OOS: `EVALUATION_WINDOWS`
+- Full report: `ALL_WINDOWS`
+- One-time signal-generation bias check per strategy version:
+  `validate_no_lookahead(...)`
 
 ## Live Functionality
 

@@ -7,23 +7,37 @@ from .models import (
     ExitReason,
     ExitResolution,
     MarketType,
-    PortfolioResult,
     PositionType,
     ResolutionLevel,
     Signal,
-    SkipReason,
-    SkippedSignal,
     TradeResult,
 )
 from .data import BinanceClient
-from .engine import backtest_portfolio, backtest_signal, backtest_signals
+from .engine import backtest_signal, backtest_signals
 from .pipeline import (
     BacktestExecutionSession,
     PreparedMarketContext,
-    generate_signals_from_prepared_context,
     prepare_market_context,
 )
+from .eval_windows import (
+    ALL_WINDOWS,
+    DEVELOPMENT_WINDOWS,
+    EVALUATION_WINDOWS,
+    EvalWindow,
+    HOLDOUT_WINDOWS,
+    LEGACY_DEVELOPMENT_WINDOWS,
+    OOS2_WINDOWS,
+    STRESS_DEVELOPMENT_WINDOWS,
+)
+from .evaluator import (
+    CategorySummary,
+    EvaluationReport,
+    PortfolioConfig,
+    StrategyEvaluator,
+    WindowResult,
+)
 from .resolver import compute_pnl, compute_tp_sl_prices
+from .validation import LookaheadViolation, validate_no_lookahead
 
 __all__ = [
     "AggTrade",
@@ -34,19 +48,29 @@ __all__ = [
     "ExitReason",
     "ExitResolution",
     "MarketType",
-    "PortfolioResult",
     "PositionType",
     "PreparedMarketContext",
     "ResolutionLevel",
     "Signal",
-    "SkipReason",
-    "SkippedSignal",
     "TradeResult",
-    "backtest_portfolio",
+    "ALL_WINDOWS",
+    "CategorySummary",
+    "DEVELOPMENT_WINDOWS",
+    "EVALUATION_WINDOWS",
+    "EvalWindow",
+    "EvaluationReport",
+    "HOLDOUT_WINDOWS",
+    "LEGACY_DEVELOPMENT_WINDOWS",
+    "LookaheadViolation",
+    "OOS2_WINDOWS",
+    "PortfolioConfig",
+    "STRESS_DEVELOPMENT_WINDOWS",
+    "StrategyEvaluator",
+    "WindowResult",
     "backtest_signal",
     "backtest_signals",
     "compute_pnl",
     "compute_tp_sl_prices",
-    "generate_signals_from_prepared_context",
     "prepare_market_context",
+    "validate_no_lookahead",
 ]
