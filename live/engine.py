@@ -76,7 +76,6 @@ class LiveEngine:
             f"LiveEngine started | "
             f"size={self._config.position_size_usdt} USDT | "
             f"max_positions={self._config.max_concurrent_positions} | "
-            f"hold_max={self._config.max_holding_hours}h | "
             f"analysis_interval={market_request.ohlcv_interval} | "
             f"poll_interval={market_request.effective_poll_ohlcv_interval} | "
             f"market_data={','.join(sorted(req.value for req in market_request.datasets))} | "

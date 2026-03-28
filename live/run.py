@@ -24,7 +24,6 @@ def main() -> None:
     parser.add_argument("--leverage", type=float, default=1.0, help="Leverage multiplier (default: 1)")
     parser.add_argument("--size", type=float, default=None, help="Position size in USDT (overrides config)")
     parser.add_argument("--max-positions", type=int, default=None, help="Max concurrent positions (overrides config)")
-    parser.add_argument("--max-holding-hours", type=int, default=None, help="Max holding time per trade (overrides config)")
     args = parser.parse_args()
 
     config = LiveConfig.load(args.config)
@@ -36,8 +35,6 @@ def main() -> None:
         overrides["position_size_usdt"] = args.size
     if args.max_positions is not None:
         overrides["max_concurrent_positions"] = args.max_positions
-    if args.max_holding_hours is not None:
-        overrides["max_holding_hours"] = args.max_holding_hours
 
     if overrides:
         config = LiveConfig(
@@ -46,7 +43,6 @@ def main() -> None:
             base_url=config.base_url,
             position_size_usdt=overrides.get("position_size_usdt", config.position_size_usdt),
             max_concurrent_positions=overrides.get("max_concurrent_positions", config.max_concurrent_positions),
-            max_holding_hours=overrides.get("max_holding_hours", config.max_holding_hours),
             order_check_interval_seconds=config.order_check_interval_seconds,
             testnet=overrides.get("testnet", config.testnet),
         )

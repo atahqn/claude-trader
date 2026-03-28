@@ -101,13 +101,10 @@ class LiveConfig:
     base_url: str = _PROD_BASE_URL
     position_size_usdt: float = 100.0
     max_concurrent_positions: int = 3
-    max_holding_hours: int = 168
     order_check_interval_seconds: float = 5.0
     testnet: bool = False
 
     def __post_init__(self) -> None:
-        if self.max_holding_hours <= 0:
-            raise ValueError("max_holding_hours must be positive")
         if self.testnet and self.base_url == _PROD_BASE_URL:
             object.__setattr__(self, "base_url", _TESTNET_BASE_URL)
 
@@ -119,6 +116,7 @@ class LiveConfig:
             if not path.exists():
                 raise FileNotFoundError(f"Config file not found: {path}")
             data = json.loads(path.read_text())
+            data.pop("max_holding_hours", None)
             return LiveConfig(**data)
 
         api_key = os.environ.get("BINANCE_API_KEY", "")
@@ -130,13 +128,13 @@ class LiveConfig:
                 base_url=os.environ.get("BINANCE_BASE_URL", _PROD_BASE_URL),
                 position_size_usdt=float(os.environ.get("BINANCE_POSITION_SIZE", "100")),
                 max_concurrent_positions=int(os.environ.get("BINANCE_MAX_POSITIONS", "3")),
-                max_holding_hours=int(os.environ.get("BINANCE_MAX_HOLDING_HOURS", "168")),
                 order_check_interval_seconds=float(os.environ.get("BINANCE_ORDER_CHECK_INTERVAL", "5")),
                 testnet=os.environ.get("BINANCE_TESTNET", "").lower() in ("1", "true", "yes"),
             )
 
         if _CONFIG_PATH.exists():
             data = json.loads(_CONFIG_PATH.read_text())
+            data.pop("max_holding_hours", None)
             return LiveConfig(**data)
 
         raise FileNotFoundError(

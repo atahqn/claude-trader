@@ -15,7 +15,7 @@ def build_squeeze_signal(
     config: Any,
     metadata: dict[str, object],
 ) -> Signal:
-    max_holding_hours = getattr(config, "max_holding_hours", None)
+    max_holding_hours = getattr(config, "max_holding_hours", 72)
     return Signal(
         signal_date=signal_date,
         position_type=position_type,

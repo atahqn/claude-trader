@@ -35,9 +35,17 @@ Reserve H.15 release dated March 27, 2026 (3.73% for March 26, 2026).
 """
 
 
+_DATA_BUFFER_HOURS = 168
+"""Hours of extra market data to fetch beyond the last signal window.
+
+This ensures we have enough candles to resolve trades whose holding period
+extends past the final evaluation window.  The actual holding time per trade
+is governed by ``Signal.max_holding_hours``.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class PortfolioConfig:
-    max_hours: int = 24
     approximate: bool = True
     seed: int | None = None
     risk_free_rate_annual: float = DEFAULT_USD_RISK_FREE_RATE_ANNUAL
@@ -180,7 +188,7 @@ class StrategyEvaluator:
 
             signal_start = earliest_start - self._cooldown_warmup
             signal_end = latest_end
-            fetch_end = signal_end + timedelta(hours=self._config.max_hours)
+            fetch_end = signal_end + timedelta(hours=_DATA_BUFFER_HOURS)
 
             request = generator.market_data_request()
             ctx = prepare_market_context(
@@ -214,7 +222,6 @@ class StrategyEvaluator:
                 result = backtest_signals(
                     w_sigs,
                     client=self._client,
-                    max_hours=self._config.max_hours,
                     approximate=self._config.approximate,
                     seed=self._config.seed,
                     session=session,

@@ -26,12 +26,6 @@ _APPROXIMATE_ENTRY_INTERVALS: tuple[tuple[str, timedelta], ...] = (
 )
 
 
-def _effective_max_holding_hours(signal: Signal, default_hours: int) -> int:
-    holding_hours = signal.max_holding_hours if signal.max_holding_hours is not None else default_hours
-    if holding_hours <= 0:
-        raise ValueError("max holding hours must be positive")
-    return holding_hours
-
 
 def _resolve_timeout_exit(
     signal: Signal,
@@ -172,7 +166,6 @@ def _ensure_session(
 def backtest_signal(
     signal: Signal,
     client: BinanceClient | None = None,
-    max_hours: int = 168,
     approximate: bool = False,
     rng: _random_module.Random | None = None,
     session: BacktestExecutionSession | None = None,
@@ -249,7 +242,7 @@ def backtest_signal(
     )
 
     # ----- Step 3: Fetch 1h candles for resolution window -----
-    holding_hours = _effective_max_holding_hours(signal, max_hours)
+    holding_hours = signal.max_holding_hours
     resolution_end = entry_time + timedelta(hours=holding_hours)
     hour_candles = session.fetch_hourly_candles(ticker, entry_time, resolution_end)
 
@@ -357,7 +350,6 @@ def _compute_stats(trades: list[TradeResult]) -> dict:
 def backtest_signals(
     signals: list[Signal],
     client: BinanceClient | None = None,
-    max_hours: int = 168,
     approximate: bool = False,
     seed: int | None = None,
     session: BacktestExecutionSession | None = None,
@@ -376,7 +368,6 @@ def backtest_signals(
     for signal in signals:
         result = backtest_signal(
             signal,
-            max_hours=max_hours,
             approximate=approximate,
             rng=rng,
             session=session,

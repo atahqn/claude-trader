@@ -427,11 +427,7 @@ class PositionTracker:
         if pos.opened_at is None:
             return False
 
-        holding_hours = pos.signal.max_holding_hours
-        if holding_hours is None:
-            holding_hours = self._config.max_holding_hours
-
-        deadline = pos.opened_at + timedelta(hours=holding_hours)
+        deadline = pos.opened_at + timedelta(hours=pos.signal.max_holding_hours)
         if now_utc < deadline:
             return False
 
@@ -634,7 +630,7 @@ class PositionTracker:
                 entry_price=sig_data.get("entry_price"),
                 fill_timeout_seconds=sig_data.get("fill_timeout_seconds", 3600),
                 entry_delay_seconds=sig_data.get("entry_delay_seconds", 5),
-                max_holding_hours=sig_data.get("max_holding_hours"),
+                max_holding_hours=sig_data.get("max_holding_hours", 72),
             )
             return LivePosition(
                 signal=signal,
