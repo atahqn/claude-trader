@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -61,24 +62,28 @@ class _RateLimiter:
     limit_per_minute: int = 2400
     _tokens: float = field(init=False, repr=False)
     _updated_at: float = field(init=False, repr=False)
+    _lock: threading.Lock = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._tokens = float(self.limit_per_minute)
         self._updated_at = time.monotonic()
+        self._lock = threading.Lock()
 
     def acquire(self, weight: int) -> None:
         while True:
-            self._refill()
-            if self._tokens >= weight:
-                self._tokens -= weight
-                return
+            with self._lock:
+                self._refill()
+                if self._tokens >= weight:
+                    self._tokens -= weight
+                    return
             time.sleep(0.1)
 
     def sync_from_server(self, used_weight: int) -> None:
-        self._refill()
-        server_remaining = max(0.0, float(self.limit_per_minute) - used_weight)
-        if server_remaining < self._tokens:
-            self._tokens = server_remaining
+        with self._lock:
+            self._refill()
+            server_remaining = max(0.0, float(self.limit_per_minute) - used_weight)
+            if server_remaining < self._tokens:
+                self._tokens = server_remaining
 
     def _refill(self) -> None:
         now = time.monotonic()

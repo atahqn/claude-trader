@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any
 
@@ -19,6 +20,13 @@ from .models import (
 )
 
 
+@dataclass(frozen=True)
+class ExecutionResult:
+    """Result of a successful order placement."""
+    position: LivePosition
+    margin_consumed: float
+
+
 class OrderExecutor:
     """Converts a Signal into exchange orders."""
 
@@ -27,19 +35,28 @@ class OrderExecutor:
         self._config = config
         self._symbol_info: dict[str, dict[str, Any]] = {}
         self._current_size_multiplier: float = 1.0
+        self._leverage_cache: dict[str, int] = {}
 
     # -- Public ----------------------------------------------------------------
 
-    def execute_signal(self, signal: Signal) -> LivePosition:
-        """Place entry order for *signal* and return a PENDING_ENTRY position."""
+    def execute_signal(
+        self,
+        signal: Signal,
+        *,
+        available_balance: float | None = None,
+    ) -> ExecutionResult:
+        """Place entry order for *signal* and return an ExecutionResult."""
         api_symbol = _symbol_for_api(signal.ticker)
 
         # Ensure symbol info is cached for precision rounding
         if api_symbol not in self._symbol_info:
             self._load_symbol_info(api_symbol)
 
-        # Set leverage
-        self._client.set_leverage(signal.ticker, int(signal.leverage))
+        # Set leverage (skip if already set for this symbol+leverage)
+        target_leverage = int(signal.leverage)
+        if self._leverage_cache.get(api_symbol) != target_leverage:
+            self._client.set_leverage(signal.ticker, target_leverage)
+            self._leverage_cache[api_symbol] = target_leverage
 
         # Determine entry price for quantity calculation
         if signal.entry_price is not None:
@@ -55,12 +72,13 @@ class OrderExecutor:
         )
         effective_leverage = self._effective_leverage(signal)
         required_margin = required_notional / effective_leverage
-        available_balance = self._client.get_available_balance()
-        if available_balance + 1e-9 < required_margin:
+
+        bal = available_balance if available_balance is not None else self._client.get_available_balance()
+        if bal + 1e-9 < required_margin:
             raise ValueError(
                 f"{signal.ticker} requires {required_notional:.2f} USDT notional "
                 f"({required_margin:.2f} USDT margin at {effective_leverage:.2f}x), "
-                f"but only {available_balance:.2f} USDT is available"
+                f"but only {bal:.2f} USDT is available"
             )
 
         # Determine order side and position side (hedge mode)
@@ -78,13 +96,14 @@ class OrderExecutor:
                 signal.ticker, side, quantity, position_side,
             )
 
-        return LivePosition(
+        position = LivePosition(
             signal=signal,
             position_id=uuid.uuid4().hex[:12],
             status=PositionStatus.PENDING_ENTRY,
             entry_order=entry_order,
             quantity=quantity,
         )
+        return ExecutionResult(position=position, margin_consumed=required_margin)
 
     def place_tp_sl(self, position: LivePosition) -> None:
         """Place TP and SL orders on the exchange using the actual fill price."""

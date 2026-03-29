@@ -63,18 +63,21 @@ class PositionTracker:
         self._positions.append(position)
         self._dirty = True
 
-    def reconcile_with_exchange(self) -> None:
-        """Track exchange positions that are not present in local state."""
+    def reconcile_with_exchange(self) -> bool:
+        """Track exchange positions that are not present in local state.
+
+        Returns True on success (including no-change), False on failure.
+        """
         try:
             raw_positions = self._client.get_position_info()
         except Exception as exc:
             print(f"Failed to reconcile exchange positions: {exc}", file=sys.stderr)
-            return
+            return False
 
         tracked_keys = self._tracked_exchange_keys()
         external_keys = self._exchange_position_keys(raw_positions) - tracked_keys
         if external_keys == self._external_position_keys:
-            return
+            return True
 
         self._external_position_keys = external_keys
         if external_keys:
@@ -85,6 +88,7 @@ class PositionTracker:
             )
         else:
             print("No untracked exchange positions remain.", file=sys.stderr)
+        return True
 
     def has_external_conflict(self, signal: Signal) -> bool:
         api_symbol = _symbol_for_api(signal.ticker)

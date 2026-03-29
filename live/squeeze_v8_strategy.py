@@ -46,6 +46,7 @@ Look-ahead bias prevention:
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 import math
 import sys
@@ -73,7 +74,7 @@ from backtester.preview import (
 )
 
 from .auth_client import LiveMarketClient
-from .signal_generator import SignalGenerator
+from .signal_generator import FatalSignalError, SignalGenerator
 
 SYMBOLS = [
     "ETH/USDT", "SOL/USDT", "BNB/USDT",
@@ -986,7 +987,11 @@ class SqueezeV8Strategy(SignalGenerator):
         assert self._client is not None
         now = datetime.now(UTC)
         start = now - timedelta(hours=_LOOKBACK_BARS + 2)
+        failures: list[str] = []
+        self._states = {}
+        self._last_committed_hour = {}
         for symbol in SYMBOLS:
+            state = _SqueezeV8PreviewState()
             try:
                 candles = self._client.fetch_klines(
                     symbol=symbol.replace("/", ""),
@@ -994,31 +999,58 @@ class SqueezeV8Strategy(SignalGenerator):
                     start=start,
                     end=now,
                 )
-                state = _SqueezeV8PreviewState()
                 for candle in candles:
                     if candle.close_time <= now:
                         state.commit(candle)
                         self._last_committed_hour[symbol] = candle.open_time
                 self._states[symbol] = state
+                if state.candle_count < _WARMUP_BARS:
+                    failures.append(
+                        f"{symbol}: only warmed {state.candle_count} candles, need {_WARMUP_BARS}"
+                    )
+                    continue
+                if (
+                    state.last_row is None
+                    or np.isnan(state.last_row.mom_slope)
+                    or np.isnan(state.last_row.atr_ratio)
+                ):
+                    failures.append(
+                        f"{symbol}: warmup indicators are incomplete after {state.candle_count} candles"
+                    )
+                    continue
                 print(
                     f"  {symbol}: warmed up {state.candle_count} bars",
                     file=sys.stderr,
                 )
             except Exception as exc:
-                print(f"  {symbol}: warmup failed: {exc}", file=sys.stderr)
-                self._states[symbol] = _SqueezeV8PreviewState()
+                failures.append(f"{symbol}: warmup fetch failed: {exc}")
+
+        if failures:
+            details = "\n".join(f"  - {failure}" for failure in failures)
+            raise FatalSignalError(
+                "SqueezeV8 warmup failed; refusing to trade without full candle history:\n"
+                f"{details}"
+            )
 
     def poll(self) -> list[Signal] | None:
         assert self._client is not None
         now = self.current_time()
         signals: list[Signal] = []
 
-        for symbol in SYMBOLS:
-            try:
-                sigs = self._check_symbol(symbol, now)
-                signals.extend(sigs)
-            except Exception as exc:
-                print(f"Error checking {symbol}: {exc}", file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            future_to_symbol = {
+                pool.submit(self._check_symbol, symbol, now): symbol
+                for symbol in SYMBOLS
+            }
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    sigs = future.result()
+                    signals.extend(sigs)
+                except FatalSignalError:
+                    raise
+                except Exception as exc:
+                    print(f"Error checking {symbol}: {exc}", file=sys.stderr)
 
         signals = _apply_dynamic_sizing(signals, sizing_mode=self.sizing_mode)
         return signals if signals else None
@@ -1028,11 +1060,16 @@ class SqueezeV8Strategy(SignalGenerator):
 
         state = self._states.get(symbol)
         if state is None:
-            return []
+            raise FatalSignalError(f"{symbol}: warmup state is missing")
 
         preview_enabled = self.effective_poll_interval != self.analysis_interval
 
-        # Commit any newly closed hourly candles since last commit
+        # Hourly mode: _check_symbol_pandas fetches full lookback and commits
+        # new candles itself — no need for a separate commit fetch here.
+        if not preview_enabled:
+            return self._check_symbol_pandas(symbol, now)
+
+        # Preview path: commit any newly closed hourly candles since last commit
         last_committed = self._last_committed_hour.get(symbol)
         current_hour = floor_boundary(now, self.analysis_interval)
         if last_committed is None or last_committed < current_hour:
@@ -1051,32 +1088,29 @@ class SqueezeV8Strategy(SignalGenerator):
                     self._last_committed_hour[symbol] = candle_hour
 
         if state.last_row is None:
-            return []
-        if (
-            state.candle_count < _WARMUP_BARS
-            and (np.isnan(state.last_row.mom_slope) or np.isnan(state.last_row.atr_ratio))
-        ):
-            return []
-
-        # Get the current candle to evaluate
-        if preview_enabled:
-            # Fetch the current open 1h candle snapshot from Binance
-            candles = self._client.fetch_klines(
-                symbol=symbol.replace("/", ""),
-                interval=self.analysis_interval,
-                start=current_hour,
-                end=now + timedelta(hours=1),
+            raise FatalSignalError(f"{symbol}: warmup state has no committed candles")
+        if state.candle_count < _WARMUP_BARS:
+            raise FatalSignalError(
+                f"{symbol}: only {state.candle_count} candles available, need {_WARMUP_BARS}"
             )
-            if not candles:
-                return []
-            eval_candle = candles[-1]
-            if eval_candle.close_time <= now:
-                # Hour already closed, was committed above — nothing to preview
-                return []
-        else:
-            # Hourly polling only needs the latest closed 1h bar. Recompute via
-            # pandas instead of carrying extra preview-state history for it.
-            return self._check_symbol_pandas(symbol, now)
+        if np.isnan(state.last_row.mom_slope) or np.isnan(state.last_row.atr_ratio):
+            raise FatalSignalError(
+                f"{symbol}: warmup indicators are incomplete after {state.candle_count} candles"
+            )
+
+        # Fetch the current open 1h candle snapshot from Binance
+        candles = self._client.fetch_klines(
+            symbol=symbol.replace("/", ""),
+            interval=self.analysis_interval,
+            start=current_hour,
+            end=now + timedelta(hours=1),
+        )
+        if not candles:
+            return []
+        eval_candle = candles[-1]
+        if eval_candle.close_time <= now:
+            # Hour already closed, was committed above — nothing to preview
+            return []
 
         # Preview path: evaluate partial candle with incremental state
         step = state.preview(eval_candle)
@@ -1119,12 +1153,17 @@ class SqueezeV8Strategy(SignalGenerator):
         return emitted
 
     def _check_symbol_pandas(self, symbol: str, now: datetime) -> list[Signal]:
-        """Fallback for non-preview (hourly) polling: full pandas recompute.
+        """Hourly polling path: full pandas recompute.
 
         Only used when poll_interval == analysis_interval (default 1h mode).
+        Also commits newly closed candles to the incremental preview state.
         """
         assert self._client is not None
         import pandas as pd
+
+        state = self._states.get(symbol)
+        if state is None:
+            raise FatalSignalError(f"{symbol}: warmup state is missing")
 
         start = now - timedelta(hours=_LOOKBACK_BARS + 2)
         candles = self._client.fetch_klines(
@@ -1135,7 +1174,20 @@ class SqueezeV8Strategy(SignalGenerator):
         )
 
         if len(candles) < _WARMUP_BARS:
-            return []
+            raise FatalSignalError(
+                f"{symbol}: live fetch returned {len(candles)} candles, need {_WARMUP_BARS}"
+            )
+
+        # Commit new closed candles to incremental state before any early returns
+        last_committed = self._last_committed_hour.get(symbol)
+        if last_committed is None:
+            raise FatalSignalError(
+                f"{symbol}: state exists but _last_committed_hour is missing"
+            )
+        for c in candles:
+            if c.close_time <= now and c.open_time > last_committed:
+                state.commit(c)
+                self._last_committed_hour[symbol] = c.open_time
 
         rows = []
         for c in candles:
@@ -1158,7 +1210,9 @@ class SqueezeV8Strategy(SignalGenerator):
         if df.iloc[last_idx]["close_time"] > now:
             last_idx -= 1
         if last_idx + 1 < _WARMUP_BARS:
-            return []
+            raise FatalSignalError(
+                f"{symbol}: only {last_idx + 1} closed candles available, need {_WARMUP_BARS}"
+            )
 
         row = df.iloc[last_idx]
         prev = df.iloc[last_idx - 1]

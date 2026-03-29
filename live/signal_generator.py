@@ -13,6 +13,10 @@ if TYPE_CHECKING:
     from .auth_client import LiveMarketClient
 
 
+class FatalSignalError(RuntimeError):
+    """Non-recoverable signal generator failure that should stop the engine."""
+
+
 class SignalGenerator(ABC):
     """Base class for live trading signal generators.
 

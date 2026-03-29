@@ -12,9 +12,9 @@ from backtester.preview import floor_boundary, interval_to_seconds
 from marketdata import MarketDataRequest
 
 from .auth_client import BinanceFuturesClient, LiveMarketClient
-from .executor import OrderExecutor
+from .executor import ExecutionResult, OrderExecutor
 from .models import LiveConfig, PositionStatus
-from .signal_generator import SignalGenerator
+from .signal_generator import FatalSignalError, SignalGenerator
 from .tracker import PositionTracker
 
 _INTENSIVE_POLL_LEAD_SECONDS = 120.0
@@ -40,6 +40,7 @@ class LiveEngine:
         self._last_pre_poll_boundary: datetime | None = None
         self._last_signal_poll_boundary: datetime | None = None
         self._pre_poll_balance: float | None = None  # set by pre-poll, read by signal poll
+        self._last_successful_reconcile_boundary: datetime | None = None
 
         # Built during start()
         self._futures_client: BinanceFuturesClient | None = None
@@ -56,47 +57,54 @@ class LiveEngine:
         self._tracker.load_state()
         self._tracker.reconcile_with_exchange()
 
-        market_request = self._generator.market_data_request()
-        self._configure_market_schedule(market_request)
-
-        # Setup signal generator
-        self._generator.setup(self._market_client)
-
-        # Handle SIGINT gracefully
-        self._running = True
         original_handler = signal.getsignal(signal.SIGINT)
-
-        def _shutdown(signum: int, frame: Any) -> None:
-            print("\nShutting down…", file=sys.stderr)
-            self._running = False
-
-        signal.signal(signal.SIGINT, _shutdown)
-
-        print(
-            f"LiveEngine started | "
-            f"size={self._config.position_size_usdt} USDT | "
-            f"max_positions={self._config.max_concurrent_positions} | "
-            f"analysis_interval={market_request.ohlcv_interval} | "
-            f"poll_interval={market_request.effective_poll_ohlcv_interval} | "
-            f"market_data={','.join(sorted(req.value for req in market_request.datasets))} | "
-            f"testnet={self._config.testnet}",
-            file=sys.stderr,
-        )
-
-        # Print initial available capital
-        try:
-            balance = self._futures_client.get_available_balance()
-            print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
-        except Exception as exc:
-            print(f"Could not fetch balance: {exc}", file=sys.stderr)
+        signal_handler_installed = False
 
         try:
+            market_request = self._generator.market_data_request()
+            self._configure_market_schedule(market_request)
+
+            # Setup signal generator
+            self._generator.setup(self._market_client)
+
+            # Handle SIGINT gracefully
+            self._running = True
+
+            def _shutdown(signum: int, frame: Any) -> None:
+                print("\nShutting down…", file=sys.stderr)
+                self._running = False
+
+            signal.signal(signal.SIGINT, _shutdown)
+            signal_handler_installed = True
+
+            print(
+                f"LiveEngine started | "
+                f"size={self._config.position_size_usdt} USDT | "
+                f"max_positions={self._config.max_concurrent_positions} | "
+                f"analysis_interval={market_request.ohlcv_interval} | "
+                f"poll_interval={market_request.effective_poll_ohlcv_interval} | "
+                f"market_data={','.join(sorted(req.value for req in market_request.datasets))} | "
+                f"testnet={self._config.testnet}",
+                file=sys.stderr,
+            )
+
+            # Print initial available capital
+            try:
+                balance = self._futures_client.get_available_balance()
+                print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
+            except Exception as exc:
+                print(f"Could not fetch balance: {exc}", file=sys.stderr)
+
             self._loop()
+        except FatalSignalError as exc:
+            self._running = False
+            print(f"Fatal signal generator error: {exc}", file=sys.stderr)
         finally:
             if self._tracker is not None:
                 self._tracker.save_state(force=True)
             self._generator.teardown()
-            signal.signal(signal.SIGINT, original_handler)
+            if signal_handler_installed:
+                signal.signal(signal.SIGINT, original_handler)
             print("LiveEngine stopped.", file=sys.stderr)
 
     # -- Main loop -------------------------------------------------------------
@@ -216,8 +224,9 @@ class LiveEngine:
         assert self._futures_client is not None
         assert self._tracker is not None
 
-        self._tracker.reconcile_with_exchange()
         next_boundary = self._next_poll_boundary(now_utc)
+        if self._tracker.reconcile_with_exchange():
+            self._last_successful_reconcile_boundary = next_boundary
         self._last_pre_poll_boundary = next_boundary
 
         open_count = self._tracker.open_count
@@ -269,8 +278,10 @@ class LiveEngine:
         assert self._tracker is not None
         assert self._futures_client is not None
 
-        self._tracker.reconcile_with_exchange()
         boundary = self._current_poll_boundary(now_utc)
+        if self._last_successful_reconcile_boundary != boundary:
+            if self._tracker.reconcile_with_exchange():
+                self._last_successful_reconcile_boundary = boundary
         self._last_signal_poll_boundary = boundary
 
         print(
@@ -342,8 +353,11 @@ class LiveEngine:
             executable_signals.append(sig)
 
         random.shuffle(executable_signals)
+        remaining_balance = balance
         for sig in executable_signals[:max_entries]:
-            self._execute_signal(sig)
+            result = self._execute_signal(sig, available_balance=remaining_balance)
+            if result is not None:
+                remaining_balance = max(0.0, remaining_balance - result.margin_consumed)
 
         skipped = len(executable_signals) - max_entries
         if external_skipped > 0:
@@ -356,6 +370,8 @@ class LiveEngine:
         try:
             self._generator.set_poll_time(now_utc)
             result = self._generator.poll()
+        except FatalSignalError:
+            raise
         except Exception as exc:
             print(f"Signal generator error: {exc}", file=sys.stderr)
             return []
@@ -365,27 +381,33 @@ class LiveEngine:
             return result
         return [result]
 
-    def _execute_signal(self, sig: Signal) -> None:
+    def _execute_signal(
+        self, sig: Signal, *, available_balance: float | None = None,
+    ) -> ExecutionResult | None:
         assert self._executor is not None
         assert self._tracker is not None
-        assert self._futures_client is not None
+
+        # Phase 1: Place order on exchange — failure means no margin consumed
         try:
-            position = self._executor.execute_signal(sig)
-            self._tracker.add_position(position)
-            self._tracker.save_state()
-            print(
-                f"[{position.position_id}] Signal executed: "
-                f"{sig.position_type.value} {sig.ticker} "
-                f"qty={position.quantity}",
-                file=sys.stderr,
+            result = self._executor.execute_signal(
+                sig, available_balance=available_balance,
             )
-            try:
-                balance = self._futures_client.get_available_balance()
-                print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
-            except Exception:
-                pass
         except Exception as exc:
             print(
                 f"Failed to execute signal {sig.ticker}: {exc}",
                 file=sys.stderr,
             )
+            return None
+
+        # Phase 2: Bookkeeping — order is already placed, margin IS consumed.
+        # Failure here propagates (hard crash) because an untracked exchange
+        # position is more dangerous than a restart.
+        self._tracker.add_position(result.position)
+        self._tracker.save_state()
+        print(
+            f"[{result.position.position_id}] Signal executed: "
+            f"{sig.position_type.value} {sig.ticker} "
+            f"qty={result.position.quantity}",
+            file=sys.stderr,
+        )
+        return result
