@@ -5,7 +5,7 @@ Example:
     python run_strategy_eval.py \
         --strategy live/squeeze_v8_strategy.py:SqueezeV8Strategy \
         --windows eval \
-        --approximate
+        --exact
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ from backtester.eval_windows import (
     OOS2_WINDOWS,
     OOS3_WINDOWS,
     OOS4_WINDOWS,
+    OOS5_WINDOWS,
+    PAIRED_DEVELOPMENT_WINDOWS,
     STRESS_DEVELOPMENT_WINDOWS,
     EvalWindow,
 )
@@ -52,9 +54,11 @@ WINDOW_ALIASES: dict[str, list[EvalWindow]] = {
     "oos2": OOS2_WINDOWS,
     "oos3": OOS3_WINDOWS,
     "oos4": OOS4_WINDOWS,
+    "oos5": OOS5_WINDOWS,
     "legacy_development": LEGACY_DEVELOPMENT_WINDOWS,
     "development_stress": STRESS_DEVELOPMENT_WINDOWS,
     "development_bull": BULL_DEVELOPMENT_WINDOWS,
+    "development_pairs": PAIRED_DEVELOPMENT_WINDOWS,
 }
 
 
@@ -79,8 +83,8 @@ def parse_args() -> argparse.Namespace:
         "--windows",
         default="eval",
         help=(
-            "Window pack: eval, dev, all, holdout, oos2, oos3, oos4, "
-            "legacy_development, development_stress, development_bull."
+            "Window pack: eval, dev, all, holdout, oos2, oos3, oos4, oos5, "
+            "legacy_development, development_stress, development_bull, development_pairs."
         ),
     )
     parser.add_argument(
@@ -91,14 +95,17 @@ def parse_args() -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--approximate",
+        dest="approximate",
         action="store_true",
-        help="Use approximate execution. This is the default when neither mode flag is passed.",
+        help="Use approximate execution.",
     )
     mode.add_argument(
         "--exact",
-        action="store_true",
-        help="Use exact execution.",
+        dest="approximate",
+        action="store_false",
+        help="Use exact execution. This is the default when neither mode flag is passed.",
     )
+    parser.set_defaults(approximate=False)
     parser.add_argument(
         "--seed",
         type=int,
@@ -116,6 +123,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=14,
         help="Period merge threshold used by StrategyEvaluator.",
+    )
+    parser.add_argument(
+        "--entry-delay-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Override the backtester default market-entry delay in seconds. "
+            "Applies when signals do not set entry_delay_seconds explicitly."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -339,12 +355,17 @@ def main() -> int:
         symbols = resolve_symbols(args.symbols, module, strategy)
 
         config = PortfolioConfig(
-            approximate=False if args.exact else True,
+            approximate=args.approximate,
             seed=args.seed,
             risk_free_rate_annual=(
                 args.risk_free_rate_annual
                 if args.risk_free_rate_annual is not None
                 else PortfolioConfig().risk_free_rate_annual
+            ),
+            entry_delay_seconds=(
+                args.entry_delay_seconds
+                if args.entry_delay_seconds is not None
+                else PortfolioConfig().entry_delay_seconds
             ),
         )
         evaluator = StrategyEvaluator(

@@ -1,9 +1,8 @@
-"""Live signal generator: Squeeze V8.1 Strategy (SHORT + LONG).
+"""Live signal generator: Squeeze V8.2 Strategy (SHORT + LONG).
 
-V8.1 extends max holding time from 24h to 72h. All signal logic unchanged
-from V8. The change is purely an execution parameter: timeout trades at 24h
-were 75% WR and +39.81% PNL across 39 evaluation windows. Extending to 72h
-lets those trades resolve to their TP naturally.
+V8.2 keeps the V8.1 signal set unchanged and adds dynamic position sizing.
+Entries, exits, TP/SL, cooldowns, and filters are the same as V8.1. The only
+change is capital allocation per trade via `Signal.size_multiplier`.
 
 V8.1 vs V8 on evaluation windows (11w):
   V8.1 (72h): +152.58% PNL, 81.8% weekly WR, PF 2.39
@@ -28,6 +27,7 @@ Architecture:
     - TP: 4.0%, SL: 2.0%, Cooldown: 12h
 
   Max holding time: 72h (V8.1 change)
+  Position sizing: ridge_v1 dynamic sizing (V8.2 change)
 
 Polling:
   - analysis interval stays 1h
@@ -46,9 +46,11 @@ Look-ahead bias prevention:
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import math
 import sys
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -61,7 +63,7 @@ from backtester.indicators import (
     required_warmup,
     true_range_value,
 )
-from backtester.models import Candle, MarketType, Signal
+from backtester.models import Candle, MarketType, PositionType, Signal
 from backtester.pipeline import PreparedMarketContext
 from backtester.preview import (
     SourcePeriodGate,
@@ -69,23 +71,19 @@ from backtester.preview import (
     interval_to_seconds,
     iter_preview_snapshots,
 )
-from backtester.squeeze_signals import emit_squeeze_entry_signals
 
 from .auth_client import LiveMarketClient
 from .signal_generator import SignalGenerator
 
-SQUEEZE_V8_SYMBOLS = [
+SYMBOLS = [
     "ETH/USDT", "SOL/USDT", "BNB/USDT",
     "XRP/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT",
     "ENA/USDT", "INJ/USDT", "NEAR/USDT", "ALGO/USDT",
     "RENDER/USDT", "WIF/USDT", "ADA/USDT", "APT/USDT",
 ]
-SYMBOLS = SQUEEZE_V8_SYMBOLS
 
 SQUEEZE_V8_FEATURE_COLUMNS = (
     "rsi_14",
-    "atr_14",
-    "atr_72_avg",
     "atr_ratio",
     "ret_72h",
     "squeeze_on",
@@ -94,15 +92,195 @@ SQUEEZE_V8_FEATURE_COLUMNS = (
 )
 _LOOKBACK_BARS = 100
 _SUPPORTED_POLL_INTERVALS = {"1h", "30m", "15m", "5m", "1m"}
+_SUPPORTED_SIZING_MODES = {"baseline", "ridge_v1"}
 _RSI_ALPHA = 1 / 14
 _EMA20_ALPHA = 2 / 21
 _WARMUP_BARS = required_warmup(SQUEEZE_V8_FEATURE_COLUMNS)
+
+_RIDGE_V1_SHORT_BETA = (
+    -0.0797095672793,
+    -0.00113339169499,
+    -0.00545966581917,
+    -0.0481497500225,
+    -0.0447666408166,
+    0.134452440809,
+    -0.0173908941701,
+    -0.0956252340052,
+    0.02824767755,
+    0.0,
+    0.0,
+    0.473511481157,
+    0.0762125236835,
+)
+_RIDGE_V1_LONG_BETA = (
+    -0.162865266543,
+    0.0359613159204,
+    0.0474623378793,
+    -0.0769663844052,
+    -0.0156901218046,
+    -0.095572751899,
+    0.0369201524174,
+    0.795102644056,
+    -0.153238461595,
+    -0.15074135538,
+    0.0642680237811,
+    0.810609883215,
+    0.014871683311,
+)
+_RIDGE_V1_SHORT_MEAN = 0.2885689587426325
+_RIDGE_V1_SHORT_STD = 0.32868843251811886
+_RIDGE_V1_LONG_MEAN = 0.8006792452830193
+_RIDGE_V1_LONG_STD = 0.5909870620140927
+_RIDGE_V1_SHORT_ALPHA = 0.34
+_RIDGE_V1_LONG_ALPHA = 0.10
+_RIDGE_V1_CLIP_LO = 0.45
+_RIDGE_V1_CLIP_HI = 1.7
+_RIDGE_V1_SCALE_2 = 0.9964448114052744
+
+
+def _validate_sizing_mode(mode: str) -> str:
+    if mode not in _SUPPORTED_SIZING_MODES:
+        supported = ", ".join(sorted(_SUPPORTED_SIZING_MODES))
+        raise ValueError(f"sizing_mode must be one of: {supported}")
+    return mode
+
+
+def _signal_metadata_float(signal: Signal, key: str, default: float) -> float:
+    value = signal.metadata.get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ridge_v1_feature_vector(
+    signal: Signal,
+    *,
+    cluster_side: int,
+    cluster_total: int,
+) -> tuple[float, ...]:
+    sq_count = _signal_metadata_float(signal, "sq_count", 12.0)
+    atr_ratio = _signal_metadata_float(signal, "atr_ratio", 0.9)
+    mom = abs(_signal_metadata_float(signal, "mom", 0.0))
+    rsi = _signal_metadata_float(signal, "rsi", 50.0)
+    ret_72h = _signal_metadata_float(signal, "ret_72h", 10.0)
+
+    sq = (sq_count - 12.0) / 4.0
+    atr = (atr_ratio - 0.9) / 0.25
+    log_mom = math.log1p(max(mom, 0.0) * 1000.0)
+    rsi_centered = (rsi - 50.0) / 10.0
+    ret = (ret_72h - 10.0) / 5.0
+    side_cluster = math.log1p(max(float(cluster_side) - 1.0, 0.0))
+    total_cluster = math.log1p(max(float(cluster_total) - 1.0, 0.0))
+
+    return (
+        1.0,
+        sq,
+        sq**2,
+        atr,
+        atr**2,
+        log_mom,
+        log_mom**2,
+        rsi_centered,
+        rsi_centered**2,
+        ret,
+        ret**2,
+        side_cluster,
+        total_cluster,
+    )
+
+
+def _ridge_v1_size_multiplier(
+    signal: Signal,
+    *,
+    cluster_side: int,
+    cluster_total: int,
+) -> float:
+    if signal.position_type is PositionType.SHORT:
+        beta = _RIDGE_V1_SHORT_BETA
+        mean = _RIDGE_V1_SHORT_MEAN
+        std = _RIDGE_V1_SHORT_STD
+        alpha = _RIDGE_V1_SHORT_ALPHA
+    else:
+        beta = _RIDGE_V1_LONG_BETA
+        mean = _RIDGE_V1_LONG_MEAN
+        std = _RIDGE_V1_LONG_STD
+        alpha = _RIDGE_V1_LONG_ALPHA
+
+    score = float(
+        np.dot(
+            np.asarray(beta, dtype=float),
+            np.asarray(
+                _ridge_v1_feature_vector(
+                    signal,
+                    cluster_side=cluster_side,
+                    cluster_total=cluster_total,
+                ),
+                dtype=float,
+            ),
+        )
+    )
+    z_score = (score - mean) / std
+    raw = float(np.clip(1.0 + alpha * z_score, 0.2, 3.0))
+    normalized = float(np.clip(raw, _RIDGE_V1_CLIP_LO, _RIDGE_V1_CLIP_HI))
+    return float(
+        np.clip(
+            normalized / _RIDGE_V1_SCALE_2,
+            _RIDGE_V1_CLIP_LO,
+            _RIDGE_V1_CLIP_HI,
+        )
+    )
+
+
+def _apply_dynamic_sizing(
+    signals: list[Signal],
+    *,
+    sizing_mode: str,
+) -> list[Signal]:
+    if not signals or sizing_mode == "baseline":
+        return signals
+    _validate_sizing_mode(sizing_mode)
+
+    total_counts: dict[datetime, int] = {}
+    side_counts: dict[tuple[datetime, PositionType], int] = {}
+    for signal in signals:
+        total_counts[signal.signal_date] = total_counts.get(signal.signal_date, 0) + 1
+        key = (signal.signal_date, signal.position_type)
+        side_counts[key] = side_counts.get(key, 0) + 1
+
+    sized: list[Signal] = []
+    for signal in signals:
+        cluster_total = total_counts[signal.signal_date]
+        cluster_side = side_counts[(signal.signal_date, signal.position_type)]
+        if sizing_mode == "ridge_v1":
+            size_multiplier = _ridge_v1_size_multiplier(
+                signal,
+                cluster_side=cluster_side,
+                cluster_total=cluster_total,
+            )
+        else:  # pragma: no cover - guarded above
+            raise ValueError(f"unsupported sizing_mode: {sizing_mode}")
+
+        metadata = dict(signal.metadata)
+        metadata["size_model"] = sizing_mode
+        metadata["cluster_side"] = cluster_side
+        metadata["cluster_total"] = cluster_total
+        metadata["size_mult"] = round(size_multiplier, 6)
+        sized.append(
+            replace(
+                signal,
+                size_multiplier=size_multiplier,
+                metadata=metadata,
+            )
+        )
+    return sized
 
 
 @dataclass(slots=True, frozen=True)
 class SqueezeV8Config:
     analysis_interval: str = "1h"
     poll_interval: str | None = None
+    sizing_mode: str = "ridge_v1"
     leverage: float = 1.0
     enable_short: bool = True
     enable_long: bool = True
@@ -125,6 +303,7 @@ class SqueezeV8Config:
     def __post_init__(self) -> None:
         if self.analysis_interval != "1h":
             raise ValueError("SqueezeV8 currently supports only 1h analysis_interval")
+        _validate_sizing_mode(self.sizing_mode)
         effective_poll_interval = self.effective_poll_interval
         if effective_poll_interval not in _SUPPORTED_POLL_INTERVALS:
             raise ValueError(
@@ -154,13 +333,149 @@ def market_data_request_for_squeeze_v8(
     )
 
 
+def _build_squeeze_signal(
+    *,
+    signal_date: datetime,
+    position_type: PositionType,
+    symbol: str,
+    config: Any,
+    metadata: dict[str, object],
+    size_multiplier: float = 1.0,
+) -> Signal:
+    max_holding_hours = getattr(config, "max_holding_hours", 72)
+    return Signal(
+        signal_date=signal_date,
+        position_type=position_type,
+        ticker=symbol,
+        tp_pct=config.short_tp if position_type is PositionType.SHORT else config.long_tp,
+        sl_pct=config.short_sl if position_type is PositionType.SHORT else config.long_sl,
+        leverage=config.leverage,
+        market_type=getattr(config, "market_type", MarketType.FUTURES),
+        taker_fee_rate=getattr(config, "taker_fee_rate", 0.0005),
+        max_holding_hours=max_holding_hours,
+        size_multiplier=size_multiplier,
+        metadata=metadata,
+    )
+
+
+def _emit_squeeze_entry_signals(
+    *,
+    signal_date: datetime,
+    symbol: str,
+    config: Any,
+    strategy_name: str,
+    prev_squeeze_count: int,
+    squeeze_on: bool,
+    mom: float,
+    rsi: float,
+    atr_ratio: float,
+    ret_72h: float,
+    last_short: datetime | None,
+    last_long: datetime | None,
+    source_period_start: datetime | None = None,
+    source_period_gate: SourcePeriodGate | None = None,
+    short_gate_key: object = "default",
+    long_gate_key: object = "default",
+) -> tuple[list[Signal], datetime | None, datetime | None]:
+    if atr_ratio > config.atr_ratio_max:
+        return [], last_short, last_long
+    if prev_squeeze_count < config.min_squeeze_bars or squeeze_on:
+        return [], last_short, last_long
+
+    signals: list[Signal] = []
+    preview_metadata: dict[str, object] = {}
+    if source_period_start is not None:
+        preview_metadata = {
+            "analysis_interval": getattr(config, "analysis_interval", "1h"),
+            "poll_interval": getattr(
+                config,
+                "effective_poll_interval",
+                getattr(config, "analysis_interval", "1h"),
+            ),
+            "source_hour_start": source_period_start.isoformat(),
+        }
+
+    enable_short = getattr(config, "enable_short", True)
+    enable_long = getattr(config, "enable_long", True)
+
+    short_gate_ok = (
+        source_period_start is None
+        or source_period_gate is None
+        or source_period_gate.allow(source_period_start, key=short_gate_key)
+    )
+    if (
+        enable_short
+        and short_gate_ok
+        and mom < 0
+        and rsi >= config.short_rsi_floor
+        and (
+            last_short is None
+            or (signal_date - last_short).total_seconds() >= config.short_cooldown_h * 3600
+        )
+    ):
+        last_short = signal_date
+        if source_period_start is not None and source_period_gate is not None:
+            source_period_gate.mark(source_period_start, key=short_gate_key)
+        signals.append(
+            _build_squeeze_signal(
+                signal_date=signal_date,
+                position_type=PositionType.SHORT,
+                symbol=symbol,
+                config=config,
+                metadata={
+                    "strategy": f"{strategy_name}_short",
+                    **preview_metadata,
+                    "mom": round(mom, 6),
+                    "rsi": round(rsi, 1),
+                    "atr_ratio": round(atr_ratio, 2),
+                    "sq_count": int(prev_squeeze_count),
+                },
+            )
+        )
+
+    long_gate_ok = (
+        source_period_start is None
+        or source_period_gate is None
+        or source_period_gate.allow(source_period_start, key=long_gate_key)
+    )
+    if (
+        enable_long
+        and long_gate_ok
+        and mom > 0
+        and rsi <= config.long_rsi_cap
+        and ret_72h >= config.long_regime_min
+        and (
+            last_long is None
+            or (signal_date - last_long).total_seconds() >= config.long_cooldown_h * 3600
+        )
+    ):
+        last_long = signal_date
+        if source_period_start is not None and source_period_gate is not None:
+            source_period_gate.mark(source_period_start, key=long_gate_key)
+        signals.append(
+            _build_squeeze_signal(
+                signal_date=signal_date,
+                position_type=PositionType.LONG,
+                symbol=symbol,
+                config=config,
+                metadata={
+                    "strategy": f"{strategy_name}_long",
+                    **preview_metadata,
+                    "mom": round(mom, 6),
+                    "rsi": round(rsi, 1),
+                    "atr_ratio": round(atr_ratio, 2),
+                    "ret_72h": round(ret_72h, 1),
+                    "sq_count": int(prev_squeeze_count),
+                },
+            )
+        )
+
+    return signals, last_short, last_long
+
+
 @dataclass(slots=True, frozen=True)
 class _SqueezeV8FeatureRow:
-    open_time: datetime
-    close_time: datetime
     rsi_14: float
-    atr_14: float
-    atr_72_avg: float
     atr_ratio: float
     ret_72h: float
     squeeze_on: bool
@@ -294,11 +609,7 @@ class _SqueezeV8PreviewState:
         squeeze_count = previous_squeeze_count + 1 if squeeze_on else 0
 
         row = _SqueezeV8FeatureRow(
-            open_time=candle.open_time,
-            close_time=candle.close_time,
             rsi_14=rsi,
-            atr_14=atr_14,
-            atr_72_avg=atr_72_avg,
             atr_ratio=atr_ratio,
             ret_72h=ret_72h,
             squeeze_on=squeeze_on,
@@ -430,11 +741,11 @@ def _generate_symbol_signals(
         ret_72h = _safe_value(row, "ret_72h", 0.0)
         mom = _safe_value(row, "mom_slope", 0.0)
         sq_count = int(_safe_value(prev, "squeeze_count", 0.0))
-        emitted, last_short, last_long = emit_squeeze_entry_signals(
+        emitted, last_short, last_long = _emit_squeeze_entry_signals(
             signal_date=close_time,
             symbol=symbol,
             config=config,
-            strategy_name="squeeze_v8.1",
+            strategy_name="squeeze_v8.2",
             prev_squeeze_count=sq_count,
             squeeze_on=bool(row.get("squeeze_on", False)),
             mom=mom,
@@ -495,11 +806,11 @@ def _generate_symbol_preview_signals(
                         ret_72h = _safe_feature_value(row.ret_72h, 0.0)
                         mom = _safe_feature_value(row.mom_slope, 0.0)
                         sq_count = int(prev_sq_count)
-                        emitted, last_short, last_long = emit_squeeze_entry_signals(
+                        emitted, last_short, last_long = _emit_squeeze_entry_signals(
                             signal_date=snapshot.signal_time,
                             symbol=symbol,
                             config=config,
-                            strategy_name="squeeze_v8.1",
+                            strategy_name="squeeze_v8.2",
                             prev_squeeze_count=sq_count,
                             squeeze_on=row.squeeze_on,
                             mom=mom,
@@ -554,7 +865,10 @@ def generate_squeeze_v8_signals(
                     active_config,
                 )
             )
-        return sorted(signals, key=lambda signal: signal.signal_date)
+        return sorted(
+            _apply_dynamic_sizing(signals, sizing_mode=active_config.sizing_mode),
+            key=lambda signal: signal.signal_date,
+        )
 
     frames = feature_frames or build_squeeze_v8_feature_frames(
         prepared_context,
@@ -576,23 +890,28 @@ def generate_squeeze_v8_signals(
                 active_config,
             )
         )
-    return sorted(signals, key=lambda signal: signal.signal_date)
+    return sorted(
+        _apply_dynamic_sizing(signals, sizing_mode=active_config.sizing_mode),
+        key=lambda signal: signal.signal_date,
+    )
 
 
 class SqueezeV8Strategy(SignalGenerator):
-    """Squeeze V8.1: SHORT + LONG live signal generator.
+    """Squeeze V8.2: SHORT + LONG live signal generator.
 
     SHORT: squeeze breakout with negative momentum (all regimes)
            TP 3.0/SL 1.5, RSI >= 25, ATR ratio <= 1.5
     LONG:  squeeze breakout with positive momentum (bull regime only, ret_72h >= 6%)
            TP 4.0/SL 2.0, RSI <= 70, ATR ratio <= 1.5
     Max holding time: 72h (V8.1 change from 24h default)
+    Default sizing: ridge_v1 dynamic sizing (V8.2 change)
     """
 
     def __init__(
         self,
         analysis_interval: str = "1h",
         poll_interval: str | None = None,
+        sizing_mode: str = "ridge_v1",
         leverage: float = 1.0,
         # SHORT params (V8: wider TP/SL, lower RSI floor)
         short_tp: float = 3.0,
@@ -621,6 +940,7 @@ class SqueezeV8Strategy(SignalGenerator):
 
         self.analysis_interval = analysis_interval
         self.poll_interval = poll_interval
+        self.sizing_mode = _validate_sizing_mode(sizing_mode)
         self.enable_short = True
         self.enable_long = True
         self.leverage = leverage
@@ -648,9 +968,10 @@ class SqueezeV8Strategy(SignalGenerator):
         self._client = client
         self._warm_up_states()
         print(
-            f"SqueezeV8.1 initialized | "
+            f"SqueezeV8.2 initialized | "
             f"symbols={len(SYMBOLS)} | leverage={self.leverage}x | "
             f"analysis={self.analysis_interval} | poll={self.effective_poll_interval} | "
+            f"sizing={self.sizing_mode} | "
             f"SHORT TP/SL={self.short_tp}/{self.short_sl}% "
             f"CD={self.short_cooldown_h}h RSI>={self.short_rsi_floor} | "
             f"LONG TP/SL={self.long_tp}/{self.long_sl}% "
@@ -699,6 +1020,7 @@ class SqueezeV8Strategy(SignalGenerator):
             except Exception as exc:
                 print(f"Error checking {symbol}: {exc}", file=sys.stderr)
 
+        signals = _apply_dynamic_sizing(signals, sizing_mode=self.sizing_mode)
         return signals if signals else None
 
     def _check_symbol(self, symbol: str, now: datetime) -> list[Signal]:
@@ -752,24 +1074,8 @@ class SqueezeV8Strategy(SignalGenerator):
                 # Hour already closed, was committed above — nothing to preview
                 return []
         else:
-            # Non-preview: evaluate the last committed candle
-            if state.last_row is None:
-                return []
-            eval_candle = Candle(
-                open_time=state.last_row.open_time,
-                close_time=state.last_row.close_time,
-                open=0.0,
-                high=0.0,
-                low=0.0,
-                close=state.prev_close or 0.0,
-                volume=0.0,
-            )
-            # For non-preview, use the committed last_row directly
-            row = state.last_row
-            prev_row = state.last_row  # Need the row before last_row
-            # Non-preview path: we need the previous bar's squeeze_count.
-            # Since we only have the last committed row, we use it as "current"
-            # and need the one before it. Fall back to pandas for non-preview.
+            # Hourly polling only needs the latest closed 1h bar. Recompute via
+            # pandas instead of carrying extra preview-state history for it.
             return self._check_symbol_pandas(symbol, now)
 
         # Preview path: evaluate partial candle with incremental state
@@ -792,11 +1098,11 @@ class SqueezeV8Strategy(SignalGenerator):
         mom = _safe_feature_value(row.mom_slope, 0.0)
 
         source_hour_start = eval_candle.open_time
-        emitted, self._last_short[symbol], self._last_long[symbol] = emit_squeeze_entry_signals(
+        emitted, self._last_short[symbol], self._last_long[symbol] = _emit_squeeze_entry_signals(
             signal_date=now,
             symbol=symbol,
             config=self,
-            strategy_name="squeeze_v8.1",
+            strategy_name="squeeze_v8.2",
             prev_squeeze_count=int(prev.squeeze_count),
             squeeze_on=row.squeeze_on,
             mom=mom,
@@ -876,11 +1182,11 @@ class SqueezeV8Strategy(SignalGenerator):
             return []
 
         mom = row["mom_slope"]
-        emitted, self._last_short[symbol], self._last_long[symbol] = emit_squeeze_entry_signals(
+        emitted, self._last_short[symbol], self._last_long[symbol] = _emit_squeeze_entry_signals(
             signal_date=now,
             symbol=symbol,
             config=self,
-            strategy_name="squeeze_v8.1",
+            strategy_name="squeeze_v8.2",
             prev_squeeze_count=int(prev["squeeze_count"]),
             squeeze_on=bool(row["squeeze_on"]),
             mom=float(mom),
@@ -900,6 +1206,7 @@ class SqueezeV8Strategy(SignalGenerator):
         return SqueezeV8Config(
             analysis_interval=self.analysis_interval,
             poll_interval=self.poll_interval,
+            sizing_mode=self.sizing_mode,
             leverage=self.leverage,
             enable_short=self.enable_short,
             enable_long=self.enable_long,

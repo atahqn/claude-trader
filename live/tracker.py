@@ -629,7 +629,7 @@ class PositionTracker:
                 taker_fee_rate=sig_data.get("taker_fee_rate", 0.0005),
                 entry_price=sig_data.get("entry_price"),
                 fill_timeout_seconds=sig_data.get("fill_timeout_seconds", 3600),
-                entry_delay_seconds=sig_data.get("entry_delay_seconds", 5),
+                entry_delay_seconds=sig_data.get("entry_delay_seconds"),
                 max_holding_hours=sig_data.get("max_holding_hours", 72),
             )
             return LivePosition(

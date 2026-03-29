@@ -28,6 +28,8 @@ from .eval_windows import (
     HOLDOUT_WINDOWS,
     LEGACY_DEVELOPMENT_WINDOWS,
     OOS2_WINDOWS,
+    OOS5_WINDOWS,
+    PAIRED_DEVELOPMENT_WINDOWS,
     OOS4_WINDOWS,
     STRESS_DEVELOPMENT_WINDOWS,
 )
@@ -68,7 +70,9 @@ __all__ = [
     "LEGACY_DEVELOPMENT_WINDOWS",
     "LookaheadViolation",
     "OOS2_WINDOWS",
+    "OOS5_WINDOWS",
     "OOS4_WINDOWS",
+    "PAIRED_DEVELOPMENT_WINDOWS",
     "PortfolioConfig",
     "rank_evaluation_reports",
     "STRESS_DEVELOPMENT_WINDOWS",

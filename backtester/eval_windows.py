@@ -24,9 +24,9 @@ tool used to identify candidates.
 
 Calendar summary
 ----------------
-  38 development windows  (24 legacy + 10 stress + 4 bullish)
-  21 evaluation windows   (7 primary holdout + 4 secondary OOS + 6 tertiary OOS + 4 bull OOS)
-  59 total windows        spanning Nov 2020 – Mar 2026
+  46 development windows  (24 legacy + 10 stress + 4 bullish + 8 paired regime)
+  29 evaluation windows   (7 primary holdout + 4 secondary OOS + 6 tertiary OOS + 4 bull OOS + 8 paired regime OOS)
+  75 total windows        spanning Nov 2020 – Mar 2026
 """
 
 from __future__ import annotations
@@ -127,11 +127,31 @@ BULL_DEVELOPMENT_WINDOWS: list[EvalWindow] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Combined development (38)
+# Paired development windows (8)
+# Added Mar-2026 without consulting strategy performance.
+# Four contiguous 2-week blocks selected for regime diversity:
+#   DEVP_QUIET23           — low-drift / no-price-movement chop
+#   DEVP_MAR24_REVERSAL    — broad bull impulse followed by a sharp reversal
+#   DEVP_JUL25_TRUMP_BULL  — strong post-election bull continuation
+#   DEVP_DEC25_BEAR        — late-2025 bear stretch containing 2025-12-18
+# ---------------------------------------------------------------------------
+
+PAIRED_DEVELOPMENT_WINDOWS: list[EvalWindow] = [
+    *_weekly_block("DEVP_QUIET23", "development_pairs", _dt(2023, 9, 9), 2),
+    *_weekly_block("DEVP_MAR24_REVERSAL", "development_pairs", _dt(2024, 3, 23), 2),
+    *_weekly_block("DEVP_JUL25_TRUMP_BULL", "development_pairs", _dt(2025, 7, 5), 2),
+    *_weekly_block("DEVP_DEC25_BEAR", "development_pairs", _dt(2025, 12, 13), 2),
+]
+
+# ---------------------------------------------------------------------------
+# Combined development (46)
 # ---------------------------------------------------------------------------
 
 DEVELOPMENT_WINDOWS: list[EvalWindow] = (
-    LEGACY_DEVELOPMENT_WINDOWS + STRESS_DEVELOPMENT_WINDOWS + BULL_DEVELOPMENT_WINDOWS
+    LEGACY_DEVELOPMENT_WINDOWS
+    + STRESS_DEVELOPMENT_WINDOWS
+    + BULL_DEVELOPMENT_WINDOWS
+    + PAIRED_DEVELOPMENT_WINDOWS
 )
 
 # ---------------------------------------------------------------------------
@@ -200,10 +220,29 @@ OOS4_WINDOWS: list[EvalWindow] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Combined evaluation (21) and full calendar (59)
+# Quinary OOS: paired regime extension (8)
+# Added Mar-2026 without consulting strategy performance.
+# Four contiguous 2-week blocks selected for regime diversity:
+#   OOS5_OCT23_BULL        — broad high-beta bull impulse pair
+#   OOS5_AUG25_TRUMP_BULL  — post-election broad bull continuation pair
+#   OOS5_NOV25_BEAR        — two-week bear liquidation
+#   OOS5_FEB26_FLAT_BEAR   — flat-to-bear block containing 2026-02-14
 # ---------------------------------------------------------------------------
 
-EVALUATION_WINDOWS: list[EvalWindow] = HOLDOUT_WINDOWS + OOS2_WINDOWS + OOS3_WINDOWS + OOS4_WINDOWS
+OOS5_WINDOWS: list[EvalWindow] = [
+    *_weekly_block("OOS5_OCT23_BULL", "oos5", _dt(2023, 10, 21), 2),
+    *_weekly_block("OOS5_AUG25_TRUMP_BULL", "oos5", _dt(2025, 8, 2), 2),
+    *_weekly_block("OOS5_NOV25_BEAR", "oos5", _dt(2025, 11, 1), 2),
+    *_weekly_block("OOS5_FEB26_FLAT_BEAR", "oos5", _dt(2026, 2, 14), 2),
+]
+
+# ---------------------------------------------------------------------------
+# Combined evaluation (29) and full calendar (75)
+# ---------------------------------------------------------------------------
+
+EVALUATION_WINDOWS: list[EvalWindow] = (
+    HOLDOUT_WINDOWS + OOS2_WINDOWS + OOS3_WINDOWS + OOS4_WINDOWS + OOS5_WINDOWS
+)
 
 ALL_WINDOWS: list[EvalWindow] = DEVELOPMENT_WINDOWS + EVALUATION_WINDOWS
 

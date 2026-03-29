@@ -15,7 +15,7 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .engine import backtest_signals
+from .engine import DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS, backtest_signals
 from .eval_windows import EvalWindow
 from .models import BacktestResult, ExitReason, PositionType
 from .pipeline import BacktestExecutionSession, prepare_market_context
@@ -58,6 +58,7 @@ class PortfolioConfig:
     approximate: bool = True
     seed: int | None = None
     risk_free_rate_annual: float = DEFAULT_USD_RISK_FREE_RATE_ANNUAL
+    entry_delay_seconds: int = DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +562,7 @@ class StrategyEvaluator:
                     approximate=self._config.approximate,
                     seed=self._config.seed,
                     session=session,
+                    default_entry_delay_seconds=self._config.entry_delay_seconds,
                 )
 
                 all_window_results.append(

@@ -25,6 +25,17 @@ _APPROXIMATE_ENTRY_INTERVALS: tuple[tuple[str, timedelta], ...] = (
     ("1m", timedelta(minutes=1)),
 )
 
+DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS = 15
+
+
+def _resolved_entry_delay_seconds(
+    signal: Signal,
+    default_entry_delay_seconds: int = DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS,
+) -> int:
+    if signal.entry_delay_seconds is None:
+        return default_entry_delay_seconds
+    return signal.entry_delay_seconds
+
 
 
 def _resolve_timeout_exit(
@@ -75,10 +86,17 @@ def _resolve_timeout_exit(
 def _resolve_entry_approximate(
     signal: Signal,
     session: BacktestExecutionSession,
+    *,
+    default_entry_delay_seconds: int = DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS,
 ) -> tuple[float, datetime] | None:
     """Approximate entry using the last fully closed aligned candle price."""
     ticker = signal.ticker
-    delay = timedelta(seconds=signal.entry_delay_seconds)
+    delay = timedelta(
+        seconds=_resolved_entry_delay_seconds(
+            signal,
+            default_entry_delay_seconds=default_entry_delay_seconds,
+        )
+    )
     candle_interval, candle_close_time = _select_approximate_entry_candle(signal.signal_date)
     candle_start = candle_close_time - _interval_duration(candle_interval)
 
@@ -170,6 +188,7 @@ def backtest_signal(
     rng: _random_module.Random | None = None,
     session: BacktestExecutionSession | None = None,
     prepared_context: PreparedMarketContext | None = None,
+    default_entry_delay_seconds: int = DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS,
 ) -> TradeResult:
     """Backtest a single signal and return its trade result."""
     session = _ensure_session(
@@ -186,13 +205,22 @@ def backtest_signal(
 
     # ----- Step 1: Resolve entry (fill check) -----
     if approximate:
-        approx_entry = _resolve_entry_approximate(signal, session)
+        approx_entry = _resolve_entry_approximate(
+            signal,
+            session,
+            default_entry_delay_seconds=default_entry_delay_seconds,
+        )
         if approx_entry is None:
             return _unfilled_result(signal)
         entry_price, entry_time = approx_entry
     elif signal.entry_price is None:
         # Market order: entry = first trade after signal_date + entry_delay
-        delay = timedelta(seconds=signal.entry_delay_seconds)
+        delay = timedelta(
+            seconds=_resolved_entry_delay_seconds(
+                signal,
+                default_entry_delay_seconds=default_entry_delay_seconds,
+            )
+        )
         window_end = signal.signal_date + delay + timedelta(seconds=10)
         trades = session.fetch_agg_trades(ticker, signal.signal_date, window_end)
         earliest = signal.signal_date + delay
@@ -354,6 +382,7 @@ def backtest_signals(
     seed: int | None = None,
     session: BacktestExecutionSession | None = None,
     prepared_context: PreparedMarketContext | None = None,
+    default_entry_delay_seconds: int = DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS,
 ) -> BacktestResult:
     """Backtest multiple signals and aggregate results."""
     rng = _random_module.Random(seed)
@@ -371,6 +400,7 @@ def backtest_signals(
             approximate=approximate,
             rng=rng,
             session=session,
+            default_entry_delay_seconds=default_entry_delay_seconds,
         )
         trades.append(result)
 

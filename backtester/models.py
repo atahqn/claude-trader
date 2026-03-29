@@ -45,7 +45,7 @@ class Signal:
 
     entry_price: float | None = None
     fill_timeout_seconds: int = 3600
-    entry_delay_seconds: int = 5
+    entry_delay_seconds: int | None = None
     max_holding_hours: int = 72
 
     size_multiplier: float = 1.0
@@ -57,6 +57,8 @@ class Signal:
             raise ValueError("at least one of tp_pct or tp_price is required")
         if self.sl_pct is None and self.sl_price is None:
             raise ValueError("at least one of sl_pct or sl_price is required")
+        if self.entry_delay_seconds is not None and self.entry_delay_seconds < 0:
+            raise ValueError("entry_delay_seconds cannot be negative")
         if self.max_holding_hours <= 0:
             raise ValueError("max_holding_hours must be positive")
 

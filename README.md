@@ -6,10 +6,13 @@ This codebase is designed for LLMs to draft and backtest their strategies and to
 ## Strategy Status
 
 - Recommended strategy iteration: **V8.1** (V8 signals + 72h max holding time)
-- Current widened weekly calendar: `38` development windows, `21` evaluation windows, `59` total
-- Latest approximate benchmark on that calendar:
-  V8.1 `+170.08%` evaluation PNL (`66.7%` weekly WR, `PF 1.78`)
-  and `+415.59%` across all `59` windows (`69.5%` weekly WR)
+- Current widened weekly calendar: `46` development windows, `29` evaluation windows, `75` total
+- Latest exact benchmark on the current `29`-window evaluation pack:
+  V8.1 `+160.06%` evaluation PNL (`58.6%` weekly WR, `PF 1.47`,
+  `MDD 37.1%`, `Preference 12.02`)
+- Latest published broader-calendar benchmark is still the previous
+  `59`-window approximate refresh:
+  V8.1 `+415.59%` across all `59` windows (`69.5%` weekly WR)
 - Current sizing takeaways:
   `norm_comp_v3` remains the capital-neutral default;
   `comp_v3_mult` remains the aggressive raw-PNL overlay

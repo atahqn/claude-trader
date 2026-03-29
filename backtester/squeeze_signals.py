@@ -26,7 +26,6 @@ def build_squeeze_signal(
         leverage=config.leverage,
         market_type=getattr(config, "market_type", MarketType.FUTURES),
         taker_fee_rate=getattr(config, "taker_fee_rate", 0.0005),
-        entry_delay_seconds=5,
         max_holding_hours=max_holding_hours,
         size_multiplier=size_multiplier,
         metadata=metadata,
