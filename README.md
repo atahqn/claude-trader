@@ -3,27 +3,7 @@ Bu kod, Cevat Ticari Şirketinin mülkiyetindedir. Şirketin yazılı izni (ceva
 
 This codebase is designed for LLMs to draft and backtest their strategies and to later deploy them.
 
-## Strategy Status
 
-- Recommended strategy iteration: **V8.1** (V8 signals + 72h max holding time)
-- Current widened weekly calendar: `46` development windows, `29` evaluation windows, `75` total
-- Latest exact benchmark on the current `29`-window evaluation pack:
-  V8.1 `+160.06%` evaluation PNL (`58.6%` weekly WR, `PF 1.47`,
-  `MDD 37.1%`, `Preference 12.02`)
-- Latest published broader-calendar benchmark is still the previous
-  `59`-window approximate refresh:
-  V8.1 `+415.59%` across all `59` windows (`69.5%` weekly WR)
-- Current sizing takeaways:
-  `norm_comp_v3` remains the capital-neutral default;
-  `comp_v3_mult` remains the aggressive raw-PNL overlay
-- Recommended trading space:
-  `ETH/USDT`, `SOL/USDT`, `BNB/USDT`, `XRP/USDT`, `DOGE/USDT`,
-  `AVAX/USDT`, `LINK/USDT`, `ENA/USDT`, `INJ/USDT`, `NEAR/USDT`,
-  `ALGO/USDT`, `RENDER/USDT`, `WIF/USDT`, `ADA/USDT`, `APT/USDT`
-- Canonical evaluation path:
-  `backtester.StrategyEvaluator` with
-  `DEVELOPMENT_WINDOWS`, `EVALUATION_WINDOWS`, or `ALL_WINDOWS`
-- Treat [`STRATEGY_EVOLUTION.md`](STRATEGY_EVOLUTION.md) as the source of truth for research history and evaluation caveats
 
 ## Backtester Architecture
 
@@ -74,7 +54,7 @@ single-signal evaluation.
 
 ### Evaluation Standard
 
-Going forward, new strategy evaluation should use the shared evaluator and the
+Strategy evaluation should use the shared evaluator and the
 coded window calendar instead of one-off `*_eval.py` scripts.
 
 - Development: `DEVELOPMENT_WINDOWS`
@@ -82,6 +62,15 @@ coded window calendar instead of one-off `*_eval.py` scripts.
 - Full report: `ALL_WINDOWS`
 - One-time signal-generation bias check per strategy version:
   `validate_no_lookahead(...)`
+
+### Drawdown Semantics
+
+When `run_strategy_eval.py` prints the category table, each row's `DD` is
+recomputed from the resolved trades in that category only, in chronological
+order after filtering to that category. The summary line's `MDD` is the `ALL`
+row drawdown, computed from the full chronological trade stream across every
+selected window.
+
 
 ## Live Functionality
 
