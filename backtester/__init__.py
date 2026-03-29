@@ -21,12 +21,14 @@ from .pipeline import (
 )
 from .eval_windows import (
     ALL_WINDOWS,
+    BULL_DEVELOPMENT_WINDOWS,
     DEVELOPMENT_WINDOWS,
     EVALUATION_WINDOWS,
     EvalWindow,
     HOLDOUT_WINDOWS,
     LEGACY_DEVELOPMENT_WINDOWS,
     OOS2_WINDOWS,
+    OOS4_WINDOWS,
     STRESS_DEVELOPMENT_WINDOWS,
 )
 from .evaluator import (
@@ -34,7 +36,9 @@ from .evaluator import (
     EvaluationReport,
     PortfolioConfig,
     StrategyEvaluator,
+    SymbolSummary,
     WindowResult,
+    rank_evaluation_reports,
 )
 from .resolver import compute_pnl, compute_tp_sl_prices
 from .validation import LookaheadViolation, validate_no_lookahead
@@ -54,6 +58,7 @@ __all__ = [
     "Signal",
     "TradeResult",
     "ALL_WINDOWS",
+    "BULL_DEVELOPMENT_WINDOWS",
     "CategorySummary",
     "DEVELOPMENT_WINDOWS",
     "EVALUATION_WINDOWS",
@@ -63,9 +68,12 @@ __all__ = [
     "LEGACY_DEVELOPMENT_WINDOWS",
     "LookaheadViolation",
     "OOS2_WINDOWS",
+    "OOS4_WINDOWS",
     "PortfolioConfig",
+    "rank_evaluation_reports",
     "STRESS_DEVELOPMENT_WINDOWS",
     "StrategyEvaluator",
+    "SymbolSummary",
     "WindowResult",
     "backtest_signal",
     "backtest_signals",

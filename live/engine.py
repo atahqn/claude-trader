@@ -19,8 +19,6 @@ from .tracker import PositionTracker
 
 _INTENSIVE_POLL_LEAD_SECONDS = 120.0
 _PRE_POLL_LEAD_SECONDS = 10.0
-_ENGINE_CHECK_INTERVAL_SECONDS = 5.0
-_MAX_CONCURRENT_POSITIONS = 3
 
 
 class LiveEngine:
@@ -76,12 +74,12 @@ class LiveEngine:
 
         print(
             f"LiveEngine started | "
-            f"max_size={self._config.max_position_size_usdt} USDT | "
-            f"max_positions={_MAX_CONCURRENT_POSITIONS} | "
+            f"size={self._config.position_size_usdt} USDT | "
+            f"max_positions={self._config.max_concurrent_positions} | "
             f"analysis_interval={market_request.ohlcv_interval} | "
             f"poll_interval={market_request.effective_poll_ohlcv_interval} | "
             f"market_data={','.join(sorted(req.value for req in market_request.datasets))} | "
-            f"endpoint={self._config.base_url}",
+            f"testnet={self._config.testnet}",
             file=sys.stderr,
         )
 
@@ -108,7 +106,7 @@ class LiveEngine:
         assert self._executor is not None
         assert self._futures_client is not None
 
-        check_interval = _ENGINE_CHECK_INTERVAL_SECONDS
+        check_interval = self._config.order_check_interval_seconds
 
         while self._running:
             now_utc = self._futures_client.server_now()
@@ -159,7 +157,7 @@ class LiveEngine:
     def _should_pre_poll(self, now_utc: datetime) -> bool:
         """True once per poll interval shortly before the next poll boundary."""
         next_boundary = self._next_poll_boundary(now_utc)
-        lead = self._pre_poll_lead_seconds(_ENGINE_CHECK_INTERVAL_SECONDS)
+        lead = self._pre_poll_lead_seconds(self._config.order_check_interval_seconds)
         if next_boundary - timedelta(seconds=lead) <= now_utc < next_boundary:
             return self._last_pre_poll_boundary != next_boundary
         return False
@@ -208,7 +206,7 @@ class LiveEngine:
         return max(0.0, available_balance) * leverage
 
     def _affordable_entries(self, available_balance: float) -> int:
-        needed = self._config.max_position_size_usdt
+        needed = self._config.position_size_usdt
         if needed <= 0:
             return 0
         return int(self._effective_buying_power(available_balance) // needed)
@@ -223,7 +221,7 @@ class LiveEngine:
         self._last_pre_poll_boundary = next_boundary
 
         open_count = self._tracker.open_count
-        open_slots = _MAX_CONCURRENT_POSITIONS - open_count
+        open_slots = self._config.max_concurrent_positions - open_count
 
         print(
             f"\n--- Pre-poll check {now_utc.strftime('%H:%M:%S')} UTC "
@@ -231,7 +229,7 @@ class LiveEngine:
             file=sys.stderr,
         )
         print(
-            f"Open positions: {open_count}/{_MAX_CONCURRENT_POSITIONS} "
+            f"Open positions: {open_count}/{self._config.max_concurrent_positions} "
             f"| Open slots: {open_slots}",
             file=sys.stderr,
         )
@@ -239,7 +237,7 @@ class LiveEngine:
         try:
             balance = self._futures_client.get_available_balance()
             self._pre_poll_balance = balance
-            needed = self._config.max_position_size_usdt
+            needed = self._config.position_size_usdt
             buying_power = self._effective_buying_power(balance)
             affordable = self._affordable_entries(balance)
             print(
@@ -282,13 +280,13 @@ class LiveEngine:
         )
 
         # Re-check slots (a fill may have freed one since pre-poll)
-        open_slots = _MAX_CONCURRENT_POSITIONS - self._tracker.open_count
+        open_slots = self._config.max_concurrent_positions - self._tracker.open_count
         if open_slots <= 0:
             print("Skipping: no open slots", file=sys.stderr)
             return
 
         # Use pre-poll balance if available, otherwise fetch now (e.g. engine just started)
-        needed = self._config.max_position_size_usdt
+        needed = self._config.position_size_usdt
         if self._last_pre_poll_boundary == boundary and self._pre_poll_balance is not None:
             balance = self._pre_poll_balance
         else:

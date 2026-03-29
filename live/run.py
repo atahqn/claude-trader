@@ -32,10 +32,11 @@ def main() -> None:
         f"  Strategy: Squeeze SHORT + LONG\n"
         f"  SHORT:    TP/SL=3.0/1.5% (all regimes, mom<0, RSI>=25, ATR<=1.5)\n"
         f"  LONG:     TP/SL=4.0/2.0% (bull only: ret_72h>=6%, mom>0, RSI<=70)\n"
-        f"  Shared:   min_squeeze=7 bars, cooldown=12h, max_hold=72h\n"
+        f"  Shared:   min_squeeze=7 bars, cooldown=12h, max_hold={strategy.max_holding_hours}h\n"
         f"  Leverage: {args.leverage}x\n"
-        f"  Max size: {config.max_position_size_usdt} USDT\n"
-        f"  Endpoint: {config.base_url}\n",
+        f"  Size:     {config.position_size_usdt} USDT\n"
+        f"  Max pos:  {config.max_concurrent_positions}\n"
+        f"  Testnet:  {config.testnet}\n",
         file=sys.stderr,
     )
 

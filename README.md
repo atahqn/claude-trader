@@ -6,6 +6,13 @@ This codebase is designed for LLMs to draft and backtest their strategies and to
 ## Strategy Status
 
 - Recommended strategy iteration: **V8.1** (V8 signals + 72h max holding time)
+- Current widened weekly calendar: `38` development windows, `21` evaluation windows, `59` total
+- Latest approximate benchmark on that calendar:
+  V8.1 `+170.08%` evaluation PNL (`66.7%` weekly WR, `PF 1.78`)
+  and `+415.59%` across all `59` windows (`69.5%` weekly WR)
+- Current sizing takeaways:
+  `norm_comp_v3` remains the capital-neutral default;
+  `comp_v3_mult` remains the aggressive raw-PNL overlay
 - Recommended trading space:
   `ETH/USDT`, `SOL/USDT`, `BNB/USDT`, `XRP/USDT`, `DOGE/USDT`,
   `AVAX/USDT`, `LINK/USDT`, `ENA/USDT`, `INJ/USDT`, `NEAR/USDT`,
@@ -77,7 +84,7 @@ coded window calendar instead of one-off `*_eval.py` scripts.
 
 The live layer is responsible for:
 
-- loading exchange credentials, endpoint selection, and max position size
+- loading exchange credentials and runtime settings
 - polling signal generators
 - checking capital and position-slot availability before execution
 - submitting entries and protective exits
@@ -87,13 +94,16 @@ The live layer is responsible for:
 Configuration can be loaded from environment variables or
 `~/.claude_trader/live_config.json`. The live runner scripts also accept
 `--config /path/to/live_config.json` to read a specific JSON config file.
-Signal definitions, TP/SL, holding times, and other strategy behavior stay in
-the strategy code and generated signals, not in live config.
+Signal-generation parameters such as ATR gates, TP/SL percentages, RSI
+thresholds, and other strategy logic stay in strategy code and generated
+signals, while live runtime controls stay in live config.
 
 Environment variables:
 
 - `BINANCE_API_KEY`
 - `BINANCE_API_SECRET`
 - `BINANCE_BASE_URL`
+- `BINANCE_POSITION_SIZE`
+- `BINANCE_MAX_POSITIONS`
+- `BINANCE_ORDER_CHECK_INTERVAL`
 - `BINANCE_TESTNET`
-- `BINANCE_MAX_POSITION_SIZE`

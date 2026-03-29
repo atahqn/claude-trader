@@ -96,13 +96,13 @@ _ALLOWED_CONFIG_KEYS = frozenset({
     "api_key",
     "api_secret",
     "base_url",
-    "max_position_size_usdt",
+    "position_size_usdt",
+    "max_concurrent_positions",
+    "order_check_interval_seconds",
+    "testnet",
 })
 _REMOVED_ENV_VARS = frozenset({
-    "BINANCE_POSITION_SIZE",
-    "BINANCE_MAX_POSITIONS",
     "BINANCE_MAX_HOLDING_HOURS",
-    "BINANCE_ORDER_CHECK_INTERVAL",
 })
 
 
@@ -111,7 +111,10 @@ class LiveConfig:
     api_key: str
     api_secret: str
     base_url: str = _PROD_BASE_URL
-    max_position_size_usdt: float = 100.0
+    position_size_usdt: float = 100.0
+    max_concurrent_positions: int = 3
+    order_check_interval_seconds: float = 5.0
+    testnet: bool = False
 
     def __post_init__(self) -> None:
         if not self.api_key:
@@ -120,8 +123,14 @@ class LiveConfig:
             raise ValueError("api_secret must not be empty")
         if not self.base_url:
             raise ValueError("base_url must not be empty")
-        if self.max_position_size_usdt <= 0:
-            raise ValueError("max_position_size_usdt must be greater than zero")
+        if self.position_size_usdt <= 0:
+            raise ValueError("position_size_usdt must be greater than zero")
+        if self.max_concurrent_positions <= 0:
+            raise ValueError("max_concurrent_positions must be greater than zero")
+        if self.order_check_interval_seconds <= 0:
+            raise ValueError("order_check_interval_seconds must be greater than zero")
+        if self.testnet and self.base_url == _PROD_BASE_URL:
+            object.__setattr__(self, "base_url", _TESTNET_BASE_URL)
 
     @property
     def is_testnet(self) -> bool:
@@ -131,17 +140,29 @@ class LiveConfig:
         self,
         *,
         use_testnet: bool = False,
-        max_position_size_usdt: float | None = None,
+        position_size_usdt: float | None = None,
+        max_concurrent_positions: int | None = None,
     ) -> LiveConfig:
         return LiveConfig(
             api_key=self.api_key,
             api_secret=self.api_secret,
-            base_url=_TESTNET_BASE_URL if use_testnet else self.base_url,
-            max_position_size_usdt=(
-                self.max_position_size_usdt
-                if max_position_size_usdt is None
-                else max_position_size_usdt
+            base_url=(
+                _TESTNET_BASE_URL
+                if use_testnet
+                else self.base_url
             ),
+            position_size_usdt=(
+                self.position_size_usdt
+                if position_size_usdt is None
+                else position_size_usdt
+            ),
+            max_concurrent_positions=(
+                self.max_concurrent_positions
+                if max_concurrent_positions is None
+                else max_concurrent_positions
+            ),
+            order_check_interval_seconds=self.order_check_interval_seconds,
+            testnet=use_testnet or self.testnet,
         )
 
     @staticmethod
@@ -156,13 +177,12 @@ class LiveConfig:
         api_key = os.environ.get("BINANCE_API_KEY", "")
         api_secret = os.environ.get("BINANCE_API_SECRET", "")
         if api_key and api_secret:
-            legacy_env = sorted(name for name in _REMOVED_ENV_VARS if name in os.environ)
-            if legacy_env:
+            removed_env = sorted(name for name in _REMOVED_ENV_VARS if name in os.environ)
+            if removed_env:
                 raise ValueError(
                     "Unsupported live config env vars are still set: "
-                    + ", ".join(legacy_env)
-                    + ". Keep runtime config limited to credentials, endpoint, "
-                    "and max position size."
+                    + ", ".join(removed_env)
+                    + ". max_holding_hours belongs in the signal generator."
                 )
             use_testnet = os.environ.get("BINANCE_TESTNET", "").lower() in ("1", "true", "yes")
             return LiveConfig(
@@ -172,7 +192,10 @@ class LiveConfig:
                     "BINANCE_BASE_URL",
                     _TESTNET_BASE_URL if use_testnet else _PROD_BASE_URL,
                 ),
-                max_position_size_usdt=float(os.environ.get("BINANCE_MAX_POSITION_SIZE", "100")),
+                position_size_usdt=float(os.environ.get("BINANCE_POSITION_SIZE", "100")),
+                max_concurrent_positions=int(os.environ.get("BINANCE_MAX_POSITIONS", "3")),
+                order_check_interval_seconds=float(os.environ.get("BINANCE_ORDER_CHECK_INTERVAL", "5")),
+                testnet=use_testnet,
             )
 
         if _CONFIG_PATH.exists():

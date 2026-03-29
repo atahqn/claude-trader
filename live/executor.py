@@ -177,7 +177,7 @@ class OrderExecutor:
         *,
         use_market_filter: bool,
     ) -> tuple[float, float]:
-        raw_qty = self._config.max_position_size_usdt * self._current_size_multiplier / entry_price
+        raw_qty = self._config.position_size_usdt * self._current_size_multiplier / entry_price
         quantity = self._round_quantity(
             api_symbol,
             raw_qty,
