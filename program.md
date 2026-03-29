@@ -82,14 +82,27 @@ windows as part of strategy research.
 
 In this repo that means:
 
-- do not modify [run_strategy_eval.py](/home/caner/claude-trader/run_strategy_eval.py) in order to make a strategy look better
-- do not modify [eval_windows.py](/home/caner/claude-trader/backtester/eval_windows.py) in order to make a strategy look better
+- do not modify [run_strategy_eval.py](claude-trader/run_strategy_eval.py) in order to make a strategy look better
+- do not modify [eval_windows.py](claude-trader/backtester/eval_windows.py) in order to make a strategy look better
 
 The allowed workflow is:
 
 - during development, run `python run_strategy_eval.py --strategy ... --windows development`
 - after the idea is frozen, run `python run_strategy_eval.py --strategy ... --windows evaluation`
 - use the evaluation result only to understand how good the final idea actually is
+
+## Strategy And Backtest Parity
+
+The evaluated backtester path must implement the strategy itself.
+
+In particular:
+
+- a live `SignalGenerator` and its backtest path must represent the same strategy logic
+- the backtester must not use a separate proxy implementation that changes the actual entry, exit, regime, or filtering rules
+- if a strategy is claimed to exist, its `generate_backtest_signals(...)` path must implement that strategy for evaluation
+
+The research goal is to evaluate the real strategy, not a nearby approximation
+that happens to backtest better.
 
 ## Practical Standard For Agents
 
@@ -99,6 +112,7 @@ An agent working in this repo should behave as follows:
 - avoid looking at eval results until the strategy version is frozen
 - treat eval as a one-way check on the chosen candidate
 - do not edit the evaluation runner or the window definitions during strategy research
+- make sure the evaluated backtest implementation is the same strategy being proposed for live use
 - document clearly whether a result is development, evaluation, or all-window
 - avoid one-off evaluation scripts when shared evaluator flow already exists
 

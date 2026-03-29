@@ -10,8 +10,6 @@ Current strategy: Squeeze V8.1 (V8 signals + 72h max holding time)
 import argparse
 import sys
 
-sys.path.insert(0, "/home/caner/claude_trader")
-
 from live.cli import add_live_runtime_args, load_live_config_from_args
 from live.engine import LiveEngine
 from live.squeeze_v8_strategy import SqueezeV8Strategy
