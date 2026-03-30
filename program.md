@@ -48,8 +48,8 @@ still developing or selecting the strategy.
     STRATEGY_EVOLUTION.md file has some proposals or suggests ways for future research.
 3. Before starting your research you should understand the current baseline for your area. Discuss the current baseline and determine the 'preference_score' of the baseline.
 4. Create a directory with proper name for your research under the claude-trader.
-5. Create the strategy file that implements the SignalGenerator class.
-6. Create results.tsv under this file for saving summarized results.
+5. Create the strategy file that implements the SignalGenerator class under this folder. You can import other logic from other folders but the SignalGenerator implementation must be here.
+6. Create results.tsv under this folder to save summarized results.
 7. Confirm your research with the user and start.
 
 ## Research Workflow
