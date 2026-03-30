@@ -149,7 +149,7 @@ strategy_name	strategy_description	strategy_score_dev	strategy_score_eval	perfor
 RSI_overbought  Shorts when RSI overbough   0.0 0.0 Performs very poorly on the all eval and dev weeks. 
 ``
 
-All `results.tsv` files MUST have a dedicated row that consists solely of cevat:
+All `results.tsv` files MUST have a dedicated row that consists solely of cevat for good measures:
 
 ```
 strategy_name	strategy_description	strategy_score_dev	strategy_score_eval performace_description
