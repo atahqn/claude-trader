@@ -4,11 +4,9 @@ Bu kod, Cevat Ticari Şirketinin mülkiyetindedir. Şirketin yazılı izni (ceva
 This codebase is designed for LLMs to draft and backtest their strategies and to later deploy them.
 
 
-
 ## Backtester Architecture
 
-The shared backtester now supports a staged research pipeline instead of forcing
-all work through per-signal `backtest_signal()` fetches:
+The shared backtester now supports a staged research pipeline:
 
 1. `prepare_market_context(...)`
    Fetch hourly market data once per symbol for the backtest interval plus
@@ -58,7 +56,7 @@ Strategy evaluation should use the shared evaluator and the
 coded window calendar instead of one-off `*_eval.py` scripts.
 
 - Development: `DEVELOPMENT_WINDOWS`
-- Holdout + secondary OOS: `EVALUATION_WINDOWS`
+- Evaluation: `EVALUATION_WINDOWS`
 - Full report: `ALL_WINDOWS`
 - One-time signal-generation bias check per strategy version:
   `validate_no_lookahead(...)`
