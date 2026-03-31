@@ -117,19 +117,21 @@ class LiveEngine:
         check_interval = self._config.order_check_interval_seconds
 
         while self._running:
-            now_utc = self._futures_client.server_now()
+            fills_now_utc = self._futures_client.server_now()
 
             # 1. Check for fills on existing positions
-            self._tracker.check_fills(now_utc)
+            self._tracker.check_fills(fills_now_utc)
             self._tracker.save_state()
 
             # 2. Pre-poll: capital check at ~xx:59:50
-            if self._should_pre_poll(now_utc):
-                self._do_pre_poll(now_utc)
+            pre_poll_now_utc = self._futures_client.server_now()
+            if self._should_pre_poll(pre_poll_now_utc):
+                self._do_pre_poll(pre_poll_now_utc)
 
             # 3. Signal poll: check signals at xx:00:01
-            if self._should_signal_poll(now_utc, check_interval):
-                self._do_signal_poll(now_utc)
+            signal_poll_now_utc = self._futures_client.server_now()
+            if self._should_signal_poll(signal_poll_now_utc, check_interval):
+                self._do_signal_poll(signal_poll_now_utc)
                 self._tracker.save_state()
 
             # 4. Sleep until next check
