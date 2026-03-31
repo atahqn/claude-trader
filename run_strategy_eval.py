@@ -38,6 +38,8 @@ from backtester.eval_windows import (
     OOS4_WINDOWS,
     OOS5_WINDOWS,
     PAIRED_DEVELOPMENT_WINDOWS,
+    RANDOM_DEVELOPMENT_WINDOWS,
+    RANDOM_EVALUATION_WINDOWS,
     STRESS_DEVELOPMENT_WINDOWS,
     EvalWindow,
 )
@@ -59,6 +61,8 @@ WINDOW_ALIASES: dict[str, list[EvalWindow]] = {
     "development_stress": STRESS_DEVELOPMENT_WINDOWS,
     "development_bull": BULL_DEVELOPMENT_WINDOWS,
     "development_pairs": PAIRED_DEVELOPMENT_WINDOWS,
+    "development_random": RANDOM_DEVELOPMENT_WINDOWS,
+    "evaluation_random": RANDOM_EVALUATION_WINDOWS,
 }
 
 
@@ -84,7 +88,8 @@ def parse_args() -> argparse.Namespace:
         default="eval",
         help=(
             "Window pack: eval, dev, all, holdout, oos2, oos3, oos4, oos5, "
-            "legacy_development, development_stress, development_bull, development_pairs."
+            "legacy_development, development_stress, development_bull, "
+            "development_pairs, development_random, evaluation_random."
         ),
     )
     parser.add_argument(
@@ -320,6 +325,7 @@ def print_run_summary(
     output_dir: Path,
     report_summary: Any,
     table: str,
+    resolution_breakdown: tuple[int, int] | None = None,
 ) -> None:
     print(table)
     print()
@@ -336,6 +342,9 @@ def print_run_summary(
         f"PF {_display_metric(report_summary.profit_factor)} | "
         f"Sortino {_display_metric(report_summary.sortino_ratio)}"
     )
+    if resolution_breakdown is not None:
+        exact_resolved, fallback_resolved = resolution_breakdown
+        print(f"Resolved:   {exact_resolved} exact | {fallback_resolved} fallback")
     print(f"Eligible:   {report_summary.preference_eligible}")
     print(f"Saved to:   {output_dir}")
 
@@ -375,6 +384,11 @@ def main() -> int:
         )
         report = evaluator.evaluate(strategy, windows)
         summary = report.overall_summary()
+        resolution_breakdown = (
+            report.resolved_trade_breakdown()
+            if not config.approximate
+            else None
+        )
 
         output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(
             strategy_name,
@@ -401,6 +415,7 @@ def main() -> int:
             output_dir=saved_dir,
             report_summary=summary,
             table=report.format_table(),
+            resolution_breakdown=resolution_breakdown,
         )
         return 0
     except Exception as exc:

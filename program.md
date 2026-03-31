@@ -1,6 +1,6 @@
 # Research Program Draft
 
-This file defines the research rules for strategy development in this repo. This is NOT an indefinite reserach loop. 
+This file defines the research rules for strategy development in this repo. 
 
 ## Objective
 
@@ -65,6 +65,7 @@ crpyto trading strategy to maximize the evaluation preference_score.
 4. Run `validate_no_lookahead(...)` for the chosen strategy version.
 5. Evaluate the chosen strategy on `EVALUATION_WINDOWS`.
 6. Record the evaluation result clearly and separately from development.
+7. Remove the excess code from bad strategies.
 
 The allowed workflow is:
 
@@ -114,6 +115,7 @@ Tie-breakers after `preference_score` are:
 
 Edit and refine your strategy.
 Use or derive metrics that you think would be useful. 
+You must work on your created strategy folder. You cannot implement already living strategies. You can import, copy or change them in your folder.
 
 The evaluated backtester path must implement the strategy itself.
 
@@ -128,6 +130,8 @@ In particular:
 
 Hardcoding strategies: You should not code something like 
 if time == good_bullish entry: Position(...)
+
+NEVER test your strategies first on the evaluation. You develop then you test on the evaluation. If it is not good enough you discard them.
 
 Any kind of cheating is forbidden. Your strategy should depend and calculate entries from the available information at the time of execution
 with no look-ahead bias. Refer STRATEGY_EVOLUTION.md for previous mistakes. 
@@ -155,3 +159,16 @@ All `results.tsv` files MUST have a dedicated row that consists solely of cevat 
 strategy_name	strategy_description	strategy_score_dev	strategy_score_eval performace_description
 cevat   cevat   cevat   cevat   cevat 
 ``
+
+## The experiment loop
+
+The experiment runs on the dedicated folder.
+
+LOOP UNTIL YOU FIND A BETTER STRATEGY:
+
+1. Better strategy is defined by better evaluation score and you cannot evaluate untill you are done with the devloplment
+2. If your strategy does not have better preference. Discard and try again. Develop new things, be creative.
+3. Use external sources, papers, blogposts, ideas from modern finance theory as well as your creative ideas.
+
+
+**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped or find a better strategy fully abiding the rules.  If you run out of ideas, think harder — read papers, blogposts from internet, re-read the in-scope files for new angles, try combining previous near-misses, try more radical strategy changes. The loop runs until the human interrupts you or you find better strategy, period.

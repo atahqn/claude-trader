@@ -31,6 +31,8 @@ from .eval_windows import (
     OOS5_WINDOWS,
     PAIRED_DEVELOPMENT_WINDOWS,
     OOS4_WINDOWS,
+    RANDOM_DEVELOPMENT_WINDOWS,
+    RANDOM_EVALUATION_WINDOWS,
     STRESS_DEVELOPMENT_WINDOWS,
 )
 from .evaluator import (
@@ -74,6 +76,8 @@ __all__ = [
     "OOS4_WINDOWS",
     "PAIRED_DEVELOPMENT_WINDOWS",
     "PortfolioConfig",
+    "RANDOM_DEVELOPMENT_WINDOWS",
+    "RANDOM_EVALUATION_WINDOWS",
     "rank_evaluation_reports",
     "STRESS_DEVELOPMENT_WINDOWS",
     "StrategyEvaluator",

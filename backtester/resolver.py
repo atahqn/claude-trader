@@ -325,7 +325,13 @@ def _resolve_hour_interval(
     if nested is not None:
         return nested
     # Fallback: SL at hour close (matching kriptistan behavior)
-    return ExitResolution(ExitReason.SL, close_time, sl_price, ResolutionLevel.HOUR)
+    return ExitResolution(
+        ExitReason.SL,
+        close_time,
+        sl_price,
+        ResolutionLevel.HOUR,
+        used_fallback=True,
+    )
 
 
 def _resolve_candles_minute(
@@ -349,7 +355,13 @@ def _resolve_candles_minute(
         if nested is not None:
             return nested
         # Fallback: SL at minute close
-        return ExitResolution(ExitReason.SL, candle.close_time, sl_price, ResolutionLevel.MINUTE)
+        return ExitResolution(
+            ExitReason.SL,
+            candle.close_time,
+            sl_price,
+            ResolutionLevel.MINUTE,
+            used_fallback=True,
+        )
     return None
 
 

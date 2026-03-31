@@ -4,7 +4,7 @@
 Usage:
     python -m live.run [--config PATH] [--testnet] [--leverage N] [--size USDT]
 
-Current strategy: Squeeze V8.2 (V8.1 signals + ridge_v1 dynamic sizing)
+Current strategy: Squeeze V8.3 (squeeze SHORT + pullback LONG + ridge_v1 dynamic sizing)
 """
 
 import argparse
@@ -16,7 +16,7 @@ from live.squeeze_v8_strategy import SqueezeV8Strategy
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Live Trader — Squeeze V8.2")
+    parser = argparse.ArgumentParser(description="Live Trader — Squeeze V8.3")
     add_live_runtime_args(parser)
     args = parser.parse_args()
 
@@ -26,11 +26,11 @@ def main() -> None:
     engine = LiveEngine(generator=strategy, config=config)
 
     print(
-        f"Starting Squeeze V8.2 Strategy\n"
-        f"  Strategy: Squeeze SHORT + LONG\n"
-        f"  SHORT:    TP/SL=3.0/1.5% (all regimes, mom<0, RSI>=25, ATR<=1.5)\n"
-        f"  LONG:     TP/SL=4.0/2.0% (bull only: ret_72h>=6%, mom>0, RSI<=70)\n"
-        f"  Shared:   min_squeeze=7 bars, cooldown=12h, max_hold={strategy.max_holding_hours}h\n"
+        f"Starting Squeeze V8.3 Strategy\n"
+        f"  Strategy: Squeeze SHORT (tiered TP/SL) + bull pullback reclaim LONG\n"
+        f"  SHORT:    TP/SL=tiered by quality (A:3.25/1.5 B:3.0/1.5 C:3.0/1.1)\n"
+        f"  LONG:     TP/SL=4.0/2.0% (10%<=ret_72h<=25%, mom>0, RSI<=75, ATR<=1.2)\n"
+        f"  Shared:   cooldown=12h, max_hold={strategy.max_holding_hours}h, short priority on conflicts\n"
         f"  Sizing:   {strategy.sizing_mode}\n"
         f"  Leverage: {args.leverage}x\n"
         f"  Size:     {config.position_size_usdt} USDT\n"

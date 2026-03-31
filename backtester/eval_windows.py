@@ -24,9 +24,9 @@ tool used to identify candidates.
 
 Calendar summary
 ----------------
-  46 development windows  (24 legacy + 10 stress + 4 bullish + 8 paired regime)
-  29 evaluation windows   (7 primary holdout + 4 secondary OOS + 6 tertiary OOS + 4 bull OOS + 8 paired regime OOS)
-  75 total windows        spanning Nov 2020 – Mar 2026
+  58 development windows  (24 legacy + 10 stress + 4 bullish + 8 paired regime + 12 random)
+  41 evaluation windows   (7 primary holdout + 4 secondary OOS + 6 tertiary OOS + 4 bull OOS + 8 paired regime OOS + 12 random)
+  99 total windows        spanning Nov 2020 – Mar 2026
 """
 
 from __future__ import annotations
@@ -144,7 +144,21 @@ PAIRED_DEVELOPMENT_WINDOWS: list[EvalWindow] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Combined development (46)
+# Random development windows (12)
+# Added Mar-2026 as a deterministic random extension. Four contiguous 3-week
+# blocks were sampled with RNG seed 20260331 from the non-overlapping 3-week
+# candidate blocks on a 7-day grid starting 2023-01-01.
+# ---------------------------------------------------------------------------
+
+RANDOM_DEVELOPMENT_WINDOWS: list[EvalWindow] = [
+    *_weekly_block("DEVR_FEB23", "development_random", _dt(2023, 2, 5), 3),
+    *_weekly_block("DEVR_SEP23", "development_random", _dt(2023, 9, 24), 3),
+    *_weekly_block("DEVR_JUN24", "development_random", _dt(2024, 6, 2), 3),
+    *_weekly_block("DEVR_AUG25", "development_random", _dt(2025, 8, 31), 3),
+]
+
+# ---------------------------------------------------------------------------
+# Combined development (58)
 # ---------------------------------------------------------------------------
 
 DEVELOPMENT_WINDOWS: list[EvalWindow] = (
@@ -152,6 +166,7 @@ DEVELOPMENT_WINDOWS: list[EvalWindow] = (
     + STRESS_DEVELOPMENT_WINDOWS
     + BULL_DEVELOPMENT_WINDOWS
     + PAIRED_DEVELOPMENT_WINDOWS
+    + RANDOM_DEVELOPMENT_WINDOWS
 )
 
 # ---------------------------------------------------------------------------
@@ -237,11 +252,30 @@ OOS5_WINDOWS: list[EvalWindow] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Combined evaluation (29) and full calendar (75)
+# Random evaluation windows (12)
+# Added Mar-2026 as a deterministic random extension. Four contiguous 3-week
+# blocks were sampled with RNG seed 20260331 from the remaining non-overlapping
+# 3-week candidate blocks on a 7-day grid starting 2023-01-01.
+# ---------------------------------------------------------------------------
+
+RANDOM_EVALUATION_WINDOWS: list[EvalWindow] = [
+    *_weekly_block("EVALR_MAY23", "evaluation_random", _dt(2023, 5, 21), 3),
+    *_weekly_block("EVALR_FEB24", "evaluation_random", _dt(2024, 2, 18), 3),
+    *_weekly_block("EVALR_JUN25", "evaluation_random", _dt(2025, 6, 1), 3),
+    *_weekly_block("EVALR_JAN26", "evaluation_random", _dt(2026, 1, 4), 3),
+]
+
+# ---------------------------------------------------------------------------
+# Combined evaluation (41) and full calendar (99)
 # ---------------------------------------------------------------------------
 
 EVALUATION_WINDOWS: list[EvalWindow] = (
-    HOLDOUT_WINDOWS + OOS2_WINDOWS + OOS3_WINDOWS + OOS4_WINDOWS + OOS5_WINDOWS
+    HOLDOUT_WINDOWS
+    + OOS2_WINDOWS
+    + OOS3_WINDOWS
+    + OOS4_WINDOWS
+    + OOS5_WINDOWS
+    + RANDOM_EVALUATION_WINDOWS
 )
 
 ALL_WINDOWS: list[EvalWindow] = DEVELOPMENT_WINDOWS + EVALUATION_WINDOWS

@@ -176,6 +176,19 @@ class EvaluationReport:
             risk_free_rate_annual=self.config.risk_free_rate_annual,
         )
 
+    def resolved_trade_breakdown(self) -> tuple[int, int]:
+        exact = 0
+        fallback = 0
+        for wr in self.window_results:
+            for trade in wr.backtest.trades:
+                if trade.exit_reason is ExitReason.UNFILLED:
+                    continue
+                if trade.used_fallback:
+                    fallback += 1
+                else:
+                    exact += 1
+        return exact, fallback
+
     def format_table(self) -> str:
         rows = self.all_summaries() + [self.overall_summary()]
         header = (
@@ -312,7 +325,7 @@ class EvaluationReport:
             "window", "category", "symbol", "direction",
             "signal_date", "entry_time", "exit_time", "hold_hours",
             "entry_price", "exit_price", "tp_price", "sl_price",
-            "tp_pct", "sl_pct", "exit_reason", "resolution_level",
+            "tp_pct", "sl_pct", "exit_reason", "resolution_level", "used_fallback",
             "pnl_pct", "gross_pnl_pct", "fee_drag_pct",
             "leverage", "size_multiplier", "max_holding_hours",
             "metadata",
@@ -343,6 +356,7 @@ class EvaluationReport:
                         "sl_pct": t.signal.sl_pct,
                         "exit_reason": t.exit_reason.value,
                         "resolution_level": t.resolution_level.value,
+                        "used_fallback": t.used_fallback,
                         "pnl_pct": round(t.pnl_pct, 4),
                         "gross_pnl_pct": round(t.gross_pnl_pct, 4),
                         "fee_drag_pct": round(t.fee_drag_pct, 4),

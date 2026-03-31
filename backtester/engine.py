@@ -45,7 +45,7 @@ def _resolve_timeout_exit(
     entry_price: float,
     *,
     approximate: bool = False,
-) -> tuple[float, datetime, ResolutionLevel]:
+) -> tuple[float, datetime, ResolutionLevel, bool]:
     """Approximate a live timeout close using the first trade after the deadline."""
     ticker = signal.ticker
 
@@ -57,7 +57,7 @@ def _resolve_timeout_exit(
         )
         first_trade = next((t for t in timeout_trades if t.timestamp >= timeout_time), None)
         if first_trade is not None:
-            return first_trade.price, first_trade.timestamp, ResolutionLevel.TRADE
+            return first_trade.price, first_trade.timestamp, ResolutionLevel.TRADE, False
 
     minute_start = timeout_time.replace(second=0, microsecond=0)
     minute_candles = session.fetch_minute_candles(
@@ -67,7 +67,12 @@ def _resolve_timeout_exit(
     )
     minute_candle = next((c for c in minute_candles if c.close_time >= timeout_time), None)
     if minute_candle is not None:
-        return minute_candle.close, minute_candle.close_time, ResolutionLevel.MINUTE
+        return (
+            minute_candle.close,
+            minute_candle.close_time,
+            ResolutionLevel.MINUTE,
+            not approximate,
+        )
 
     hour_start = timeout_time.replace(minute=0, second=0, microsecond=0)
     hour_candles = session.fetch_hourly_candles(
@@ -77,10 +82,15 @@ def _resolve_timeout_exit(
     )
     hour_candle = next((c for c in hour_candles if c.close_time >= timeout_time), None)
     if hour_candle is not None:
-        return hour_candle.close, hour_candle.close_time, ResolutionLevel.HOUR
+        return (
+            hour_candle.close,
+            hour_candle.close_time,
+            ResolutionLevel.HOUR,
+            not approximate,
+        )
 
     fallback_level = ResolutionLevel.HOUR if approximate else ResolutionLevel.TRADE
-    return entry_price, timeout_time, fallback_level
+    return entry_price, timeout_time, fallback_level, not approximate
 
 
 def _resolve_entry_approximate(
@@ -202,6 +212,7 @@ def backtest_signal(
     ticker = signal.ticker
     if rng is None:
         rng = _random_module.Random()
+    used_fallback = False
 
     # ----- Step 1: Resolve entry (fill check) -----
     if approximate:
@@ -236,6 +247,7 @@ def backtest_signal(
             if fallback_candles:
                 entry_price = fallback_candles[0].close
                 entry_time = fallback_candles[0].close_time
+                used_fallback = True
             else:
                 # Cannot determine entry at all -> treat as unfilled
                 return _unfilled_result(signal)
@@ -300,16 +312,18 @@ def backtest_signal(
         exit_time = resolution.exit_time
         exit_reason = resolution.reason
         resolution_level = resolution.resolution_level
+        used_fallback = used_fallback or resolution.used_fallback
     else:
         # Timeout: no exit within max_hours
         exit_reason = ExitReason.TIMEOUT
-        exit_price, exit_time, resolution_level = _resolve_timeout_exit(
+        exit_price, exit_time, resolution_level, timeout_used_fallback = _resolve_timeout_exit(
             signal,
             session,
             resolution_end,
             entry_price,
             approximate=approximate,
         )
+        used_fallback = used_fallback or timeout_used_fallback
 
     net_pnl, gross_pnl, fee_drag = compute_pnl(
         entry_price, exit_price, signal.position_type,
@@ -329,6 +343,7 @@ def backtest_signal(
         pnl_pct=net_pnl,
         gross_pnl_pct=gross_pnl,
         fee_drag_pct=fee_drag,
+        used_fallback=used_fallback,
     )
 
 
@@ -423,4 +438,5 @@ def _unfilled_result(signal: Signal) -> TradeResult:
         pnl_pct=0.0,
         gross_pnl_pct=0.0,
         fee_drag_pct=0.0,
+        used_fallback=False,
     )

@@ -88,6 +88,7 @@ class ExitResolution:
     exit_time: datetime
     exit_price: float
     resolution_level: ResolutionLevel
+    used_fallback: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -104,6 +105,7 @@ class TradeResult:
     pnl_pct: float
     gross_pnl_pct: float
     fee_drag_pct: float
+    used_fallback: bool = False
 
 
 @dataclass(slots=True)
