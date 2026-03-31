@@ -133,7 +133,8 @@ class LiveEngine:
                 self._tracker.save_state()
 
             # 4. Sleep until next check
-            time.sleep(self._sleep_interval_seconds(now_utc, check_interval))
+            sleep_now_utc = self._futures_client.server_now()
+            time.sleep(self._sleep_interval_seconds(sleep_now_utc, check_interval))
 
     # -- Interval-aware signal polling ------------------------------------------
 
@@ -187,16 +188,17 @@ class LiveEngine:
 
     def _sleep_interval_seconds(self, now_utc: datetime, check_interval: float) -> float:
         """Use coarse idle polling until the lead-up window before the next poll boundary."""
-        if self._has_local_active_positions():
-            return check_interval
-
         seconds_until_boundary = max(
             0.0,
             (self._next_poll_boundary(now_utc) - now_utc).total_seconds(),
         )
+
+        if self._has_local_active_positions():
+            return min(check_interval, seconds_until_boundary)
+
         lead = self._intensive_poll_lead_seconds(check_interval)
         if seconds_until_boundary <= lead:
-            return check_interval
+            return min(check_interval, seconds_until_boundary)
 
         coarse_sleep = seconds_until_boundary - lead
         return max(check_interval, coarse_sleep)
