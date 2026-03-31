@@ -9,7 +9,7 @@ from backtester.data import _symbol_for_api
 from backtester.models import PositionType, Signal
 from backtester.resolver import compute_tp_sl_prices
 
-from .auth_client import BinanceFuturesClient
+from .auth_client import BybitFuturesClient
 from .models import (
     ExchangeOrder,
     LiveConfig,
@@ -30,7 +30,7 @@ class ExecutionResult:
 class OrderExecutor:
     """Converts a Signal into exchange orders."""
 
-    def __init__(self, client: BinanceFuturesClient, config: LiveConfig) -> None:
+    def __init__(self, client: BybitFuturesClient, config: LiveConfig) -> None:
         self._client = client
         self._config = config
         self._symbol_info: dict[str, dict[str, Any]] = {}
@@ -81,9 +81,9 @@ class OrderExecutor:
                 f"but only {bal:.2f} USDT is available"
             )
 
-        # Determine order side and position side (hedge mode)
+        # Use Bybit one-way mode; tracker keeps the logical LONG/SHORT side.
         side = OrderSide.BUY if signal.position_type is PositionType.LONG else OrderSide.SELL
-        position_side = "LONG" if signal.position_type is PositionType.LONG else "SHORT"
+        position_side = "BOTH"
 
         # Place entry order
         if signal.entry_price is not None:
@@ -128,11 +128,11 @@ class OrderExecutor:
         tp_price = self._round_price(api_symbol, tp_price)
         sl_price = self._round_price(api_symbol, sl_price)
 
-        # Close side is opposite of entry side; positionSide stays the same
+        # Close side is opposite of entry side; keep one-way position mode.
         close_side = (
             OrderSide.SELL if signal.position_type is PositionType.LONG else OrderSide.BUY
         )
-        position_side = "LONG" if signal.position_type is PositionType.LONG else "SHORT"
+        position_side = "BOTH"
 
         position.tp_order = self._client.place_take_profit_market(
             signal.ticker, close_side, tp_price, position_side,
@@ -159,7 +159,7 @@ class OrderExecutor:
         close_side = (
             OrderSide.SELL if signal.position_type is PositionType.LONG else OrderSide.BUY
         )
-        position_side = "LONG" if signal.position_type is PositionType.LONG else "SHORT"
+        position_side = "BOTH"
 
         exit_order = self._client.place_market_order(
             signal.ticker,
@@ -271,7 +271,7 @@ class OrderExecutor:
         if qty_filter is None:
             return qty
 
-        step = Decimal(str(qty_filter.get("stepSize", "0")))
+        step = Decimal(str(qty_filter.get("stepSize", qty_filter.get("qtyStep", "0"))))
         if step <= 0:
             return qty
 
@@ -293,6 +293,9 @@ class OrderExecutor:
         info = self._symbol_info.get(api_symbol)
         if info is None:
             return None
+        lot_filter = info.get("lotSizeFilter")
+        if lot_filter is not None:
+            return lot_filter
         filters = info.get("filters", [])
         if use_market_filter:
             for f in filters:
@@ -307,12 +310,15 @@ class OrderExecutor:
         qty_filter = self._quantity_filter(api_symbol, use_market_filter=use_market_filter)
         if qty_filter is None:
             return 0.0
-        return float(qty_filter.get("minQty", 0) or 0)
+        return float(qty_filter.get("minQty", qty_filter.get("minOrderQty", 0)) or 0)
 
     def _minimum_notional(self, api_symbol: str) -> float:
         info = self._symbol_info.get(api_symbol)
         if info is None:
             return 0.0
+        lot_filter = info.get("lotSizeFilter")
+        if lot_filter is not None:
+            return float(lot_filter.get("minNotionalValue", 0) or 0)
         for f in info.get("filters", []):
             if f["filterType"] in {"MIN_NOTIONAL", "NOTIONAL"}:
                 value = f.get("minNotional", f.get("notional", 0))
@@ -323,6 +329,13 @@ class OrderExecutor:
         info = self._symbol_info.get(api_symbol)
         if info is None:
             return price
+        price_filter = info.get("priceFilter")
+        if price_filter is not None:
+            tick_str = str(price_filter.get("tickSize", "0"))
+            tick = float(tick_str)
+            if tick > 0:
+                precision = len(tick_str.rstrip("0").split(".")[-1])
+                return round(price - (price % tick), precision)
         for f in info.get("filters", []):
             if f["filterType"] == "PRICE_FILTER":
                 tick = float(f["tickSize"])

@@ -34,12 +34,12 @@ Polling:
   - analysis interval stays 1h
   - poll interval defaults to 1h, preserving the old close-only behavior
   - when poll interval is lower (for example 15m or 5m), the strategy evaluates
-    Binance's current in-progress 1h candle snapshot at those poll boundaries
+    Bybit's current in-progress 1h candle snapshot at those poll boundaries
   - uses incremental _SqueezeV8PreviewState per symbol for O(1) indicator updates
 
 Look-ahead bias prevention:
   - close-only mode uses the last fully closed 1h candle
-  - preview mode uses the currently visible 1h candle snapshot from Binance
+  - preview mode uses the currently visible 1h candle snapshot from Bybit
   - all indicators remain backward-looking: rolling(), ewm(), pct_change()
   - entry executes via market order after signal
 """
@@ -1178,13 +1178,14 @@ class SqueezeV8Strategy(SignalGenerator):
         self._source_period_gate = SourcePeriodGate()
         self._states: dict[str, _SqueezeV8PreviewState] = {}
         self._last_committed_hour: dict[str, datetime] = {}
+        self._active_symbols: list[str] = list(SYMBOLS)
 
     def setup(self, client: LiveMarketClient) -> None:
         self._client = client
         self._warm_up_states()
         print(
             f"SqueezeV8.2 initialized | "
-            f"symbols={len(SYMBOLS)} | leverage={self.leverage}x | "
+            f"symbols={len(self._active_symbols)} | leverage={self.leverage}x | "
             f"analysis={self.analysis_interval} | poll={self.effective_poll_interval} | "
             f"sizing={self.sizing_mode} | "
             f"SHORT TP/SL={self.short_tp}/{self.short_sl}% "
@@ -1203,6 +1204,7 @@ class SqueezeV8Strategy(SignalGenerator):
         failures: list[str] = []
         self._states = {}
         self._last_committed_hour = {}
+        active_symbols: list[str] = []
         for symbol in SYMBOLS:
             state = _SqueezeV8PreviewState()
             try:
@@ -1216,7 +1218,6 @@ class SqueezeV8Strategy(SignalGenerator):
                     if candle.close_time <= now:
                         state.commit(candle)
                         self._last_committed_hour[symbol] = candle.open_time
-                self._states[symbol] = state
                 if state.candle_count < _WARMUP_BARS:
                     failures.append(
                         f"{symbol}: only warmed {state.candle_count} candles, need {_WARMUP_BARS}"
@@ -1231,6 +1232,8 @@ class SqueezeV8Strategy(SignalGenerator):
                         f"{symbol}: warmup indicators are incomplete after {state.candle_count} candles"
                     )
                     continue
+                self._states[symbol] = state
+                active_symbols.append(symbol)
                 print(
                     f"  {symbol}: warmed up {state.candle_count} bars",
                     file=sys.stderr,
@@ -1238,11 +1241,19 @@ class SqueezeV8Strategy(SignalGenerator):
             except Exception as exc:
                 failures.append(f"{symbol}: warmup fetch failed: {exc}")
 
-        if failures:
+        self._active_symbols = active_symbols
+        if not self._active_symbols:
             details = "\n".join(f"  - {failure}" for failure in failures)
             raise FatalSignalError(
-                "SqueezeV8 warmup failed; refusing to trade without full candle history:\n"
+                "SqueezeV8 warmup failed; no symbols have sufficient Bybit history:\n"
                 f"{details}"
+            )
+        if failures:
+            details = "\n".join(f"  - {failure}" for failure in failures)
+            print(
+                "SqueezeV8 skipped symbols without sufficient Bybit history:\n"
+                f"{details}",
+                file=sys.stderr,
             )
 
     def poll(self) -> list[Signal] | None:
@@ -1253,7 +1264,7 @@ class SqueezeV8Strategy(SignalGenerator):
         with ThreadPoolExecutor(max_workers=6) as pool:
             future_to_symbol = {
                 pool.submit(self._check_symbol, symbol, now): symbol
-                for symbol in SYMBOLS
+                for symbol in self._active_symbols
             }
             for future in as_completed(future_to_symbol):
                 symbol = future_to_symbol[future]
@@ -1311,7 +1322,7 @@ class SqueezeV8Strategy(SignalGenerator):
                 f"{symbol}: warmup indicators are incomplete after {state.candle_count} candles"
             )
 
-        # Fetch the current open 1h candle snapshot from Binance
+        # Fetch the current open 1h candle snapshot from Bybit
         candles = self._client.fetch_klines(
             symbol=symbol.replace("/", ""),
             interval=self.analysis_interval,

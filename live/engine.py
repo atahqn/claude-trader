@@ -11,7 +11,7 @@ from backtester.models import Signal
 from backtester.preview import floor_boundary, interval_to_seconds
 from marketdata import MarketDataRequest
 
-from .auth_client import BinanceFuturesClient, LiveMarketClient
+from .auth_client import BybitFuturesClient, LiveMarketClient
 from .executor import ExecutionResult, OrderExecutor
 from .models import LiveConfig, PositionStatus
 from .signal_generator import FatalSignalError, SignalGenerator
@@ -43,15 +43,15 @@ class LiveEngine:
         self._last_successful_reconcile_boundary: datetime | None = None
 
         # Built during start()
-        self._futures_client: BinanceFuturesClient | None = None
+        self._futures_client: BybitFuturesClient | None = None
         self._market_client: LiveMarketClient | None = None
         self._executor: OrderExecutor | None = None
         self._tracker: PositionTracker | None = None
 
     def start(self) -> None:
         """Run the live trading loop until interrupted."""
-        self._futures_client = BinanceFuturesClient(self._config)
-        self._market_client = LiveMarketClient()
+        self._futures_client = BybitFuturesClient(self._config)
+        self._market_client = LiveMarketClient(self._config)
         self._executor = OrderExecutor(self._futures_client, self._config)
         self._tracker = PositionTracker(self._futures_client, self._executor, self._config)
         self._tracker.load_state()

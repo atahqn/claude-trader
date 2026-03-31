@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from .models import LiveConfig
 
 
 def add_live_runtime_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
-    parser.add_argument("--testnet", action="store_true", help="Use Binance futures testnet endpoint")
+    parser.add_argument("--testnet", action="store_true", help="Use Bybit futures testnet endpoint")
     parser.add_argument("--leverage", type=float, default=1.0, help="Leverage multiplier (default: 1)")
     parser.add_argument(
         "--size",
@@ -24,6 +25,8 @@ def add_live_runtime_args(parser: argparse.ArgumentParser) -> None:
 
 
 def load_live_config_from_args(args: argparse.Namespace) -> LiveConfig:
+    if getattr(args, "testnet", False):
+        os.environ["BYBIT_TESTNET"] = "true"
     config = LiveConfig.load(getattr(args, "config", None))
     return config.with_overrides(
         use_testnet=bool(getattr(args, "testnet", False)),

@@ -84,16 +84,18 @@ The live layer is responsible for:
 Configuration can be loaded from environment variables or
 `~/.claude_trader/live_config.json`. The live runner scripts also accept
 `--config /path/to/live_config.json` to read a specific JSON config file.
-Signal-generation parameters such as ATR gates, TP/SL percentages, RSI
-thresholds, and other strategy logic stay in strategy code and generated
-signals, while live runtime controls stay in live config.
+JSON configs can reference `live/local_keys.py` via `api_key_var` /
+`api_secret_var` so secrets stay out of tracked files. Signal-generation
+parameters such as ATR gates, TP/SL percentages, RSI thresholds, and other
+strategy logic stay in strategy code and generated signals, while live runtime
+controls stay in live config.
 
 Environment variables:
 
-- `BINANCE_API_KEY`
-- `BINANCE_API_SECRET`
-- `BINANCE_BASE_URL`
-- `BINANCE_POSITION_SIZE`
-- `BINANCE_MAX_POSITIONS`
-- `BINANCE_ORDER_CHECK_INTERVAL`
-- `BINANCE_TESTNET`
+- `BYBIT_API_KEY`
+- `BYBIT_API_SECRET`
+- `BYBIT_BASE_URL`
+- `BYBIT_POSITION_SIZE`
+- `BYBIT_MAX_POSITIONS`
+- `BYBIT_ORDER_CHECK_INTERVAL`
+- `BYBIT_TESTNET`

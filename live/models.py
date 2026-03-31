@@ -5,7 +5,9 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from importlib import import_module
 from pathlib import Path
+from types import ModuleType
 
 from backtester.models import Signal
 
@@ -39,8 +41,8 @@ class PositionStatus(StrEnum):
 
 @dataclass(slots=True, frozen=True)
 class AccountTrade:
-    trade_id: int
-    order_id: int
+    trade_id: str
+    order_id: str
     symbol: str
     side: OrderSide
     price: float
@@ -54,7 +56,7 @@ class AccountTrade:
 
 @dataclass(slots=True, frozen=True)
 class ExchangeOrder:
-    order_id: int
+    order_id: str
     symbol: str
     side: OrderSide
     order_type: OrderType
@@ -66,7 +68,7 @@ class ExchangeOrder:
     avg_fill_price: float = 0.0
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    algo_id: int = 0  # non-zero for algo (conditional) orders
+    is_conditional: bool = False
 
 
 @dataclass(slots=True)
@@ -90,20 +92,42 @@ class LivePosition:
 _CONFIG_DIR = Path.home() / ".claude_trader"
 _CONFIG_PATH = _CONFIG_DIR / "live_config.json"
 
-_PROD_BASE_URL = "https://fapi.binance.com"
-_TESTNET_BASE_URL = "https://testnet.binancefuture.com"
+_PROD_BASE_URL = "https://api.bybit.com"
+_TESTNET_BASE_URL = "https://api-testnet.bybit.com"
 _ALLOWED_CONFIG_KEYS = frozenset({
     "api_key",
     "api_secret",
+    "api_key_var",
+    "api_secret_var",
     "base_url",
     "position_size_usdt",
     "max_concurrent_positions",
     "order_check_interval_seconds",
     "testnet",
 })
-_REMOVED_ENV_VARS = frozenset({
-    "BINANCE_MAX_HOLDING_HOURS",
-})
+
+
+def _load_local_keys_module() -> ModuleType | None:
+    try:
+        return import_module("live.local_keys")
+    except ModuleNotFoundError:
+        return None
+
+
+def _resolve_secret_reference(name: str, *, required: bool = True) -> str:
+    module = _load_local_keys_module()
+    if module is None:
+        if required:
+            raise FileNotFoundError(
+                "live/local_keys.py is required to resolve config secret references"
+            )
+        return ""
+    value = getattr(module, name, "")
+    if value:
+        return str(value)
+    if required:
+        raise ValueError(f"Secret variable {name!r} was not found in live/local_keys.py")
+    return ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -172,38 +196,35 @@ class LiveConfig:
             path = Path(config_path).expanduser()
             if not path.exists():
                 raise FileNotFoundError(f"Config file not found: {path}")
-            return LiveConfig(**_load_config_data(path))
+            return _config_from_data(_load_config_data(path))
 
-        api_key = os.environ.get("BINANCE_API_KEY", "")
-        api_secret = os.environ.get("BINANCE_API_SECRET", "")
+        api_key = os.environ.get("BYBIT_API_KEY", "")
+        api_secret = os.environ.get("BYBIT_API_SECRET", "")
         if api_key and api_secret:
-            removed_env = sorted(name for name in _REMOVED_ENV_VARS if name in os.environ)
-            if removed_env:
-                raise ValueError(
-                    "Unsupported live config env vars are still set: "
-                    + ", ".join(removed_env)
-                    + ". max_holding_hours belongs in the signal generator."
-                )
-            use_testnet = os.environ.get("BINANCE_TESTNET", "").lower() in ("1", "true", "yes")
+            use_testnet = os.environ.get("BYBIT_TESTNET", "").lower() in ("1", "true", "yes")
             return LiveConfig(
                 api_key=api_key,
                 api_secret=api_secret,
                 base_url=os.environ.get(
-                    "BINANCE_BASE_URL",
+                    "BYBIT_BASE_URL",
                     _TESTNET_BASE_URL if use_testnet else _PROD_BASE_URL,
                 ),
-                position_size_usdt=float(os.environ.get("BINANCE_POSITION_SIZE", "100")),
-                max_concurrent_positions=int(os.environ.get("BINANCE_MAX_POSITIONS", "3")),
-                order_check_interval_seconds=float(os.environ.get("BINANCE_ORDER_CHECK_INTERVAL", "5")),
+                position_size_usdt=float(os.environ.get("BYBIT_POSITION_SIZE", "100")),
+                max_concurrent_positions=int(os.environ.get("BYBIT_MAX_POSITIONS", "3")),
+                order_check_interval_seconds=float(os.environ.get("BYBIT_ORDER_CHECK_INTERVAL", "5")),
                 testnet=use_testnet,
             )
 
+        local_keys_config = _load_local_keys_config()
+        if local_keys_config is not None:
+            return local_keys_config
+
         if _CONFIG_PATH.exists():
-            return LiveConfig(**_load_config_data(_CONFIG_PATH))
+            return _config_from_data(_load_config_data(_CONFIG_PATH))
 
         raise FileNotFoundError(
-            f"No API credentials found. Set BINANCE_API_KEY/BINANCE_API_SECRET env vars "
-            f"or create {_CONFIG_PATH}"
+            f"No API credentials found. Set BYBIT_API_KEY/BYBIT_API_SECRET env vars "
+            f"or create {_CONFIG_PATH} or live/local_keys.py"
         )
 
 
@@ -219,3 +240,51 @@ def _load_config_data(path: Path) -> dict[str, object]:
             f"Allowed fields: {', '.join(sorted(_ALLOWED_CONFIG_KEYS))}."
         )
     return data
+
+
+def _config_from_data(data: dict[str, object]) -> LiveConfig:
+    config_data = dict(data)
+
+    api_key = str(config_data.pop("api_key", "") or "")
+    api_secret = str(config_data.pop("api_secret", "") or "")
+    api_key_var = str(config_data.pop("api_key_var", "") or "")
+    api_secret_var = str(config_data.pop("api_secret_var", "") or "")
+
+    if not api_key and api_key_var:
+        api_key = _resolve_secret_reference(api_key_var)
+    if not api_secret and api_secret_var:
+        api_secret = _resolve_secret_reference(api_secret_var)
+
+    if not api_key or not api_secret:
+        raise ValueError(
+            "Config must provide api_key/api_secret or api_key_var/api_secret_var"
+        )
+
+    return LiveConfig(api_key=api_key, api_secret=api_secret, **config_data)
+
+
+def _load_local_keys_config() -> LiveConfig | None:
+    module = _load_local_keys_module()
+    if module is None:
+        return None
+
+    testnet = os.environ.get("BYBIT_TESTNET", "").lower() in ("1", "true", "yes")
+    if testnet:
+        api_key = getattr(module, "TESTNET_BOT_KEY", "")
+        api_secret = getattr(module, "TESTNET_BOT_SECRET", "")
+    else:
+        api_key = getattr(module, "MAINNET_BOT_KEY", "")
+        api_secret = getattr(module, "MAINNET_BOT_SECRET", "")
+
+    if not api_key or not api_secret:
+        return None
+
+    return LiveConfig(
+        api_key=str(api_key),
+        api_secret=str(api_secret),
+        base_url=os.environ.get("BYBIT_BASE_URL", _PROD_BASE_URL),
+        position_size_usdt=float(os.environ.get("BYBIT_POSITION_SIZE", "100")),
+        max_concurrent_positions=int(os.environ.get("BYBIT_MAX_POSITIONS", "3")),
+        order_check_interval_seconds=float(os.environ.get("BYBIT_ORDER_CHECK_INTERVAL", "5")),
+        testnet=testnet,
+    )

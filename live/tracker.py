@@ -10,7 +10,7 @@ from backtester.data import _symbol_for_api
 from backtester.models import PositionType, Signal
 from backtester.resolver import compute_pnl
 
-from .auth_client import BinanceFuturesClient
+from .auth_client import BybitFuturesClient
 from .executor import OrderExecutor
 from .models import (
     AccountTrade,
@@ -34,7 +34,7 @@ class PositionTracker:
 
     def __init__(
         self,
-        client: BinanceFuturesClient,
+        client: BybitFuturesClient,
         executor: OrderExecutor,
         config: LiveConfig,
     ) -> None:
@@ -191,32 +191,41 @@ class PositionTracker:
             if not symbol:
                 continue
             try:
-                amount = float(row.get("positionAmt", 0))
+                amount = float(row.get("positionAmt", row.get("size", 0)) or 0)
             except (TypeError, ValueError):
                 continue
             if abs(amount) <= _POSITION_AMOUNT_EPSILON:
                 continue
-            side = str(row.get("positionSide", "BOTH"))
+            side = str(row.get("positionSide", "")).upper()
             if side not in {"LONG", "SHORT"}:
-                side = "LONG" if amount > 0 else "SHORT"
+                raw_side = str(row.get("side", "")).upper()
+                if raw_side in {"BUY", "LONG"}:
+                    side = "LONG"
+                elif raw_side in {"SELL", "SHORT"}:
+                    side = "SHORT"
+                else:
+                    side = "LONG" if amount > 0 else "SHORT"
             keys.add((symbol, side))
         return keys
 
     # -- Exit fill detection ---------------------------------------------------
 
     def _query_order(self, ticker: str, order: ExchangeOrder) -> ExchangeOrder:
-        """Query order status, routing to algo API when needed."""
-        if order.algo_id > 0:
-            return self._client.get_algo_order(order.algo_id)
-        return self._client.get_order(ticker, order.order_id)
+        """Query order status, routing to conditional order endpoint when needed."""
+        return self._client.get_order(
+            ticker,
+            order.order_id,
+            conditional=order.is_conditional,
+        )
 
     def _cancel_order_safe(self, ticker: str, order: ExchangeOrder) -> None:
-        """Cancel order, routing to algo API when needed."""
+        """Cancel order, routing to conditional order endpoint when needed."""
         try:
-            if order.algo_id > 0:
-                self._client.cancel_algo_order(order.algo_id)
-            else:
-                self._client.cancel_order(ticker, order.order_id)
+            self._client.cancel_order(
+                ticker,
+                order.order_id,
+                conditional=order.is_conditional,
+            )
         except Exception:
             pass  # may already be canceled
 
@@ -245,20 +254,21 @@ class PositionTracker:
             if str(row.get("symbol", "")) != api_symbol:
                 continue
             try:
-                amount = float(row.get("positionAmt", 0))
+                amount = float(row.get("positionAmt", row.get("size", 0)) or 0)
             except (TypeError, ValueError):
                 continue
             if abs(amount) <= _POSITION_AMOUNT_EPSILON:
                 continue
 
-            side = str(row.get("positionSide", "BOTH"))
+            side = str(row.get("positionSide", "")).upper()
             if side in {"LONG", "SHORT"}:
                 if side == target_side:
                     return True
                 continue
-            if target_side == "LONG" and amount > _POSITION_AMOUNT_EPSILON:
+            raw_side = str(row.get("side", "")).upper()
+            if target_side == "LONG" and raw_side in {"BUY", "LONG"}:
                 return True
-            if target_side == "SHORT" and amount < -_POSITION_AMOUNT_EPSILON:
+            if target_side == "SHORT" and raw_side in {"SELL", "SHORT"}:
                 return True
 
         return False
@@ -326,7 +336,7 @@ class PositionTracker:
         total_qty = 0.0
         total_notional = 0.0
         exit_time: datetime | None = None
-        matched_order_ids: set[int] = set()
+        matched_order_ids: set[str] = set()
 
         for trade in relevant:
             remaining = qty_needed - total_qty
@@ -338,16 +348,16 @@ class PositionTracker:
             total_qty += used_qty
             total_notional += trade.price * used_qty
             exit_time = trade.time
-            if trade.order_id > 0:
+            if trade.order_id:
                 matched_order_ids.add(trade.order_id)
 
         if total_qty <= qty_epsilon or total_qty + qty_epsilon < qty_needed or exit_time is None:
             return None
 
         exit_reason = "EXTERNAL"
-        if pos.tp_order is not None and pos.tp_order.order_id > 0 and pos.tp_order.order_id in matched_order_ids:
+        if pos.tp_order is not None and pos.tp_order.order_id and pos.tp_order.order_id in matched_order_ids:
             exit_reason = "TP"
-        elif pos.sl_order is not None and pos.sl_order.order_id > 0 and pos.sl_order.order_id in matched_order_ids:
+        elif pos.sl_order is not None and pos.sl_order.order_id and pos.sl_order.order_id in matched_order_ids:
             exit_reason = "SL"
 
         return exit_reason, total_notional / total_qty, exit_time
@@ -567,7 +577,7 @@ class PositionTracker:
                 "status": order.status.value,
                 "filled_qty": order.filled_qty,
                 "avg_fill_price": order.avg_fill_price,
-                "algo_id": order.algo_id,
+                "is_conditional": order.is_conditional,
             }
 
         def _signal_dict(sig: Signal) -> dict[str, Any]:
@@ -616,7 +626,7 @@ class PositionTracker:
                 status=OrderStatus(d["status"]),
                 filled_qty=d.get("filled_qty", 0),
                 avg_fill_price=d.get("avg_fill_price", 0),
-                algo_id=d.get("algo_id", 0),
+                is_conditional=d.get("is_conditional", False),
             )
 
         try:
