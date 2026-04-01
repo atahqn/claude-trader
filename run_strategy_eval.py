@@ -43,7 +43,7 @@ from backtester.eval_windows import (
     STRESS_DEVELOPMENT_WINDOWS,
     EvalWindow,
 )
-from live.signal_generator import SignalGenerator
+from live.signal_generator import CompositeSignalGenerator, SignalGenerator
 
 
 WINDOW_ALIASES: dict[str, list[EvalWindow]] = {
@@ -73,9 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         required=True,
+        nargs="+",
         help=(
-            "Strategy spec as module[:attr] or path/to/file.py[:attr]. "
-            "If attr is omitted, a unique SignalGenerator subclass defined in the file is used."
+            "One or more strategy specs as module[:attr] or path/to/file.py[:attr]. "
+            "If attr is omitted, a unique SignalGenerator subclass defined in the file is used. "
+            "When multiple specs are given, strategies are combined into a composite."
         ),
     )
     parser.add_argument(
@@ -355,13 +357,48 @@ def _display_metric(value: float) -> str:
     return "inf" if value > 0 else "-inf"
 
 
+def _load_strategies(
+    specs: list[str], kwargs: dict[str, Any],
+) -> tuple[SignalGenerator, str, str]:
+    """Load one or more strategy specs and return (generator, display_name, strategy_spec_str).
+
+    For a single spec, returns the generator directly.
+    For multiple specs, wraps them in a CompositeSignalGenerator.
+    kwargs are only applied when a single strategy is loaded.
+    """
+    if len(specs) == 1:
+        strategy, module, name = load_strategy(specs[0], kwargs)
+        return strategy, name, specs[0]
+
+    if kwargs and kwargs != {}:
+        raise ValueError("--strategy-kwargs is not supported with multiple strategies")
+
+    generators: list[SignalGenerator] = []
+    names: list[str] = []
+    for spec in specs:
+        gen, _, name = load_strategy(spec, {})
+        generators.append(gen)
+        names.append(name)
+
+    composite = CompositeSignalGenerator(generators)
+    display_name = "+".join(names)
+    spec_str = " ".join(specs)
+    return composite, display_name, spec_str
+
+
 def main() -> int:
     args = parse_args()
     try:
         strategy_kwargs = parse_strategy_kwargs(args.strategy_kwargs)
         window_label, windows = resolve_windows(args.windows)
-        strategy, module, strategy_name = load_strategy(args.strategy, strategy_kwargs)
-        symbols = resolve_symbols(args.symbols, module, strategy)
+        strategy, strategy_name, strategy_spec = _load_strategies(
+            args.strategy, strategy_kwargs,
+        )
+        symbols = (
+            [s.strip() for s in args.symbols.split(",") if s.strip()]
+            if args.symbols.strip()
+            else strategy.symbols
+        )
 
         config = PortfolioConfig(
             approximate=args.approximate,
@@ -398,16 +435,16 @@ def main() -> int:
         saved_dir = report.save(output_dir)
         enrich_meta(
             saved_dir / "meta.json",
-            strategy_spec=args.strategy,
+            strategy_spec=strategy_spec,
             strategy_name=strategy_name,
             strategy_kwargs=strategy_kwargs,
-            module_name=module.__name__,
+            module_name=strategy_name,
             window_selector=window_label,
             symbols=symbols,
             summary=summary,
         )
         print_run_summary(
-            strategy_spec=args.strategy,
+            strategy_spec=strategy_spec,
             strategy_name=strategy_name,
             window_selector=window_label,
             approximate=config.approximate,

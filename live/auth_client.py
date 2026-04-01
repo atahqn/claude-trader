@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -117,6 +118,7 @@ class BinanceFuturesClient:
         self._api_secret = config.api_secret.encode()
         self._base_url = config.base_url
         self._rate_limiter = _RateLimiter(limit_per_minute=2400)
+        self._time_sync_lock = threading.Lock()
         self._time_offset_ms: int = 0
         self._last_time_sync_monotonic: float = 0.0
         self._last_sync_wall_ms: int = 0
@@ -154,15 +156,16 @@ class BinanceFuturesClient:
         return abs(wall_delta - monotonic_delta) > _CLOCK_JUMP_THRESHOLD_MS
 
     def _ensure_time_sync(self, *, force: bool = False) -> None:
-        if force or self._last_time_sync_monotonic <= 0:
-            self._sync_server_time()
-            return
-        if time.monotonic() - self._last_time_sync_monotonic > _TIME_SYNC_INTERVAL:
-            self._sync_server_time()
-            return
-        if self._clock_jump_detected():
-            print("Detected local clock jump; re-syncing with Binance.", file=sys.stderr)
-            self._sync_server_time()
+        with self._time_sync_lock:
+            if force or self._last_time_sync_monotonic <= 0:
+                self._sync_server_time()
+                return
+            if time.monotonic() - self._last_time_sync_monotonic > _TIME_SYNC_INTERVAL:
+                self._sync_server_time()
+                return
+            if self._clock_jump_detected():
+                print("Detected local clock jump; re-syncing with Binance.", file=sys.stderr)
+                self._sync_server_time()
 
     def _timestamp_ms(self) -> int:
         return int(time.time() * 1000) + self._time_offset_ms

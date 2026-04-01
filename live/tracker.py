@@ -57,6 +57,14 @@ class PositionTracker:
         )
         return tracked_open + len(self._external_position_keys)
 
+    def open_count_for(self, strategy_id: str) -> int:
+        """Count active positions attributed to a specific strategy."""
+        return sum(
+            1 for p in self._positions
+            if p.strategy_id == strategy_id
+            and p.status in (PositionStatus.PENDING_ENTRY, PositionStatus.OPEN)
+        )
+
     # -- Position management ---------------------------------------------------
 
     def add_position(self, position: LivePosition) -> None:
@@ -590,6 +598,7 @@ class PositionTracker:
 
         return {
             "position_id": pos.position_id,
+            "strategy_id": pos.strategy_id,
             "status": pos.status.value,
             "signal": _signal_dict(pos.signal),
             "entry_order": _order_dict(pos.entry_order),
@@ -639,6 +648,7 @@ class PositionTracker:
             return LivePosition(
                 signal=signal,
                 position_id=data["position_id"],
+                strategy_id=data.get("strategy_id", ""),
                 status=PositionStatus(data["status"]),
                 entry_order=_parse_order(data.get("entry_order")),
                 tp_order=_parse_order(data.get("tp_order")),

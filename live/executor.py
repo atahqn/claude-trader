@@ -44,6 +44,7 @@ class OrderExecutor:
         signal: Signal,
         *,
         available_balance: float | None = None,
+        position_size_usdt: float | None = None,
     ) -> ExecutionResult:
         """Place entry order for *signal* and return an ExecutionResult."""
         api_symbol = _symbol_for_api(signal.ticker)
@@ -64,11 +65,17 @@ class OrderExecutor:
         else:
             entry_price = self._client.get_mark_price(signal.ticker)
 
+        effective_size = (
+            position_size_usdt
+            if position_size_usdt is not None
+            else self._config.position_size_usdt
+        )
         self._current_size_multiplier = signal.size_multiplier
         quantity, required_notional = self._compute_entry_quantity(
             api_symbol,
             entry_price,
             use_market_filter=signal.entry_price is None,
+            position_size_usdt=effective_size,
         )
         effective_leverage = self._effective_leverage(signal)
         required_margin = required_notional / effective_leverage
@@ -195,8 +202,14 @@ class OrderExecutor:
         entry_price: float,
         *,
         use_market_filter: bool,
+        position_size_usdt: float | None = None,
     ) -> tuple[float, float]:
-        raw_qty = self._config.position_size_usdt * self._current_size_multiplier / entry_price
+        effective_size = (
+            position_size_usdt
+            if position_size_usdt is not None
+            else self._config.position_size_usdt
+        )
+        raw_qty = effective_size * self._current_size_multiplier / entry_price
         quantity = self._round_quantity(
             api_symbol,
             raw_qty,

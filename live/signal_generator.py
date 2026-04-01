@@ -22,10 +22,29 @@ class SignalGenerator(ABC):
 
     Implement ``poll`` with your strategy logic.  The engine calls ``setup``
     once before the main loop and ``teardown`` on shutdown.
+
+    Subclasses **must** override the ``symbols`` property to declare which
+    tickers they trade.  The engine validates disjoint symbol spaces at
+    startup and filters signals against declared symbols at runtime.
     """
 
     analysis_interval: str = "1h"
     poll_interval: str | None = None
+
+    @property
+    def strategy_id(self) -> str:
+        """Unique identifier for this generator in a multi-generator engine.
+
+        Defaults to the class name.  Override to customise.
+        """
+        return type(self).__name__
+
+    @property
+    def symbols(self) -> list[str]:
+        """Symbols this generator trades.  Must be overridden."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must define a 'symbols' property"
+        )
 
     def setup(self, client: LiveMarketClient) -> None:
         """Called once before the main loop.
@@ -42,6 +61,11 @@ class SignalGenerator(ABC):
         self._current_poll_time = now
 
     def current_time(self) -> datetime:
+        """Return the engine-injected poll time.
+
+        Strategies **must** use this instead of ``datetime.now()`` so that
+        all generators in a multi-slot engine share a consistent clock.
+        """
         current = getattr(self, "_current_poll_time", None)
         if current is not None:
             return current
@@ -91,3 +115,63 @@ class SignalGenerator(ABC):
 
     def teardown(self) -> None:
         """Called on engine shutdown.  Override for cleanup; default is a no-op."""
+
+
+class CompositeSignalGenerator(SignalGenerator):
+    """Wraps multiple generators for backtesting as a single unit.
+
+    Each child generator must have a disjoint symbol space.  Signals from
+    all children are merged chronologically.  Used by ``run_strategy_eval.py``
+    to evaluate multi-strategy portfolios through the existing
+    ``StrategyEvaluator`` without any evaluator changes.
+    """
+
+    def __init__(self, generators: list[SignalGenerator]) -> None:
+        if not generators:
+            raise ValueError("CompositeSignalGenerator requires at least one generator")
+        self._generators = list(generators)
+        self._validate_symbol_space()
+        self._all_symbols = []
+        for gen in self._generators:
+            self._all_symbols.extend(gen.symbols)
+
+    def _validate_symbol_space(self) -> None:
+        seen: dict[str, str] = {}
+        for gen in self._generators:
+            for symbol in gen.symbols:
+                if symbol in seen:
+                    raise ValueError(
+                        f"Symbol space conflict: '{symbol}' claimed by both "
+                        f"'{seen[symbol]}' and '{gen.strategy_id}'"
+                    )
+                seen[symbol] = gen.strategy_id
+
+    @property
+    def strategy_id(self) -> str:
+        return "+".join(g.strategy_id for g in self._generators)
+
+    @property
+    def symbols(self) -> list[str]:
+        return list(self._all_symbols)
+
+    def poll(self) -> Signal | list[Signal] | None:
+        return None
+
+    def generate_backtest_signals(
+        self,
+        prepared_context: PreparedMarketContext,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+    ) -> list[Signal]:
+        all_signals: list[Signal] = []
+        for gen in self._generators:
+            child_symbols = [s for s in symbols if s in gen.symbols]
+            if not child_symbols:
+                continue
+            sigs = gen.generate_backtest_signals(
+                prepared_context, child_symbols, start, end,
+            )
+            all_signals.extend(sigs)
+        all_signals.sort(key=lambda s: s.signal_date)
+        return all_signals

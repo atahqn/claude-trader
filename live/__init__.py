@@ -5,6 +5,7 @@ from .engine import LiveEngine
 from .executor import OrderExecutor
 from .models import (
     ExchangeOrder,
+    GeneratorBudget,
     LiveConfig,
     LivePosition,
     OrderSide,
@@ -18,6 +19,7 @@ from .tracker import PositionTracker
 __all__ = [
     "BinanceFuturesClient",
     "ExchangeOrder",
+    "GeneratorBudget",
     "LiveConfig",
     "LiveEngine",
     "LiveMarketClient",

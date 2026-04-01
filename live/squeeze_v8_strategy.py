@@ -125,6 +125,11 @@ _PULLBACK_FEATURE_COLUMNS = (
 )
 _PULLBACK_WARMUP_BARS = required_warmup(_PULLBACK_FEATURE_COLUMNS)
 
+# Union of squeeze and pullback columns — computed once per poll instead of twice.
+_COMBINED_FEATURE_COLUMNS = tuple(dict.fromkeys(
+    SQUEEZE_V8_FEATURE_COLUMNS + _PULLBACK_FEATURE_COLUMNS
+))
+
 _PULLBACK_V1_BETA = (
     0.0203650314688874,
     -0.54086920213952,
@@ -565,12 +570,14 @@ class _SqueezeV8PreviewState:
     close_tail_19: deque[float] = None  # type: ignore[assignment]
     close_tail_72: deque[float] = None  # type: ignore[assignment]
     last_row: _SqueezeV8FeatureRow | None = None
+    candle_buffer: deque[Candle] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         self.tr_tail = deque(maxlen=13)
         self.atr_tail = deque(maxlen=71)
         self.close_tail_19 = deque(maxlen=19)
         self.close_tail_72 = deque(maxlen=72)
+        self.candle_buffer = deque(maxlen=_LOOKBACK_BARS)
 
     def preview(self, candle: Candle) -> _SqueezeV8PreviewStep:
         close = candle.close
@@ -703,6 +710,7 @@ class _SqueezeV8PreviewState:
         self.close_tail_19.append(step.close)
         self.close_tail_72.append(step.close)
         self.last_row = step.row
+        self.candle_buffer.append(candle)
         return step.row
 
 
@@ -1171,6 +1179,10 @@ class SqueezeV8Strategy(SignalGenerator):
     Default sizing: ridge_v1 dynamic sizing (separate models per side)
     """
 
+    @property
+    def symbols(self) -> list[str]:
+        return list(SYMBOLS)
+
     def __init__(
         self,
         analysis_interval: str = "1h",
@@ -1409,13 +1421,7 @@ class SqueezeV8Strategy(SignalGenerator):
         # Pullback LONG check (full pandas path for preview mode)
         had_short = len(emitted) > 0
         if self.enable_pullback_long and not had_short:
-            lookback_start = now - timedelta(hours=_LOOKBACK_BARS + 2)
-            pb_candles = self._client.fetch_klines(
-                symbol=symbol.replace("/", ""),
-                interval=self.analysis_interval,
-                start=lookback_start,
-                end=now,
-            )
+            pb_candles = list(state.candle_buffer)
             if len(pb_candles) >= _PULLBACK_WARMUP_BARS:
                 import pandas as pd
                 pb_rows = [{
@@ -1424,7 +1430,8 @@ class SqueezeV8Strategy(SignalGenerator):
                     "close": c.close, "volume": c.volume,
                 } for c in pb_candles]
                 df_raw = pd.DataFrame(pb_rows).sort_values("open_time").reset_index(drop=True)
-                pullback_sigs = self._check_pullback_long(df_raw, symbol, now)
+                df_feat = compute_indicator_frame(df_raw, _COMBINED_FEATURE_COLUMNS)
+                pullback_sigs = self._check_pullback_long(df_feat, symbol, now)
                 emitted.extend(pullback_sigs)
 
         return emitted
@@ -1482,10 +1489,10 @@ class SqueezeV8Strategy(SignalGenerator):
             return []
         df_raw = df_raw.sort_values("open_time").reset_index(drop=True)
 
-        # --- Squeeze SHORT check ---
-        df_squeeze = build_squeeze_v8_feature_frame(df_raw.copy())
-        last_idx = len(df_squeeze) - 1
-        if df_squeeze.iloc[last_idx]["close_time"] > now:
+        # --- Combined feature frame (squeeze + pullback in one pass) ---
+        df_feat = compute_indicator_frame(df_raw, _COMBINED_FEATURE_COLUMNS)
+        last_idx = len(df_feat) - 1
+        if df_feat.iloc[last_idx]["close_time"] > now:
             last_idx -= 1
         if last_idx + 1 < _WARMUP_BARS:
             raise FatalSignalError(
@@ -1493,8 +1500,8 @@ class SqueezeV8Strategy(SignalGenerator):
             )
 
         emitted: list[Signal] = []
-        row = df_squeeze.iloc[last_idx]
-        prev = df_squeeze.iloc[last_idx - 1]
+        row = df_feat.iloc[last_idx]
+        prev = df_feat.iloc[last_idx - 1]
 
         if not pd.isna(row.get("mom_slope")) and not pd.isna(row.get("atr_ratio")):
             rsi = row.get("rsi_14", 50)
@@ -1522,19 +1529,18 @@ class SqueezeV8Strategy(SignalGenerator):
         # --- Pullback LONG check ---
         had_short = len(emitted) > 0
         if self.enable_pullback_long and not had_short:
-            pullback_sigs = self._check_pullback_long(df_raw, symbol, now)
-            emitted.extend(pullback_sigs)
+            pullback_sigs = self._check_pullback_long(df_feat, symbol, now)
 
         return emitted
 
     def _check_pullback_long(
         self,
-        df_raw: pd.DataFrame,
+        df_feat: pd.DataFrame,
         symbol: str,
         now: datetime,
     ) -> list[Signal]:
         """Check pullback LONG conditions on the last closed candle."""
-        df_pullback = _build_pullback_feature_frame(df_raw.copy())
+        df_pullback = df_feat
         last_idx = len(df_pullback) - 1
         if df_pullback.iloc[last_idx]["close_time"] > now:
             last_idx -= 1
