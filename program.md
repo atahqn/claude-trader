@@ -50,7 +50,9 @@ still developing or selecting the strategy.
 4. Create a directory with proper name for your research under the claude-trader.
 5. Create the strategy file that implements the SignalGenerator class under this folder. You can import other logic from other folders but the SignalGenerator implementation must be here.
 6. Create results.tsv under this folder to save summarized results.
-7. Confirm your research with the user and start.
+7. Confirm your research with the user take his approval and start.
+
+Note that developing strategies is very challenging. Before and after you start your research, you should think hard on your ideas, if you wish you can even research the internet, look for papers, blogpposts etc. to find new ideas.
 
 ## Research Workflow
 
@@ -114,11 +116,14 @@ Tie-breakers after `preference_score` are:
 ## What to Do:
 
 Edit and refine your strategy.
-Use or derive metrics that you think would be useful. 
+
+Use provided indicators from backtester/indicators.py or derive metrics that you think would be useful. Codebase exposes 5 Binance dataset types through MarketDataRequest: ohlcv, agg_trades (this is only available for l year so you cannot properly use this for signal generation), funding_rates, mark_price_klines, and premium_index_klines (marketdata/models.py:9, marketdata/bundle.py:45). You can use this data to create new indicators but doing so do not change directly the backtester/indicator.py but keep it in under the research folder.
+
 You must work on your created strategy folder. You cannot implement already living strategies. You can import, copy or change them in your folder.
 
 The evaluated backtester path must implement the strategy itself.
 
+You can calculate new indicators or use the provided data if you think it will be useful for the strategy.  (OHLCV, premium)
 In particular:
 
 - a live `SignalGenerator` and its backtest path must represent the same strategy logic
