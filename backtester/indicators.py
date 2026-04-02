@@ -122,6 +122,19 @@ _INDICATOR_SPECS: dict[str, IndicatorSpec] = {
     "mom_slope": IndicatorSpec("mom_slope", ("close",), 19),
     "body": IndicatorSpec("body", ("open", "close"), 0),
     "body_ratio": IndicatorSpec("body_ratio", ("body", "high", "low"), 0),
+    # --- ADX (Average Directional Index) ---
+    "_plus_dm": IndicatorSpec("_plus_dm", ("high", "low"), 1),
+    "_minus_dm": IndicatorSpec("_minus_dm", ("high", "low"), 1),
+    "_smoothed_plus_dm": IndicatorSpec("_smoothed_plus_dm", ("_plus_dm",), 13),
+    "_smoothed_minus_dm": IndicatorSpec("_smoothed_minus_dm", ("_minus_dm",), 13),
+    "_smoothed_tr": IndicatorSpec("_smoothed_tr", ("true_range",), 13),
+    "_plus_di": IndicatorSpec("_plus_di", ("_smoothed_plus_dm", "_smoothed_tr"), 0),
+    "_minus_di": IndicatorSpec("_minus_di", ("_smoothed_minus_dm", "_smoothed_tr"), 0),
+    "_dx": IndicatorSpec("_dx", ("_plus_di", "_minus_di"), 0),
+    "adx_14": IndicatorSpec("adx_14", ("_dx",), 13),
+    # --- Bollinger Band normalizations ---
+    "bb_pct_b": IndicatorSpec("bb_pct_b", ("close", "bb_upper", "bb_lower"), 0),
+    "bb_width": IndicatorSpec("bb_width", ("bb_upper", "bb_lower", "_bb_ma_20"), 0),
 }
 
 
@@ -176,6 +189,37 @@ def _compute_indicator(name: str, frame: pd.DataFrame) -> pd.Series:
         return frame["close"] - frame["open"]
     if name == "body_ratio":
         return frame["body"] / (frame["high"] - frame["low"]).replace(0, np.nan)
+    # --- ADX ---
+    if name == "_plus_dm":
+        diff_high = frame["high"].diff()
+        diff_low = -(frame["low"].diff())
+        return diff_high.where((diff_high > diff_low) & (diff_high > 0), 0.0)
+    if name == "_minus_dm":
+        diff_high = frame["high"].diff()
+        diff_low = -(frame["low"].diff())
+        return diff_low.where((diff_low > diff_high) & (diff_low > 0), 0.0)
+    if name == "_smoothed_plus_dm":
+        return frame["_plus_dm"].ewm(alpha=_RSI_ALPHA, min_periods=14).mean()
+    if name == "_smoothed_minus_dm":
+        return frame["_minus_dm"].ewm(alpha=_RSI_ALPHA, min_periods=14).mean()
+    if name == "_smoothed_tr":
+        return frame["true_range"].ewm(alpha=_RSI_ALPHA, min_periods=14).mean()
+    if name == "_plus_di":
+        return 100.0 * frame["_smoothed_plus_dm"] / frame["_smoothed_tr"]
+    if name == "_minus_di":
+        return 100.0 * frame["_smoothed_minus_dm"] / frame["_smoothed_tr"]
+    if name == "_dx":
+        di_sum = frame["_plus_di"] + frame["_minus_di"]
+        di_diff = (frame["_plus_di"] - frame["_minus_di"]).abs()
+        return (100.0 * di_diff / di_sum).replace([np.inf, -np.inf], np.nan)
+    if name == "adx_14":
+        return frame["_dx"].ewm(alpha=_RSI_ALPHA, min_periods=14).mean()
+    # --- BB normalizations ---
+    if name == "bb_pct_b":
+        band_range = frame["bb_upper"] - frame["bb_lower"]
+        return ((frame["close"] - frame["bb_lower"]) / band_range).replace([np.inf, -np.inf], np.nan)
+    if name == "bb_width":
+        return (frame["bb_upper"] - frame["bb_lower"]) / frame["_bb_ma_20"]
     raise KeyError(f"unknown indicator: {name}")
 
 

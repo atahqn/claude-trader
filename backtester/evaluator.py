@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .engine import DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS, backtest_signals
-from .eval_windows import EvalWindow
+from .eval_windows import CATEGORY_DESCRIPTIONS, EvalWindow
 from .models import BacktestResult, ExitReason, PositionType
 from .pipeline import BacktestExecutionSession, prepare_market_context
 
@@ -192,7 +192,7 @@ class EvaluationReport:
     def format_table(self) -> str:
         rows = self.all_summaries() + [self.overall_summary()]
         header = (
-            f"{'Category':<20} | {'Win':>7} | {'PNL':>9} | {'WR':>6} "
+            f"{'Category':<35} | {'Win':>7} | {'PNL':>9} | {'WR':>6} "
             f"| {'Worst':>8} | {'Best':>8} | {'Trades':>6} "
             f"| {'S/L':>9} | {'Trd WR':>6} | {'PF':>5} | {'Sort':>7} "
             f"| {'DD':>6} | {'Omega':>6} | {'Pref':>7}"
@@ -200,8 +200,10 @@ class EvaluationReport:
         sep = "-" * len(header)
         lines = [header, sep]
         for s in rows:
+            desc = CATEGORY_DESCRIPTIONS.get(s.category, "")
+            label = f"{s.category} ({desc})" if desc else s.category
             lines.append(
-                f"{s.category:<20} | {s.windows:>7} | "
+                f"{label:<35} | {s.windows:>7} | "
                 f"{s.total_pnl:>+8.2f}% | "
                 f"{s.weekly_win_rate * 100:>5.1f}% | "
                 f"{s.worst_week_pnl:>+7.2f}% | "

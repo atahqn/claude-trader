@@ -18,13 +18,24 @@ Breadth entries have priority when both regimes are active.
 10-symbol universe (non-overlapping with V8.3):
   ETH, SOL, BTC, NEAR, DOT, ADA, APT, RENDER, INJ, LTC
 
-Approximate evaluation (2026-04-02):
-  Dev  (58w): pref 23.15, PNL +177%, PF 2.19, MDD 25.9%, 152 trades
-  Eval (41w): pref 10.40, PNL +86%,  PF 1.66, MDD 19.9%, 116 trades
+Exact evaluation (2026-04-02):
+  Baseline   Dev 19.74 / Eval 11.22  (PNL +170/+86%, MDD 28.3/18.3%)
+  heuristic_v1  Dev 23.29 / Eval 17.48  (PNL +167/+92%, MDD 25.4/14.7%)
+
+Supports sizing_mode:
+  "baseline"       — all signals get size_multiplier=1.0
+  "heuristic_v1"   — pattern-based sizing with dip-depth and cluster
+                     adjustments (deployed default)
+
+Supports tp_sl_mode:
+  "baseline"       — fixed per-pattern TP/SL (deployed default)
+  "tiered_v1"      — quality-tiered TP/SL (failed on eval, do not use)
 """
 
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -213,6 +224,105 @@ def _conv_impulse(row: pd.Series) -> tuple[bool, dict[str, object], float, float
     return True, {"pattern": "conv_impulse", "impulse_atr": round(body / atr, 2), "ret_72h": round(ret_72h, 2)}, 4.0, 2.0
 
 
+# --- Heuristic V1 sizing ---
+#
+# Pattern-based multiplier from cross-split trade analysis:
+#   conv_impulse  PF ~2.15 (dev+eval) -> upweight
+#   breadth_sel_mom PF ~3.0 (small N) -> moderate upweight
+#   breadth_dipbuy PF ~2.1  (standard) -> neutral
+#   conv_dipbuy   PF ~1.25 (weakest)  -> downweight
+#
+# Dip-depth adjustment: deeper ret_24h -> better outcomes on both splits.
+# Cluster dilution: many simultaneous signals -> reduce each.
+
+_PATTERN_BASE_MULT: dict[str, float] = {
+    "conv_impulse": 1.30,
+    "breadth_sel_mom": 1.15,
+    "breadth_dipbuy": 1.00,
+    "conv_dipbuy": 0.75,
+}
+
+_SIZE_CLIP_LO = 0.50
+_SIZE_CLIP_HI = 1.60
+
+
+def _heuristic_v1_size(
+    pattern: str,
+    ret_24h: float | None,
+    cluster_count: int,
+) -> float:
+    base = _PATTERN_BASE_MULT.get(pattern, 1.0)
+
+    # Dip-depth adjustment (dipbuy patterns only)
+    if "dipbuy" in pattern and ret_24h is not None:
+        if ret_24h <= -3.0:
+            base *= 1.10
+        elif ret_24h <= -1.0:
+            pass  # neutral
+        else:
+            base *= 0.90
+
+    # Cluster dilution: log-scale penalty for simultaneous signals
+    if cluster_count >= 4:
+        base *= 0.80
+    elif cluster_count >= 3:
+        base *= 0.90
+
+    return max(_SIZE_CLIP_LO, min(_SIZE_CLIP_HI, base))
+
+
+def _apply_heuristic_v1_sizing(signals: list[Signal]) -> list[Signal]:
+    time_counts: Counter[datetime] = Counter(s.signal_date for s in signals)
+    result: list[Signal] = []
+    for sig in signals:
+        meta = dict(sig.metadata)
+        pattern = meta.get("pattern", "")
+        ret_24h = meta.get("ret_24h")
+        cluster = time_counts[sig.signal_date]
+        mult = _heuristic_v1_size(pattern, ret_24h, cluster)
+        meta["size_model"] = "heuristic_v1"
+        meta["size_mult"] = round(mult, 4)
+        meta["cluster_count"] = cluster
+        result.append(replace(sig, size_multiplier=mult, metadata=meta))
+    return result
+
+
+# --- Tiered V1 TP/SL ---
+#
+# Quality-tiered exits based on pattern quality:
+#   conv_dipbuy (weakest PF ~1.25): tighter SL 1.5% to cut losses faster
+#   conv_impulse with impulse_atr >= 2.5: wider TP 5.0% to let winners run
+#   Everything else: unchanged from baseline
+
+def _apply_tiered_v1_tp_sl(signals: list[Signal]) -> list[Signal]:
+    result: list[Signal] = []
+    for sig in signals:
+        meta = dict(sig.metadata)
+        pattern = meta.get("pattern", "")
+        tp = sig.tp_pct
+        sl = sig.sl_pct
+
+        if pattern == "conv_dipbuy":
+            sl = 1.5
+            meta["tp_sl_tier"] = "tight_sl"
+        elif pattern == "conv_impulse":
+            impulse_atr = meta.get("impulse_atr", 0.0)
+            if impulse_atr >= 2.5:
+                tp = 5.0
+                meta["tp_sl_tier"] = "wide_tp"
+            else:
+                meta["tp_sl_tier"] = "standard"
+        else:
+            meta["tp_sl_tier"] = "standard"
+
+        result.append(replace(sig, tp_pct=tp, sl_pct=sl, metadata=meta))
+    return result
+
+
+_VALID_SIZING_MODES = ("baseline", "heuristic_v1")
+_VALID_TP_SL_MODES = ("baseline", "tiered_v1")
+
+
 # --- Strategy class ---
 
 class CombinedLongStrategy(SignalGenerator):
@@ -231,20 +341,33 @@ class CombinedLongStrategy(SignalGenerator):
         convergence_pct: float = 0.70,
         breadth_pct: float = 0.80,
         leverage: float = 1.0,
+        sizing_mode: str = "baseline",
+        tp_sl_mode: str = "baseline",
         **kwargs: Any,
     ) -> None:
+        if sizing_mode not in _VALID_SIZING_MODES:
+            raise ValueError(f"sizing_mode must be one of {_VALID_SIZING_MODES}")
+        if tp_sl_mode not in _VALID_TP_SL_MODES:
+            raise ValueError(f"tp_sl_mode must be one of {_VALID_TP_SL_MODES}")
         self.cooldown_h = cooldown_h
         self.max_holding_hours = max_holding_hours
         self.convergence_pct = convergence_pct
         self.breadth_pct = breadth_pct
         self.leverage = leverage
+        self.sizing_mode = sizing_mode
+        self.tp_sl_mode = tp_sl_mode
 
     def __str__(self) -> str:
-        return (
-            f"CombinedLong(br>={self.breadth_pct:.0%} "
-            f"conv>={self.convergence_pct:.0%} "
-            f"{len(SYMBOLS)}sym)"
-        )
+        parts = [
+            f"CombinedLong(br>={self.breadth_pct:.0%}",
+            f"conv>={self.convergence_pct:.0%}",
+            f"{len(SYMBOLS)}sym",
+        ]
+        if self.sizing_mode != "baseline":
+            parts.append(f"size={self.sizing_mode}")
+        if self.tp_sl_mode != "baseline":
+            parts.append(f"tpsl={self.tp_sl_mode}")
+        return " ".join(parts) + ")"
 
     def market_data_request(self) -> MarketDataRequest:
         return MarketDataRequest.ohlcv_only(interval=self.analysis_interval)
@@ -355,4 +478,11 @@ class CombinedLongStrategy(SignalGenerator):
                 last_signal = close_time
 
         all_signals.sort(key=lambda s: s.signal_date)
+
+        # Post-processing: dynamic TP/SL then sizing
+        if self.tp_sl_mode == "tiered_v1":
+            all_signals = _apply_tiered_v1_tp_sl(all_signals)
+        if self.sizing_mode == "heuristic_v1":
+            all_signals = _apply_heuristic_v1_sizing(all_signals)
+
         return all_signals

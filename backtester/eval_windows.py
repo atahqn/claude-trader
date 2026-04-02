@@ -286,6 +286,21 @@ ALL_WINDOWS: list[EvalWindow] = DEVELOPMENT_WINDOWS + EVALUATION_WINDOWS
 # ---------------------------------------------------------------------------
 
 
+CATEGORY_DESCRIPTIONS: dict[str, str] = {
+    "development": "mixed Apr24-Mar25",
+    "development_stress": "crashes/bears/chop",
+    "development_bull": "pre-2024 bull",
+    "development_pairs": "regime pairs",
+    "development_random": "random blocks",
+    "holdout": "Apr25+Mar26",
+    "oos2": "bull/bear/chop/capit",
+    "oos3": "dispersion+bears",
+    "oos4": "strong bull pre-23",
+    "oos5": "bull/bear/flat pairs",
+    "evaluation_random": "random blocks",
+}
+
+
 def windows_by_category(
     windows: list[EvalWindow],
 ) -> dict[str, list[EvalWindow]]:

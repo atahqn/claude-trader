@@ -27,7 +27,7 @@ def main() -> None:
     config = load_live_config_from_args(args)
 
     squeeze = SqueezeV8Strategy(leverage=args.leverage, sizing_mode="ridge_v1")
-    combined_long = CombinedLongStrategy(leverage=args.leverage)
+    combined_long = CombinedLongStrategy(leverage=args.leverage, sizing_mode="heuristic_v1")
 
     size = config.position_size_usdt
     max_pos = config.max_concurrent_positions
