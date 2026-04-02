@@ -6,14 +6,14 @@ Usage:
 
 Strategies:
   - Squeeze V8.3: squeeze SHORT + pullback LONG (7 altcoins)
-  - Breadth Momentum: dip-buy + selective momentum LONG (10 symbols)
+  - Combined Long: breadth + convergence LONG (10 symbols)
 """
 
 import argparse
 import sys
 
-from live.breadth_momentum_strategy import BreadthMomentumStrategy
 from live.cli import add_live_runtime_args, load_live_config_from_args
+from live.combined_long_strategy import CombinedLongStrategy
 from live.engine import LiveEngine
 from live.models import GeneratorBudget
 from live.squeeze_v8_strategy import SqueezeV8Strategy
@@ -27,7 +27,7 @@ def main() -> None:
     config = load_live_config_from_args(args)
 
     squeeze = SqueezeV8Strategy(leverage=args.leverage, sizing_mode="ridge_v1")
-    breadth_mom = BreadthMomentumStrategy(leverage=args.leverage)
+    combined_long = CombinedLongStrategy(leverage=args.leverage)
 
     size = config.position_size_usdt
     max_pos = config.max_concurrent_positions
@@ -36,7 +36,7 @@ def main() -> None:
     engine = LiveEngine(
         generators=[
             (squeeze, budget),
-            (breadth_mom, budget),
+            (combined_long, budget),
         ],
         config=config,
     )
@@ -44,7 +44,7 @@ def main() -> None:
     print(
         f"Starting Multi-Strategy Live Trader\n"
         f"  Squeeze V8.3:       SHORT + LONG | 7 symbols\n"
-        f"  Breadth Momentum:   LONG only    | 10 symbols\n"
+        f"  Combined Long:      LONG only    | 10 symbols\n"
         f"  Leverage: {args.leverage}x\n"
         f"  Size:     {size} USDT\n"
         f"  Max positions: {max_pos} (global ceiling)\n"
