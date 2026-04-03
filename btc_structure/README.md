@@ -96,6 +96,33 @@ def poll(self):
 ```
 
 
+## Engine API
+
+`simulate_btc_structure(ohlcv, config, *, checkpoint=None)` returns a
+`tuple[StructureArtifacts, StructureCheckpoint]`. The checkpoint captures the
+engine's internal state so that subsequent calls with appended bars can resume
+from the last processed bar instead of re-running the full history. Pass
+`checkpoint=None` (the default) for a fresh computation.
+
+```python
+from btc_structure import BtcStructureConfig, simulate_btc_structure
+
+config = BtcStructureConfig.for_interval("1d")
+artifacts, checkpoint = simulate_btc_structure(ohlcv_day_1_to_100, config)
+
+# Later, with more bars appended:
+artifacts, checkpoint = simulate_btc_structure(
+    ohlcv_day_1_to_200, config, checkpoint=checkpoint,
+)
+```
+
+The checkpoint is validated on resume via a SHA-256 prefix hash over the OHLCV
+data and a config fingerprint. If either mismatches (e.g. different data or
+config), the checkpoint is discarded and full recomputation runs automatically.
+
+`DailyStructureProvider` uses this internally — no changes needed in strategy
+code.
+
 ## Requirements
 
 - Daily OHLCV data from BTC/USDT perpetual (Binance futures), listing date (2019-09-08) to present

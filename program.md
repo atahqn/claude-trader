@@ -142,6 +142,8 @@ Do not modify files outside the research folder. You can import them, copy-paste
 
 NEVER test your strategies first on the evaluation. You develop then you test on the evaluation. If it is not good enough you discard them.
 
+Your research is independent of the other researchs you should not scan for other research folders but you should only look at the native claude-trader code for context.
+
 Any kind of cheating is forbidden. Your strategy should depend and calculate entries from the available information at the time of execution
 with no look-ahead bias. Refer STRATEGY_EVOLUTION.md for previous mistakes. 
 

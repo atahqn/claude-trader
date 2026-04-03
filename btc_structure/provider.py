@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from .config import BtcStructureConfig
-from .engine import StructureArtifacts, simulate_btc_structure
+from .engine import StructureArtifacts, StructureCheckpoint, simulate_btc_structure
 from .features import StructureExperimentResult, StructureLabArtifacts, run_structure_feature_lab
 
 if TYPE_CHECKING:
@@ -86,6 +86,7 @@ class DailyStructureProvider:
         self._features: pd.DataFrame | None = None
         self._result: StructureExperimentResult | None = None
         self._computed_until: datetime | None = None
+        self._checkpoint: StructureCheckpoint | None = None
 
     # ------------------------------------------------------------------
     # Computation
@@ -99,7 +100,9 @@ class DailyStructureProvider:
             return
         frame = _candles_to_frame(closed)
         config = BtcStructureConfig.for_interval("1d")
-        structure = simulate_btc_structure(frame, config)
+        structure, self._checkpoint = simulate_btc_structure(
+            frame, config, checkpoint=self._checkpoint,
+        )
         lab = run_structure_feature_lab(structure, columns=self._columns)
         self._result = StructureExperimentResult(structure=structure, lab=lab)
         self._features = lab.feature_matrix
@@ -110,6 +113,13 @@ class DailyStructureProvider:
         if self._computed_until is not None and cutoff <= self._computed_until:
             return
         self._compute(cutoff)
+
+    def reset(self) -> None:
+        """Discard all cached state including checkpoint."""
+        self._features = None
+        self._result = None
+        self._computed_until = None
+        self._checkpoint = None
 
     def refresh_if_stale(self, now: datetime) -> bool:
         """Recompute if a new daily candle has closed since last run.

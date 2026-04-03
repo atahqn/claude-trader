@@ -240,10 +240,10 @@ def backtest_signal(
             entry_price = base_trade.price
             entry_time = base_trade.timestamp
         else:
-            # Fallback: close of 1h candle at signal_date
-            candle_start = signal.signal_date.replace(minute=0, second=0, microsecond=0)
-            candle_end = candle_start + timedelta(hours=1)
-            fallback_candles = session.fetch_hourly_candles(ticker, candle_start, candle_end)
+            # Fallback: close of 1m candle at signal_date
+            candle_start = signal.signal_date.replace(second=0, microsecond=0)
+            candle_end = candle_start + timedelta(minutes=1)
+            fallback_candles = session.fetch_minute_candles(ticker, candle_start, candle_end)
             if fallback_candles:
                 entry_price = fallback_candles[0].close
                 entry_time = fallback_candles[0].close_time

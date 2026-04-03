@@ -1,5 +1,5 @@
 from .config import BtcStructureConfig
-from .engine import BarArrays, BarData, StructureArtifacts, simulate_btc_structure
+from .engine import BarArrays, BarData, StructureArtifacts, StructureCheckpoint, simulate_btc_structure
 from .features import (
     STRUCTURE_EVENTS,
     STRUCTURE_LEVELS,
@@ -27,6 +27,7 @@ __all__ = [
     "STRUCTURE_LEVELS",
     "STRUCTURE_REGIME",
     "StructureArtifacts",
+    "StructureCheckpoint",
     "StructureExperimentResult",
     "StructureLabArtifacts",
     "build_structure_feature_matrix",

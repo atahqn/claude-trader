@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -91,6 +93,36 @@ class StructureArtifacts:
     break_attempt_lows: pd.DataFrame
     structure_breaks: pd.DataFrame
     summary: dict[str, Any]
+
+
+@dataclass(slots=True)
+class StructureCheckpoint:
+    """Snapshot of engine state after processing bar at ``resume_from - 1``.
+
+    Allows ``simulate_btc_structure`` to resume from bar ``resume_from``
+    without re-processing earlier bars, while producing bit-identical results.
+    """
+
+    resume_from: int  # next bar index to process
+    state: dict[str, Any]  # 7-key engine state dict
+    stats: dict[str, Any]  # 11-key stats dict (event lists + counters)
+    feature_rows: list[dict[str, Any]]  # accumulated feature row dicts [0..resume_from)
+    prefix_hash: str  # hex digest over processed OHLCV prefix
+    config_fingerprint: str  # repr(config) — invalidates on config change
+
+
+def _ohlcv_prefix_hash(ohlcv: pd.DataFrame, n: int) -> str:
+    """Hash the first *n* rows' OHLCV+volume values for checkpoint identity.
+
+    Uses ``to_records`` to preserve per-column dtype (int64 timestamps,
+    float64 prices/volume) instead of ``.values`` which upcasts the
+    mixed-dtype frame to a single float64 array, losing nanosecond
+    timestamp precision.
+    """
+    cols = ["close_time", "open", "high", "low", "close", "volume"]
+    subset = ohlcv.iloc[:n][cols].copy()
+    subset["close_time"] = subset["close_time"].astype("int64")
+    return hashlib.sha256(subset.to_records(index=False).tobytes()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -782,42 +814,65 @@ def summarize_structure(
 # Main simulation
 # ---------------------------------------------------------------------------
 
-def simulate_btc_structure(ohlcv: pd.DataFrame, config: BtcStructureConfig) -> StructureArtifacts:
+def simulate_btc_structure(
+    ohlcv: pd.DataFrame,
+    config: BtcStructureConfig,
+    *,
+    checkpoint: StructureCheckpoint | None = None,
+) -> tuple[StructureArtifacts, StructureCheckpoint]:
     work = ohlcv.copy()
     work["atr"] = causal_atr(work, config.atr_window)
     work = _build_rolling_levels(work, config.level_windows)
     arrays = _extract_arrays(work, config)
 
-    state: dict[str, Any] = {
-        "candidate_high": _empty_candidate("high"),
-        "candidate_low": _empty_candidate("low"),
-        "latest_confirmed_high": _confirmed_template(),
-        "latest_confirmed_low": _confirmed_template(),
-        "active_side": None,
-        "last_confirmed_side": None,
-        "market_bias": "neutral",
-    }
-    stats: dict[str, Any] = {
-        "candidate_high_events": [],
-        "candidate_low_events": [],
-        "break_attempt_high_events": [],
-        "break_attempt_low_events": [],
-        "confirmed_high_events": [],
-        "confirmed_low_events": [],
-        "bars_to_confirm_high": [],
-        "bars_to_confirm_low": [],
-        "candidate_high_replaced_before_confirmation": 0,
-        "candidate_low_replaced_before_confirmation": 0,
-        "structure_break_events": [],
-    }
+    # -- restore from checkpoint or initialise fresh -----------------------
+    fingerprint = repr(config)
+    can_resume = (
+        checkpoint is not None
+        and checkpoint.resume_from <= arrays.length
+        and checkpoint.config_fingerprint == fingerprint
+        and checkpoint.resume_from > 0
+        and _ohlcv_prefix_hash(ohlcv, checkpoint.resume_from) == checkpoint.prefix_hash
+    )
 
-    feature_rows: list[dict[str, Any]] = []
+    if can_resume:
+        assert checkpoint is not None  # for type narrowing
+        state = copy.deepcopy(checkpoint.state)
+        stats = copy.deepcopy(checkpoint.stats)
+        feature_rows: list[dict[str, Any]] = list(checkpoint.feature_rows)
+        start_idx = checkpoint.resume_from
+    else:
+        state: dict[str, Any] = {
+            "candidate_high": _empty_candidate("high"),
+            "candidate_low": _empty_candidate("low"),
+            "latest_confirmed_high": _confirmed_template(),
+            "latest_confirmed_low": _confirmed_template(),
+            "active_side": None,
+            "last_confirmed_side": None,
+            "market_bias": "neutral",
+        }
+        stats: dict[str, Any] = {
+            "candidate_high_events": [],
+            "candidate_low_events": [],
+            "break_attempt_high_events": [],
+            "break_attempt_low_events": [],
+            "confirmed_high_events": [],
+            "confirmed_low_events": [],
+            "bars_to_confirm_high": [],
+            "bars_to_confirm_low": [],
+            "candidate_high_replaced_before_confirmation": 0,
+            "candidate_low_replaced_before_confirmation": 0,
+            "structure_break_events": [],
+        }
+        feature_rows: list[dict[str, Any]] = []
+        start_idx = 0
+
     # Reuse a single mutable BarData across the hot loop to avoid
     # allocating a new object + two dicts per bar.
     bar = BarData(rolling_highs={w: 0.0 for w in config.level_windows},
                   rolling_lows={w: 0.0 for w in config.level_windows})
 
-    for i in range(arrays.length):
+    for i in range(start_idx, arrays.length):
         arrays.fill_bar(i, bar)
         break_event = _compute_structure_break_event(state, bar, config)
 
@@ -898,6 +953,17 @@ def simulate_btc_structure(ohlcv: pd.DataFrame, config: BtcStructureConfig) -> S
         state["market_bias"] = break_event["market_bias_after_close"]
         feature_rows.append(feature_row)
 
+    # -- build checkpoint ----------------------------------------------------
+    new_checkpoint = StructureCheckpoint(
+        resume_from=arrays.length,
+        state=copy.deepcopy(state),
+        stats=copy.deepcopy(stats),
+        feature_rows=list(feature_rows),
+        prefix_hash=_ohlcv_prefix_hash(ohlcv, arrays.length),
+        config_fingerprint=fingerprint,
+    )
+
+    # -- build artifacts ----------------------------------------------------
     features = pd.DataFrame(feature_rows)
     candidate_highs = pd.DataFrame(stats["candidate_high_events"])
     candidate_lows = pd.DataFrame(stats["candidate_low_events"])
@@ -908,7 +974,7 @@ def simulate_btc_structure(ohlcv: pd.DataFrame, config: BtcStructureConfig) -> S
     structure_breaks = pd.DataFrame(stats["structure_break_events"])
     summary = summarize_structure(config, ohlcv, features, confirmed_highs, confirmed_lows, structure_breaks, stats)
 
-    return StructureArtifacts(
+    artifacts = StructureArtifacts(
         ohlcv=ohlcv,
         features=features,
         candidate_highs=candidate_highs,
@@ -920,3 +986,4 @@ def simulate_btc_structure(ohlcv: pd.DataFrame, config: BtcStructureConfig) -> S
         structure_breaks=structure_breaks,
         summary=summary,
     )
+    return artifacts, new_checkpoint

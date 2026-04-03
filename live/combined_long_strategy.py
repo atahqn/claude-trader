@@ -1,8 +1,7 @@
-"""Combined Breadth + Convergence LONG strategy with BTC structure gating.
+"""Combined Breadth + Convergence + BTC Structure LONG strategy.
 
-Merges two complementary regime filters into a single LONG strategy
-on a shared 10-symbol universe. A signal fires when EITHER regime
-gate passes and its corresponding entry pattern matches.
+Merges three complementary regime filters into a single LONG strategy
+on a shared 10-symbol universe.
 
 Regime A (breadth): 80%+ of symbols with positive ret_72h
   -> dipbuy (TP 4.5% / SL 2.0%)
@@ -13,28 +12,36 @@ Regime B (convergence): 70%+ of symbols with positive mom_slope
   -> impulse continuation body > 2x ATR (TP 4.0% / SL 2.0%)
      [gated by BTC daily structure]
 
-BTC structure gate (conv_no_bearish): convergence entries are blocked
-when BTC daily market_bias_after_close == "bearish". Breadth entries
-pass through ungated — the 80% breadth filter already provides strong
-macro confirmation. This reduces MDD by ~3pp on eval while maintaining
-PNL, because convergence entries (especially conv_dipbuy PF ~1.25) are
-vulnerable to bear rallies that momentum convergence alone can't filter.
+Regime C (BTC structure): BTC global_continuation_long_flag OR
+  major_global_bullish_confluence_flag, combined with cross-asset
+  convergence (70%+) or breadth (80%+)
+  -> struct_dipbuy (TP 4.0% / SL 2.0%)  [convergence path]
+  -> struct_impulse body > 2x ATR (TP 4.0% / SL 2.0%)
+     [convergence or breadth path]
+
+Regime C fires at different times than A/B — when BTC's multi-year
+swing structure is bullish but breadth/convergence alone may not be
+active. Adds ~14 high-quality trades on eval (+26% PNL) without
+increasing MDD.
+
+BTC structure gate (conv_no_bearish): convergence entries (Regime B)
+are blocked when BTC daily market_bias_after_close == "bearish".
 
 Shared 12h per-symbol cooldown prevents overlapping signals.
-Breadth entries have priority when both regimes are active.
+Breadth entries have priority, then convergence, then BTC structure.
 
 10-symbol universe (non-overlapping with V8.3):
   ETH, SOL, BTC, NEAR, DOT, ADA, APT, RENDER, INJ, LTC
 
-Approximate evaluation (2026-04-03, conv_no_bearish + heuristic_v1):
-  Dev 60.45  (PNL +167.7%, MDD 14.4%, PF 2.55)
-  Eval 26.28 (PNL +96.2%, MDD 12.8%, PF 1.96)
-  vs prior baseline Eval 16.97
+Exact evaluation (2026-04-03, merged + heuristic_v1):
+  Eval Pref 35.50 (PNL +115.02%, MDD 11.9%, PF 2.02)
+  vs prior CombinedLong-only Eval Pref 22.95
 
 Supports sizing_mode:
   "baseline"       — all signals get size_multiplier=1.0
   "heuristic_v1"   — pattern-based sizing with dip-depth and cluster
-                     adjustments (deployed default)
+                     adjustments (deployed default, applies to Regime
+                     A/B signals only; Regime C signals use 1.0)
 
 Supports tp_sl_mode:
   "baseline"       — fixed per-pattern TP/SL (deployed default)
@@ -79,6 +86,8 @@ _WARMUP_BARS = max(required_warmup(_BASE_INDICATORS), 100)
 
 _BTC_STRUCTURE_COLUMNS = [
     "market_bias_after_close",
+    "global_continuation_long_flag",
+    "major_global_bullish_confluence_flag",
 ]
 
 
@@ -222,6 +231,70 @@ def _conv_dipbuy(row: pd.Series, prev: pd.Series) -> tuple[bool, dict[str, objec
     if vol_ratio < 0.9:
         return False, {}, 0, 0
     return True, {"pattern": "conv_dipbuy", "ret_72h": round(ret_72h, 2), "ret_24h": round(ret_24h, 2)}, 4.0, 2.0
+
+
+def _struct_dipbuy(row: pd.Series, prev: pd.Series) -> tuple[bool, dict[str, object], float, float]:
+    """Dip-buy gated by BTC structure (continuation/confluence)."""
+    if pd.isna(row.get("ema_20")) or pd.isna(row.get("atr_14")):
+        return False, {}, 0, 0
+    ret_72h = _safe(row, "ret_72h", 0.0)
+    if ret_72h < 5.0 or ret_72h > 35.0:
+        return False, {}, 0, 0
+    ret_24h = _safe(row, "ret_24h", 0.0)
+    if ret_24h > 0.5 or ret_24h < -6.0:
+        return False, {}, 0, 0
+    rsi = _safe(row, "rsi_14", 50.0)
+    if rsi > 65.0 or rsi < 30.0:
+        return False, {}, 0, 0
+    atr_ratio = _safe(row, "atr_ratio", 1.0)
+    if atr_ratio > 1.2:
+        return False, {}, 0, 0
+    close = float(row["close"])
+    if close <= float(row["ema_20"]):
+        return False, {}, 0, 0
+    high, low, open_price = float(row["high"]), float(row["low"]), float(row["open"])
+    bar_range = high - low
+    if bar_range <= 0:
+        return False, {}, 0, 0
+    body = close - open_price
+    if body <= 0 or body / bar_range < 0.3:
+        return False, {}, 0, 0
+    vol_ratio = _safe(row, "vol_ratio", 1.0)
+    if vol_ratio < 0.9:
+        return False, {}, 0, 0
+    prev_range = float(prev["high"]) - float(prev["low"])
+    if prev_range > 0:
+        prev_body = float(prev["close"]) - float(prev["open"])
+        if prev_body > 0.3 * prev_range:
+            return False, {}, 0, 0
+    return True, {"pattern": "struct_dipbuy", "ret_72h": round(ret_72h, 2), "ret_24h": round(ret_24h, 2)}, 4.0, 2.0
+
+
+def _struct_impulse(row: pd.Series) -> tuple[bool, dict[str, object], float, float]:
+    """Impulse continuation gated by BTC structure."""
+    body = _safe(row, "body", 0.0)
+    atr = _safe(row, "atr_14", 0.0)
+    if atr <= 0 or body <= 0:
+        return False, {}, 0, 0
+    if body < 2.0 * atr:
+        return False, {}, 0, 0
+    ret_72h = _safe(row, "ret_72h", 0.0)
+    if ret_72h < 3.0 or ret_72h > 30.0:
+        return False, {}, 0, 0
+    close = float(row["close"])
+    ema20 = _safe(row, "ema_20", close)
+    if close <= ema20:
+        return False, {}, 0, 0
+    rsi = _safe(row, "rsi_14", 50.0)
+    if rsi > 70.0 or rsi < 30.0:
+        return False, {}, 0, 0
+    atr_ratio = _safe(row, "atr_ratio", 1.0)
+    if atr_ratio > 1.3:
+        return False, {}, 0, 0
+    mom_slope = _safe(row, "mom_slope", 0.0)
+    if mom_slope <= 0:
+        return False, {}, 0, 0
+    return True, {"pattern": "struct_impulse", "impulse_atr": round(body / atr, 2), "ret_72h": round(ret_72h, 2)}, 4.0, 2.0
 
 
 def _conv_impulse(row: pd.Series) -> tuple[bool, dict[str, object], float, float]:
@@ -385,7 +458,7 @@ class CombinedLongStrategy(SignalGenerator):
         parts = [
             f"CombinedLong(br>={self.breadth_pct:.0%}",
             f"conv>={self.convergence_pct:.0%}",
-            "btc_gate=conv_no_bearish",
+            "btc_struct+gate",
             f"{len(SYMBOLS)}sym",
         ]
         if self.sizing_mode != "baseline":
@@ -481,7 +554,12 @@ class CombinedLongStrategy(SignalGenerator):
                 conv_on = (total_mom > 0
                            and pos_mom / total_mom >= self.convergence_pct)
 
-                if not breadth_on and not conv_on:
+                # BTC structure flags
+                btc_cont = bool(row.get("global_continuation_long_flag", False))
+                btc_conf = bool(row.get("major_global_bullish_confluence_flag", False))
+                btc_struct_on = btc_cont or btc_conf
+
+                if not breadth_on and not conv_on and not btc_struct_on:
                     continue
 
                 ok = False
@@ -489,11 +567,13 @@ class CombinedLongStrategy(SignalGenerator):
                 tp = sl = 0.0
                 is_convergence = False
 
+                # Priority 1: breadth entries
                 if breadth_on:
                     ok, metadata, tp, sl = _breadth_dipbuy(row, prev)
                     if not ok:
                         ok, metadata, tp, sl = _breadth_sel_momentum(row)
 
+                # Priority 2: convergence entries
                 if not ok and conv_on:
                     ok, metadata, tp, sl = _conv_dipbuy(row, prev)
                     if ok:
@@ -502,6 +582,15 @@ class CombinedLongStrategy(SignalGenerator):
                         ok, metadata, tp, sl = _conv_impulse(row)
                         if ok:
                             is_convergence = True
+
+                # Priority 3: BTC structure entries (fires when breadth/conv miss)
+                if not ok and btc_struct_on:
+                    if conv_on:
+                        ok, metadata, tp, sl = _struct_dipbuy(row, prev)
+                        if not ok:
+                            ok, metadata, tp, sl = _struct_impulse(row)
+                    elif breadth_on:
+                        ok, metadata, tp, sl = _struct_impulse(row)
 
                 if not ok:
                     continue
@@ -514,6 +603,9 @@ class CombinedLongStrategy(SignalGenerator):
                     metadata["breadth"] = f"{pos_ret}/{total_ret}"
                 if conv_on:
                     metadata["convergence"] = f"{pos_mom}/{total_mom}"
+                if btc_struct_on:
+                    metadata["btc_cont"] = btc_cont
+                    metadata["btc_conf"] = btc_conf
                 metadata["btc_bias"] = row.get("market_bias_after_close")
 
                 signal = Signal(

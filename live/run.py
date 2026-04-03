@@ -6,7 +6,7 @@ Usage:
 
 Strategies:
   - Squeeze V8.3: squeeze SHORT + pullback LONG (7 altcoins)
-  - Combined Long: breadth + convergence LONG (10 symbols)
+  - Combined Long: breadth + convergence + BTC structure LONG (10 symbols)
 """
 
 import argparse
@@ -44,7 +44,7 @@ def main() -> None:
     print(
         f"Starting Multi-Strategy Live Trader\n"
         f"  Squeeze V8.3:       SHORT + LONG | 7 symbols\n"
-        f"  Combined Long:      LONG only    | 10 symbols | btc_gate=conv_no_bearish\n"
+        f"  Combined Long:      LONG only    | 10 symbols | breadth+conv+btc_struct\n"
         f"  Leverage: {args.leverage}x\n"
         f"  Size:     {size} USDT\n"
         f"  Max positions: {max_pos} (global ceiling)\n"
