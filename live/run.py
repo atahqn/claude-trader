@@ -44,7 +44,7 @@ def main() -> None:
     print(
         f"Starting Multi-Strategy Live Trader\n"
         f"  Squeeze V8.3:       SHORT + LONG | 7 symbols\n"
-        f"  Combined Long:      LONG only    | 10 symbols\n"
+        f"  Combined Long:      LONG only    | 10 symbols | btc_gate=conv_no_bearish\n"
         f"  Leverage: {args.leverage}x\n"
         f"  Size:     {size} USDT\n"
         f"  Max positions: {max_pos} (global ceiling)\n"

@@ -1,4 +1,4 @@
-"""Combined Breadth + Convergence LONG strategy.
+"""Combined Breadth + Convergence LONG strategy with BTC structure gating.
 
 Merges two complementary regime filters into a single LONG strategy
 on a shared 10-symbol universe. A signal fires when EITHER regime
@@ -9,8 +9,16 @@ Regime A (breadth): 80%+ of symbols with positive ret_72h
   -> selective momentum (TP 5.0% / SL 2.0%)
 
 Regime B (convergence): 70%+ of symbols with positive mom_slope
-  -> dipbuy (TP 4.0% / SL 2.0%)
+  -> dipbuy (TP 4.0% / SL 2.0%)  [gated by BTC daily structure]
   -> impulse continuation body > 2x ATR (TP 4.0% / SL 2.0%)
+     [gated by BTC daily structure]
+
+BTC structure gate (conv_no_bearish): convergence entries are blocked
+when BTC daily market_bias_after_close == "bearish". Breadth entries
+pass through ungated — the 80% breadth filter already provides strong
+macro confirmation. This reduces MDD by ~3pp on eval while maintaining
+PNL, because convergence entries (especially conv_dipbuy PF ~1.25) are
+vulnerable to bear rallies that momentum convergence alone can't filter.
 
 Shared 12h per-symbol cooldown prevents overlapping signals.
 Breadth entries have priority when both regimes are active.
@@ -18,9 +26,10 @@ Breadth entries have priority when both regimes are active.
 10-symbol universe (non-overlapping with V8.3):
   ETH, SOL, BTC, NEAR, DOT, ADA, APT, RENDER, INJ, LTC
 
-Exact evaluation (2026-04-02):
-  Baseline   Dev 19.74 / Eval 11.22  (PNL +170/+86%, MDD 28.3/18.3%)
-  heuristic_v1  Dev 23.29 / Eval 17.48  (PNL +167/+92%, MDD 25.4/14.7%)
+Approximate evaluation (2026-04-03, conv_no_bearish + heuristic_v1):
+  Dev 60.45  (PNL +167.7%, MDD 14.4%, PF 2.55)
+  Eval 26.28 (PNL +96.2%, MDD 12.8%, PF 1.96)
+  vs prior baseline Eval 16.97
 
 Supports sizing_mode:
   "baseline"       — all signals get size_multiplier=1.0
@@ -37,7 +46,10 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .auth_client import LiveMarketClient
 
 import numpy as np
 import pandas as pd
@@ -46,6 +58,7 @@ from marketdata import MarketDataRequest
 from backtester.indicators import compute_indicator_frame, required_warmup
 from backtester.models import MarketType, PositionType, Signal
 from backtester.pipeline import PreparedMarketContext
+from btc_structure import DailyStructureProvider
 
 from .signal_generator import SignalGenerator
 
@@ -63,6 +76,16 @@ _BASE_INDICATORS = (
 )
 
 _WARMUP_BARS = max(required_warmup(_BASE_INDICATORS), 100)
+
+_BTC_STRUCTURE_COLUMNS = [
+    "market_bias_after_close",
+]
+
+
+def _btc_structure_is_bearish(row: pd.Series) -> bool:
+    """Return True if BTC daily structure regime is bearish."""
+    bias = row.get("market_bias_after_close")
+    return isinstance(bias, str) and bias == "bearish"
 
 
 def _safe(row: pd.Series, col: str, default: float) -> float:
@@ -341,7 +364,7 @@ class CombinedLongStrategy(SignalGenerator):
         convergence_pct: float = 0.70,
         breadth_pct: float = 0.80,
         leverage: float = 1.0,
-        sizing_mode: str = "baseline",
+        sizing_mode: str = "heuristic_v1",
         tp_sl_mode: str = "baseline",
         **kwargs: Any,
     ) -> None:
@@ -356,11 +379,13 @@ class CombinedLongStrategy(SignalGenerator):
         self.leverage = leverage
         self.sizing_mode = sizing_mode
         self.tp_sl_mode = tp_sl_mode
+        self._structure = DailyStructureProvider(columns=_BTC_STRUCTURE_COLUMNS)
 
     def __str__(self) -> str:
         parts = [
             f"CombinedLong(br>={self.breadth_pct:.0%}",
             f"conv>={self.convergence_pct:.0%}",
+            "btc_gate=conv_no_bearish",
             f"{len(SYMBOLS)}sym",
         ]
         if self.sizing_mode != "baseline":
@@ -374,6 +399,11 @@ class CombinedLongStrategy(SignalGenerator):
 
     def poll(self) -> Signal | list[Signal] | None:
         return None
+
+    def setup(self, client: "LiveMarketClient") -> None:
+        self._structure = DailyStructureProvider(
+            client, columns=_BTC_STRUCTURE_COLUMNS,
+        )
 
     def generate_backtest_signals(
         self,
@@ -394,6 +424,20 @@ class CombinedLongStrategy(SignalGenerator):
 
         if not frames:
             return []
+
+        # Compute BTC structure and merge onto all frames
+        btc_frame = frames.get("BTC/USDT")
+        if btc_frame is None:
+            btc_frame = next(iter(frames.values()))
+        data_cutoff = pd.Timestamp(btc_frame["close_time"].max()).to_pydatetime()
+        self._structure.ensure_computed_until(data_cutoff)
+
+        for symbol, frame in list(frames.items()):
+            frames[symbol] = self._structure.merge_onto(
+                frame,
+                _BTC_STRUCTURE_COLUMNS,
+                cutoff=data_cutoff,
+            )
 
         all_times: set[datetime] = set()
         for frame in frames.values():
@@ -443,6 +487,7 @@ class CombinedLongStrategy(SignalGenerator):
                 ok = False
                 metadata: dict[str, object] = {}
                 tp = sl = 0.0
+                is_convergence = False
 
                 if breadth_on:
                     ok, metadata, tp, sl = _breadth_dipbuy(row, prev)
@@ -451,16 +496,25 @@ class CombinedLongStrategy(SignalGenerator):
 
                 if not ok and conv_on:
                     ok, metadata, tp, sl = _conv_dipbuy(row, prev)
+                    if ok:
+                        is_convergence = True
                     if not ok:
                         ok, metadata, tp, sl = _conv_impulse(row)
+                        if ok:
+                            is_convergence = True
 
                 if not ok:
+                    continue
+
+                # BTC structure gate: block convergence entries during bearish
+                if is_convergence and _btc_structure_is_bearish(row):
                     continue
 
                 if breadth_on:
                     metadata["breadth"] = f"{pos_ret}/{total_ret}"
                 if conv_on:
                     metadata["convergence"] = f"{pos_mom}/{total_mom}"
+                metadata["btc_bias"] = row.get("market_bias_after_close")
 
                 signal = Signal(
                     signal_date=close_time,

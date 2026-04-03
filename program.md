@@ -119,6 +119,8 @@ Edit and refine your strategy.
 
 Use provided indicators from backtester/indicators.py or derive metrics that you think would be useful. Codebase exposes 5 Binance dataset types through MarketDataRequest: ohlcv, agg_trades (this is only available for l year so you cannot properly use this for signal generation), funding_rates, mark_price_klines, and premium_index_klines (marketdata/models.py:9, marketdata/bundle.py:45). You can use this data to create new indicators but doing so do not change directly the backtester/indicator.py but keep it in under the research folder.
 
+Additionally, the `btc_structure/` module provides daily BTC market structure features (regime, structural price levels, and structure break events) derived from daily OHLCV. These are accessed via `DailyStructureProvider` and can be merged onto intraday frames. See `btc_structure/README.md` for the full column reference, usage patterns, and computation cost.
+
 You must work on your created strategy folder. You cannot implement already living strategies. You can import, copy or change them in your folder.
 
 The evaluated backtester path must implement the strategy itself.
@@ -135,6 +137,8 @@ In particular:
 
 Hardcoding strategies: You should not code something like 
 if time == good_bullish entry: Position(...)
+
+Do not modify files outside the research folder. You can import them, copy-paste them but cannot modify them. After research is completed and user prompts you to modify some files then you can do it.
 
 NEVER test your strategies first on the evaluation. You develop then you test on the evaluation. If it is not good enough you discard them.
 
