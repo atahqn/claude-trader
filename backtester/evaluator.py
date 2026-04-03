@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -556,6 +557,7 @@ class StrategyEvaluator:
             all_signals = generator.generate_backtest_signals(
                 ctx, self._symbols, signal_start, signal_end,
             )
+            all_signals.sort(key=lambda s: s.signal_date)
 
             session = BacktestExecutionSession(
                 client=self._client,
@@ -563,10 +565,9 @@ class StrategyEvaluator:
             )
 
             for window in period_windows:
-                w_sigs = [
-                    s for s in all_signals
-                    if window.start <= s.signal_date < window.end
-                ]
+                lo = bisect_left(all_signals, window.start, key=lambda s: s.signal_date)
+                hi = bisect_left(all_signals, window.end, key=lambda s: s.signal_date)
+                w_sigs = all_signals[lo:hi]
                 short_count = sum(
                     1 for s in w_sigs if s.position_type is PositionType.SHORT
                 )

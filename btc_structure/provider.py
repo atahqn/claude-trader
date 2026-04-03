@@ -87,18 +87,36 @@ class DailyStructureProvider:
         self._result: StructureExperimentResult | None = None
         self._computed_until: datetime | None = None
         self._checkpoint: StructureCheckpoint | None = None
+        self._cached_frame: pd.DataFrame | None = None
 
     # ------------------------------------------------------------------
     # Computation
     # ------------------------------------------------------------------
 
     def _compute(self, cutoff: datetime) -> None:
-        candles = self._client.fetch_klines("BTC/USDT", "1d", _LISTING_START, cutoff)
-        # Only keep fully closed candles
-        closed = [c for c in candles if c.close_time <= cutoff]
-        if not closed:
-            return
-        frame = _candles_to_frame(closed)
+        if self._cached_frame is not None and self._computed_until is not None:
+            # Incremental: only fetch candles after the last computation
+            new_candles = self._client.fetch_klines(
+                "BTC/USDT", "1d", self._computed_until, cutoff,
+            )
+            new_closed = [c for c in new_candles if c.close_time <= cutoff]
+            if new_closed:
+                new_frame = _candles_to_frame(new_closed)
+                frame = pd.concat(
+                    [self._cached_frame, new_frame], ignore_index=True,
+                ).drop_duplicates(
+                    "close_time", keep="last",
+                ).sort_values("close_time").reset_index(drop=True)
+            else:
+                frame = self._cached_frame
+        else:
+            # First compute: full history from listing date
+            candles = self._client.fetch_klines("BTC/USDT", "1d", _LISTING_START, cutoff)
+            closed = [c for c in candles if c.close_time <= cutoff]
+            if not closed:
+                return
+            frame = _candles_to_frame(closed)
+        self._cached_frame = frame
         config = BtcStructureConfig.for_interval("1d")
         structure, self._checkpoint = simulate_btc_structure(
             frame, config, checkpoint=self._checkpoint,
@@ -120,6 +138,7 @@ class DailyStructureProvider:
         self._result = None
         self._computed_until = None
         self._checkpoint = None
+        self._cached_frame = None
 
     def refresh_if_stale(self, now: datetime) -> bool:
         """Recompute if a new daily candle has closed since last run.

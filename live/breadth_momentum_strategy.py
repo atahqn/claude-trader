@@ -98,6 +98,30 @@ def _compute_breadth_at_time(
     return positive, total
 
 
+def _build_breadth_cache(
+    frames: dict[str, pd.DataFrame],
+    timestamps: list[datetime],
+) -> dict[datetime, tuple[int, int]]:
+    """Batch-compute breadth using time-indexed lookups instead of per-row scans."""
+    ret_index: dict[str, dict[datetime, float]] = {}
+    for symbol, frame in frames.items():
+        if frame.empty or "close_time" not in frame.columns or "ret_72h" not in frame.columns:
+            continue
+        ret_index[symbol] = dict(zip(frame["close_time"], frame["ret_72h"]))
+    cache: dict[datetime, tuple[int, int]] = {}
+    for t in timestamps:
+        positive = 0
+        total = 0
+        for sym_ret in ret_index.values():
+            v = sym_ret.get(t)
+            if v is not None and not pd.isna(v):
+                total += 1
+                if v > 0:
+                    positive += 1
+        cache[t] = (positive, total)
+    return cache
+
+
 def _check_dipbuy(row: pd.Series, prev: pd.Series) -> tuple[bool, dict[str, object]]:
     if pd.isna(row.get("ema_20")) or pd.isna(row.get("atr_14")):
         return False, {}
@@ -235,9 +259,7 @@ class BreadthMomentumStrategy(SignalGenerator):
             mask = (frame["close_time"] >= start) & (frame["close_time"] < end)
             all_times.update(frame.loc[mask, "close_time"].tolist())
 
-        breadth_cache: dict[datetime, tuple[int, int]] = {}
-        for t in sorted(all_times):
-            breadth_cache[t] = _compute_breadth_at_time(frames, t)
+        breadth_cache = _build_breadth_cache(frames, sorted(all_times))
 
         all_signals: list[Signal] = []
         for symbol, frame in frames.items():

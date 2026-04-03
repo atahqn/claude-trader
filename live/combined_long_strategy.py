@@ -128,6 +128,40 @@ def _compute_cross_asset_state(
     return pos_mom, total_mom, pos_ret, total_ret
 
 
+def _build_cross_asset_cache(
+    frames: dict[str, pd.DataFrame],
+    timestamps: list[datetime],
+) -> dict[datetime, tuple[int, int, int, int]]:
+    """Batch-compute cross-asset state using time-indexed lookups."""
+    mom_index: dict[str, dict[datetime, float]] = {}
+    ret_index: dict[str, dict[datetime, float]] = {}
+    for symbol, frame in frames.items():
+        if frame.empty or "close_time" not in frame.columns:
+            continue
+        ct = frame["close_time"]
+        if "mom_slope" in frame.columns:
+            mom_index[symbol] = dict(zip(ct, frame["mom_slope"]))
+        if "ret_72h" in frame.columns:
+            ret_index[symbol] = dict(zip(ct, frame["ret_72h"]))
+    cache: dict[datetime, tuple[int, int, int, int]] = {}
+    for t in timestamps:
+        pos_mom = total_mom = pos_ret = total_ret = 0
+        for sym_mom in mom_index.values():
+            v = sym_mom.get(t)
+            if v is not None and not pd.isna(v):
+                total_mom += 1
+                if v > 0:
+                    pos_mom += 1
+        for sym_ret in ret_index.values():
+            v = sym_ret.get(t)
+            if v is not None and not pd.isna(v):
+                total_ret += 1
+                if v > 0:
+                    pos_ret += 1
+        cache[t] = (pos_mom, total_mom, pos_ret, total_ret)
+    return cache
+
+
 # --- Breadth-regime entries ---
 
 def _breadth_dipbuy(row: pd.Series, prev: pd.Series) -> tuple[bool, dict[str, object], float, float]:
@@ -519,9 +553,7 @@ class CombinedLongStrategy(SignalGenerator):
             mask = (frame["close_time"] >= start) & (frame["close_time"] < end)
             all_times.update(frame.loc[mask, "close_time"].tolist())
 
-        state_cache: dict[datetime, tuple[int, int, int, int]] = {}
-        for t in sorted(all_times):
-            state_cache[t] = _compute_cross_asset_state(frames, t)
+        state_cache = _build_cross_asset_cache(frames, sorted(all_times))
 
         all_signals: list[Signal] = []
 

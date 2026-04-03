@@ -614,6 +614,9 @@ def build_structure_feature_matrix(
     *,
     fib_scopes: tuple[str, ...] = ("local", "major", "global"),
     skip_ranking: bool = False,
+    ranked_highs: pd.DataFrame | None = None,
+    ranked_lows: pd.DataFrame | None = None,
+    ranked_breaks: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     base = structure.features[[
         "close_time", "open", "high", "low", "close", "volume", "atr",
@@ -630,9 +633,12 @@ def build_structure_feature_matrix(
     if skip_ranking:
         return base.sort_values("close_time").reset_index(drop=True)
 
-    ranked_highs = rank_confirmed_levels(structure.confirmed_highs, kind="high")
-    ranked_lows = rank_confirmed_levels(structure.confirmed_lows, kind="low")
-    ranked_breaks = rank_structure_breaks(structure.structure_breaks, structure.confirmed_highs, structure.confirmed_lows)
+    if ranked_highs is None:
+        ranked_highs = rank_confirmed_levels(structure.confirmed_highs, kind="high")
+    if ranked_lows is None:
+        ranked_lows = rank_confirmed_levels(structure.confirmed_lows, kind="low")
+    if ranked_breaks is None:
+        ranked_breaks = rank_structure_breaks(structure.structure_breaks, structure.confirmed_highs, structure.confirmed_lows)
 
     all_scopes = ("local", "structural", "major", "global")
     for scope in all_scopes:
@@ -698,7 +704,12 @@ def run_structure_feature_lab(
         ranked_breaks = rank_structure_breaks(structure.structure_breaks, structure.confirmed_highs, structure.confirmed_lows)
 
     feature_matrix = build_structure_feature_matrix(
-        structure, fib_scopes=fib_scopes, skip_ranking=skip_ranking,
+        structure,
+        fib_scopes=fib_scopes,
+        skip_ranking=skip_ranking,
+        ranked_highs=ranked_highs,
+        ranked_lows=ranked_lows,
+        ranked_breaks=ranked_breaks,
     )
     return StructureLabArtifacts(
         ranked_highs=ranked_highs,

@@ -105,11 +105,19 @@ class PositionTracker:
     def check_fills(self, now_utc: datetime | None = None) -> None:
         """Poll exchange for order status updates on all active positions."""
         now_utc = now_utc or self._client.server_now()
+        # Prefetch all exchange positions once (weight 5) instead of
+        # per-position get_position_info calls (weight 5 each).
+        all_exchange_positions: list[dict[str, Any]] | None = None
+        if any(p.status is PositionStatus.OPEN for p in self._positions):
+            try:
+                all_exchange_positions = self._client.get_position_info()
+            except Exception:
+                pass  # per-position fallback in _has_open_exchange_position
         for pos in self._positions:
             if pos.status is PositionStatus.PENDING_ENTRY:
                 self._check_entry_fill(pos, now_utc)
             elif pos.status is PositionStatus.OPEN:
-                exit_closed = self._check_exit_fills(pos, now_utc)
+                exit_closed = self._check_exit_fills(pos, now_utc, all_exchange_positions)
                 if exit_closed is not False:
                     continue
                 self._check_timeout(pos, now_utc)
@@ -236,16 +244,23 @@ class PositionTracker:
     def _close_side(pos: LivePosition) -> OrderSide:
         return OrderSide.SELL if pos.signal.position_type is PositionType.LONG else OrderSide.BUY
 
-    def _has_open_exchange_position(self, pos: LivePosition) -> bool | None:
+    def _has_open_exchange_position(
+        self,
+        pos: LivePosition,
+        all_exchange_positions: list[dict[str, Any]] | None = None,
+    ) -> bool | None:
         """Return whether the exchange still reports an open position for *pos*."""
-        try:
-            raw_positions = self._client.get_position_info(pos.signal.ticker)
-        except Exception as exc:
-            print(
-                f"[{pos.position_id}] Failed to query exchange position: {exc}",
-                file=sys.stderr,
-            )
-            return None
+        if all_exchange_positions is not None:
+            raw_positions = all_exchange_positions
+        else:
+            try:
+                raw_positions = self._client.get_position_info(pos.signal.ticker)
+            except Exception as exc:
+                print(
+                    f"[{pos.position_id}] Failed to query exchange position: {exc}",
+                    file=sys.stderr,
+                )
+                return None
 
         api_symbol = _symbol_for_api(pos.signal.ticker)
         target_side = self._position_side(pos)
@@ -360,7 +375,12 @@ class PositionTracker:
 
         return exit_reason, total_notional / total_qty, exit_time
 
-    def _check_exit_fills(self, pos: LivePosition, now_utc: datetime) -> bool | None:
+    def _check_exit_fills(
+        self,
+        pos: LivePosition,
+        now_utc: datetime,
+        all_exchange_positions: list[dict[str, Any]] | None = None,
+    ) -> bool | None:
         tp_filled = False
         sl_filled = False
         query_failed = False
@@ -402,7 +422,7 @@ class PositionTracker:
             self._finalize_close(pos, exit_order, exit_reason, now_utc)
             return True
 
-        exchange_open = self._has_open_exchange_position(pos)
+        exchange_open = self._has_open_exchange_position(pos, all_exchange_positions)
         if exchange_open is False:
             exit_reason, exit_order = self._infer_exchange_exit(pos)
             if exit_reason == "EXTERNAL":

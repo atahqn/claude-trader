@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
@@ -90,11 +91,9 @@ class PreparedMarketContext:
         candles = self._hourly_candles.get(symbol, [])
         if not candles:
             return []
-        return [
-            candle
-            for candle in candles
-            if candle.open_time >= start and candle.open_time < end
-        ]
+        lo = bisect_left(candles, start, key=lambda c: c.open_time)
+        hi = bisect_left(candles, end, key=lambda c: c.open_time)
+        return candles[lo:hi]
 
     def slice_poll_candles(
         self,
@@ -107,11 +106,9 @@ class PreparedMarketContext:
             candles = self._hourly_candles.get(symbol, [])
         if not candles:
             return []
-        return [
-            candle
-            for candle in candles
-            if candle.open_time >= start and candle.open_time < end
-        ]
+        lo = bisect_left(candles, start, key=lambda c: c.open_time)
+        hi = bisect_left(candles, end, key=lambda c: c.open_time)
+        return candles[lo:hi]
 
     def truncated_to(self, t: datetime) -> PreparedMarketContext:
         """Return a copy with all data after *t* physically removed.
@@ -242,11 +239,11 @@ class _ChunkedWindowCache(Generic[T]):
             if key not in self._cache:
                 chunk_end = cursor + self.chunk_size
                 self._cache[key] = self.fetcher(symbol, cursor, chunk_end)
-            rows.extend(
-                row
-                for row in self._cache[key]
-                if start <= self.time_selector(row) < end
-            )
+            chunk = self._cache[key]
+            if chunk:
+                lo = bisect_left(chunk, start, key=self.time_selector)
+                hi = bisect_left(chunk, end, key=self.time_selector)
+                rows.extend(chunk[lo:hi])
             cursor += self.chunk_size
 
         rows.sort(key=self.time_selector)
