@@ -50,9 +50,11 @@ Supports tp_sl_mode:
 
 from __future__ import annotations
 
+import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -67,7 +69,7 @@ from backtester.models import MarketType, PositionType, Signal
 from backtester.pipeline import PreparedMarketContext
 from btc_structure import DailyStructureProvider
 
-from .signal_generator import SignalGenerator
+from .signal_generator import FatalSignalError, SignalGenerator
 
 SYMBOLS = [
     "ETH/USDT", "SOL/USDT", "BTC/USDT",
@@ -487,6 +489,8 @@ class CombinedLongStrategy(SignalGenerator):
         self.sizing_mode = sizing_mode
         self.tp_sl_mode = tp_sl_mode
         self._structure = DailyStructureProvider(columns=_BTC_STRUCTURE_COLUMNS)
+        self._client: LiveMarketClient | None = None
+        self._last_signal: dict[str, datetime] = {}
 
     def __str__(self) -> str:
         parts = [
@@ -504,13 +508,284 @@ class CombinedLongStrategy(SignalGenerator):
     def market_data_request(self) -> MarketDataRequest:
         return MarketDataRequest.ohlcv_only(interval=self.analysis_interval)
 
-    def poll(self) -> Signal | list[Signal] | None:
-        return None
+    # ------------------------------------------------------------------
+    # Live trading: setup / warmup / poll
+    # ------------------------------------------------------------------
 
     def setup(self, client: "LiveMarketClient") -> None:
+        self._client = client
         self._structure = DailyStructureProvider(
             client, columns=_BTC_STRUCTURE_COLUMNS,
         )
+        self._last_signal = {}
+        self._warm_up()
+        print(
+            f"CombinedLong initialized | "
+            f"symbols={len(SYMBOLS)} | leverage={self.leverage}x | "
+            f"analysis={self.analysis_interval} | "
+            f"sizing={self.sizing_mode} | "
+            f"breadth>={self.breadth_pct:.0%} | conv>={self.convergence_pct:.0%} | "
+            f"cooldown={self.cooldown_h}h | "
+            f"max_hold={self.max_holding_hours}h",
+            file=sys.stderr,
+        )
+
+    def _warm_up(self) -> None:
+        """Validate sufficient history and indicator quality for every symbol."""
+        assert self._client is not None
+        now = datetime.now(UTC)
+        start = now - timedelta(hours=_WARMUP_BARS + 20)
+        failures: list[str] = []
+
+        for symbol in SYMBOLS:
+            try:
+                frame = self._fetch_symbol_frame(symbol, start, now)
+                if frame is None:
+                    failures.append(f"{symbol}: no candle data returned")
+                    continue
+                last_idx = len(frame) - 1
+                if frame.iloc[last_idx]["close_time"] > now:
+                    last_idx -= 1
+                if last_idx < _WARMUP_BARS:
+                    failures.append(
+                        f"{symbol}: only {last_idx + 1} closed candles, "
+                        f"need {_WARMUP_BARS}"
+                    )
+                    continue
+                last_row = frame.iloc[last_idx]
+                if (
+                    pd.isna(last_row.get("mom_slope"))
+                    or pd.isna(last_row.get("atr_ratio"))
+                ):
+                    failures.append(
+                        f"{symbol}: warmup indicators incomplete after "
+                        f"{last_idx + 1} candles"
+                    )
+                    continue
+                print(
+                    f"  {symbol}: warmed up {last_idx + 1} bars",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                failures.append(f"{symbol}: warmup fetch failed: {exc}")
+
+        # Ensure BTC structure is ready before first poll
+        self._structure.ensure_computed_until(now)
+
+        if failures:
+            details = "\n".join(f"  - {f}" for f in failures)
+            raise FatalSignalError(
+                "CombinedLong warmup failed; refusing to trade without full "
+                "candle history:\n" + details
+            )
+
+    def _fetch_symbol_frame(
+        self, symbol: str, start: datetime, now: datetime,
+    ) -> pd.DataFrame | None:
+        """Fetch candles and compute indicator frame for one symbol."""
+        assert self._client is not None
+        candles = self._client.fetch_klines(
+            symbol=symbol.replace("/", ""),
+            interval=self.analysis_interval,
+            start=start,
+            end=now,
+        )
+        if not candles:
+            return None
+        rows = [
+            {
+                "open_time": c.open_time,
+                "close_time": c.close_time,
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+                "volume": c.volume,
+            }
+            for c in candles
+        ]
+        df = pd.DataFrame(rows).sort_values("open_time").reset_index(drop=True)
+        if df.empty:
+            return None
+        return compute_indicator_frame(df, _BASE_INDICATORS)
+
+    def poll(self) -> Signal | list[Signal] | None:
+        assert self._client is not None
+        now = self.current_time()
+        start = now - timedelta(hours=_WARMUP_BARS + 20)
+
+        # -- 1. Fetch indicator frames for all symbols in parallel -----------
+        frames: dict[str, pd.DataFrame] = {}
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            future_to_symbol = {
+                pool.submit(self._fetch_symbol_frame, symbol, start, now): symbol
+                for symbol in SYMBOLS
+            }
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    frame = future.result()
+                    if frame is not None:
+                        frames[symbol] = frame
+                except FatalSignalError:
+                    raise
+                except Exception as exc:
+                    print(
+                        f"CombinedLong: error fetching {symbol}: {exc}",
+                        file=sys.stderr,
+                    )
+
+        if not frames:
+            return None
+
+        # -- 2. Merge BTC structure onto all frames --------------------------
+        self._structure.refresh_if_stale(now)
+        btc_frame = frames.get("BTC/USDT")
+        if btc_frame is None:
+            btc_frame = next(iter(frames.values()))
+        data_cutoff = pd.Timestamp(
+            btc_frame["close_time"].max(),
+        ).to_pydatetime()
+        self._structure.ensure_computed_until(data_cutoff)
+
+        for symbol in list(frames):
+            frames[symbol] = self._structure.merge_onto(
+                frames[symbol], _BTC_STRUCTURE_COLUMNS, cutoff=data_cutoff,
+            )
+
+        # -- 3. Determine last closed-bar index per symbol -------------------
+        last_indices: dict[str, int] = {}
+        latest_ct: datetime | None = None
+        for symbol, frame in frames.items():
+            last_idx = len(frame) - 1
+            if frame.iloc[last_idx]["close_time"] > now:
+                last_idx -= 1
+            if last_idx < 0:
+                continue
+            last_indices[symbol] = last_idx
+            ct = frame.iloc[last_idx]["close_time"]
+            if latest_ct is None or ct > latest_ct:
+                latest_ct = ct
+
+        if latest_ct is None:
+            return None
+
+        # -- 4. Cross-asset state at latest closed bar -----------------------
+        pos_mom, total_mom, pos_ret, total_ret = _compute_cross_asset_state(
+            frames, latest_ct,
+        )
+
+        breadth_on = (
+            total_ret > 0 and pos_ret / total_ret >= self.breadth_pct
+        )
+        conv_on = (
+            total_mom > 0 and pos_mom / total_mom >= self.convergence_pct
+        )
+
+        # -- 5. Check each symbol for entry signals -------------------------
+        signals: list[Signal] = []
+        for symbol, frame in frames.items():
+            last_idx = last_indices.get(symbol)
+            if last_idx is None or last_idx < max(_WARMUP_BARS, 3):
+                continue
+
+            row = frame.iloc[last_idx]
+            prev = frame.iloc[last_idx - 1]
+            close_time = row["close_time"]
+
+            # Cooldown
+            last = self._last_signal.get(symbol)
+            if last is not None:
+                hours = (close_time - last).total_seconds() / 3600.0
+                if hours < self.cooldown_h:
+                    continue
+
+            # BTC structure flags
+            btc_cont = bool(row.get("global_continuation_long_flag", False))
+            btc_conf = bool(
+                row.get("major_global_bullish_confluence_flag", False),
+            )
+            btc_struct_on = btc_cont or btc_conf
+
+            if not breadth_on and not conv_on and not btc_struct_on:
+                continue
+
+            ok = False
+            metadata: dict[str, object] = {}
+            tp = sl = 0.0
+            is_convergence = False
+
+            # Priority 1: breadth entries
+            if breadth_on:
+                ok, metadata, tp, sl = _breadth_dipbuy(row, prev)
+                if not ok:
+                    ok, metadata, tp, sl = _breadth_sel_momentum(row)
+
+            # Priority 2: convergence entries
+            if not ok and conv_on:
+                ok, metadata, tp, sl = _conv_dipbuy(row, prev)
+                if ok:
+                    is_convergence = True
+                if not ok:
+                    ok, metadata, tp, sl = _conv_impulse(row)
+                    if ok:
+                        is_convergence = True
+
+            # Priority 3: BTC structure entries
+            if not ok and btc_struct_on:
+                if conv_on:
+                    ok, metadata, tp, sl = _struct_dipbuy(row, prev)
+                    if not ok:
+                        ok, metadata, tp, sl = _struct_impulse(row)
+                elif breadth_on:
+                    ok, metadata, tp, sl = _struct_impulse(row)
+
+            if not ok:
+                continue
+
+            # BTC structure gate: block convergence entries during bearish
+            if is_convergence and _btc_structure_is_bearish(row):
+                continue
+
+            if breadth_on:
+                metadata["breadth"] = f"{pos_ret}/{total_ret}"
+            if conv_on:
+                metadata["convergence"] = f"{pos_mom}/{total_mom}"
+            if btc_struct_on:
+                metadata["btc_cont"] = btc_cont
+                metadata["btc_conf"] = btc_conf
+            metadata["btc_bias"] = row.get("market_bias_after_close")
+
+            signal = Signal(
+                signal_date=close_time,
+                position_type=PositionType.LONG,
+                ticker=symbol,
+                tp_pct=tp,
+                sl_pct=sl,
+                leverage=self.leverage,
+                market_type=MarketType.FUTURES,
+                taker_fee_rate=0.0005,
+                max_holding_hours=self.max_holding_hours,
+                metadata=metadata,
+            )
+            signals.append(signal)
+            self._last_signal[symbol] = close_time
+
+        if not signals:
+            return None
+
+        # -- 6. Post-processing: TP/SL mode then sizing ---------------------
+        signals.sort(key=lambda s: s.signal_date)
+        if self.tp_sl_mode == "tiered_v1":
+            signals = _apply_tiered_v1_tp_sl(signals)
+        if self.sizing_mode == "heuristic_v1":
+            signals = _apply_heuristic_v1_sizing(signals)
+
+        return signals if signals else None
+
+    # ------------------------------------------------------------------
+    # Backtesting
+    # ------------------------------------------------------------------
 
     def generate_backtest_signals(
         self,
