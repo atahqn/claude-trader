@@ -181,12 +181,13 @@ class OrderExecutor:
     # -- Helpers ---------------------------------------------------------------
 
     def _load_symbol_info(self, api_symbol: str) -> None:
+        if api_symbol in self._symbol_info:
+            return
         info = self._client.get_exchange_info()
         for s in info.get("symbols", []):
-            if s["symbol"] == api_symbol:
-                self._symbol_info[api_symbol] = s
-                return
-        raise ValueError(f"Symbol {api_symbol} not found in exchange info")
+            self._symbol_info[s["symbol"]] = s
+        if api_symbol not in self._symbol_info:
+            raise ValueError(f"Symbol {api_symbol} not found in exchange info")
 
     @staticmethod
     def _effective_leverage(signal: Signal) -> float:

@@ -339,8 +339,13 @@ class LiveEngine:
         assert self._tracker is not None
         assert self._futures_client is not None
 
-        # Reconcile if not done in pre-poll
-        self._tracker.reconcile_with_exchange()
+        # Reconcile if not done recently in pre-poll
+        if (
+            self._last_reconcile_time is None
+            or (now_utc - self._last_reconcile_time).total_seconds() > 5.0
+        ):
+            self._tracker.reconcile_with_exchange()
+            self._last_reconcile_time = now_utc
 
         print(
             f"\n--- Signal poll {now_utc.strftime('%H:%M:%S')} UTC | "

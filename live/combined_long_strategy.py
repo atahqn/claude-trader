@@ -491,6 +491,8 @@ class CombinedLongStrategy(SignalGenerator):
         self._structure = DailyStructureProvider(columns=_BTC_STRUCTURE_COLUMNS)
         self._client: LiveMarketClient | None = None
         self._last_signal: dict[str, datetime] = {}
+        self._candle_buffers: dict[str, list] = {}
+        self._last_poll_time: datetime | None = None
 
     def __str__(self) -> str:
         parts = [
@@ -539,7 +541,17 @@ class CombinedLongStrategy(SignalGenerator):
 
         for symbol in SYMBOLS:
             try:
-                frame = self._fetch_symbol_frame(symbol, start, now)
+                candles = self._client.fetch_klines(
+                    symbol=symbol.replace("/", ""),
+                    interval=self.analysis_interval,
+                    start=start,
+                    end=now,
+                )
+                if not candles:
+                    failures.append(f"{symbol}: no candle data returned")
+                    continue
+                self._candle_buffers[symbol] = candles
+                frame = self._candles_to_indicator_frame(candles)
                 if frame is None:
                     failures.append(f"{symbol}: no candle data returned")
                     continue
@@ -569,6 +581,8 @@ class CombinedLongStrategy(SignalGenerator):
             except Exception as exc:
                 failures.append(f"{symbol}: warmup fetch failed: {exc}")
 
+        self._last_poll_time = now
+
         # Ensure BTC structure is ready before first poll
         self._structure.ensure_computed_until(now)
 
@@ -579,17 +593,9 @@ class CombinedLongStrategy(SignalGenerator):
                 "candle history:\n" + details
             )
 
-    def _fetch_symbol_frame(
-        self, symbol: str, start: datetime, now: datetime,
-    ) -> pd.DataFrame | None:
-        """Fetch candles and compute indicator frame for one symbol."""
-        assert self._client is not None
-        candles = self._client.fetch_klines(
-            symbol=symbol.replace("/", ""),
-            interval=self.analysis_interval,
-            start=start,
-            end=now,
-        )
+    @staticmethod
+    def _candles_to_indicator_frame(candles: list) -> pd.DataFrame | None:
+        """Convert raw candle list to indicator DataFrame."""
         if not candles:
             return None
         rows = [
@@ -609,16 +615,56 @@ class CombinedLongStrategy(SignalGenerator):
             return None
         return compute_indicator_frame(df, _BASE_INDICATORS)
 
+    def _fetch_symbol_frame(
+        self, symbol: str, now: datetime,
+    ) -> pd.DataFrame | None:
+        """Fetch new candles incrementally, update buffer, compute indicators."""
+        assert self._client is not None
+        buf = self._candle_buffers.get(symbol)
+        if buf and self._last_poll_time is not None:
+            # Incremental: only fetch candles since last poll (with 2h overlap
+            # buffer for safety against gaps).
+            fetch_start = self._last_poll_time - timedelta(hours=2)
+            new_candles = self._client.fetch_klines(
+                symbol=symbol.replace("/", ""),
+                interval=self.analysis_interval,
+                start=fetch_start,
+                end=now,
+            )
+            if new_candles:
+                existing_times = {c.open_time for c in buf}
+                for c in new_candles:
+                    if c.open_time not in existing_times:
+                        buf.append(c)
+                        existing_times.add(c.open_time)
+                # Trim to prevent unbounded growth
+                max_buf = _WARMUP_BARS + 30
+                if len(buf) > max_buf:
+                    buf[:] = buf[-max_buf:]
+        else:
+            # First fetch (no buffer yet)
+            start = now - timedelta(hours=_WARMUP_BARS + 20)
+            buf = self._client.fetch_klines(
+                symbol=symbol.replace("/", ""),
+                interval=self.analysis_interval,
+                start=start,
+                end=now,
+            )
+            if not buf:
+                return None
+            self._candle_buffers[symbol] = buf
+
+        return self._candles_to_indicator_frame(buf)
+
     def poll(self) -> Signal | list[Signal] | None:
         assert self._client is not None
         now = self.current_time()
-        start = now - timedelta(hours=_WARMUP_BARS + 20)
 
         # -- 1. Fetch indicator frames for all symbols in parallel -----------
         frames: dict[str, pd.DataFrame] = {}
         with ThreadPoolExecutor(max_workers=6) as pool:
             future_to_symbol = {
-                pool.submit(self._fetch_symbol_frame, symbol, start, now): symbol
+                pool.submit(self._fetch_symbol_frame, symbol, now): symbol
                 for symbol in SYMBOLS
             }
             for future in as_completed(future_to_symbol):
@@ -634,6 +680,8 @@ class CombinedLongStrategy(SignalGenerator):
                         f"CombinedLong: error fetching {symbol}: {exc}",
                         file=sys.stderr,
                     )
+
+        self._last_poll_time = now
 
         if not frames:
             return None

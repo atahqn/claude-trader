@@ -169,11 +169,6 @@ class PositionTracker:
                     f"@ {pos.fill_price}, TP/SL placed.",
                     file=sys.stderr,
                 )
-                try:
-                    balance = self._client.get_available_balance()
-                    print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
-                except Exception:
-                    pass
             except Exception as exc:
                 print(
                     f"[{pos.position_id}] Entry filled but TP/SL placement failed: {exc}",
@@ -381,6 +376,16 @@ class PositionTracker:
         now_utc: datetime,
         all_exchange_positions: list[dict[str, Any]] | None = None,
     ) -> bool | None:
+        # Fast path: when prefetched position data shows the position still
+        # open, neither TP nor SL has fully triggered — skip order queries.
+        if all_exchange_positions is not None:
+            exchange_open = self._has_open_exchange_position(pos, all_exchange_positions)
+            if exchange_open is True:
+                return False
+        else:
+            exchange_open = None
+
+        # Position gone or couldn't determine — query TP/SL to detect fills
         tp_filled = False
         sl_filled = False
         query_failed = False
@@ -397,7 +402,8 @@ class PositionTracker:
                 )
                 query_failed = True
 
-        if pos.sl_order is not None:
+        # Skip SL query if TP already filled
+        if not tp_filled and pos.sl_order is not None:
             try:
                 updated_sl = self._query_order(pos.signal.ticker, pos.sl_order)
                 pos.sl_order = updated_sl
@@ -422,7 +428,10 @@ class PositionTracker:
             self._finalize_close(pos, exit_order, exit_reason, now_utc)
             return True
 
-        exchange_open = self._has_open_exchange_position(pos, all_exchange_positions)
+        # No fill from order queries — check exchange position if not yet known
+        if exchange_open is None:
+            exchange_open = self._has_open_exchange_position(pos, all_exchange_positions)
+
         if exchange_open is False:
             exit_reason, exit_order = self._infer_exchange_exit(pos)
             if exit_reason == "EXTERNAL":
@@ -539,11 +548,6 @@ class PositionTracker:
             f"@ {exit_price_text} | PnL: {pnl_text}",
             file=sys.stderr,
         )
-        try:
-            balance = self._client.get_available_balance()
-            print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
-        except Exception:
-            pass
 
     # -- State persistence -----------------------------------------------------
 
