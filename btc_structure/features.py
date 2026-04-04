@@ -230,10 +230,14 @@ def _filter_fib_source_levels(ranked_df: pd.DataFrame, *, scope: str) -> pd.Data
     return out.sort_values("available_on").reset_index(drop=True)
 
 
-def _candidate_pool_for_fib(levels: pd.DataFrame, current_ts: pd.Timestamp, *, scope: str) -> pd.DataFrame:
+def _candidate_pool_for_fib(
+    levels: pd.DataFrame,
+    current_ts: pd.Timestamp,
+    *,
+    settings: dict[str, Any],
+) -> pd.DataFrame:
     if levels.empty:
         return levels.copy()
-    settings = _fib_scope_settings(scope)
     out = levels[levels["available_on"] <= current_ts].copy()
     lookback_days = settings["lookback_days"]
     if lookback_days is not None:
@@ -244,43 +248,46 @@ def _candidate_pool_for_fib(levels: pd.DataFrame, current_ts: pd.Timestamp, *, s
     top_n = int(settings["top_n"])
     recent = out.sort_values("available_on").tail(top_n)
     strongest = out.sort_values(["level_score", "available_on"], ascending=[False, False]).head(top_n)
-    pooled = pd.concat([recent, strongest], ignore_index=True)
-    pooled = pooled.drop_duplicates(subset=["available_on", "swing_date", "value"], keep="first")
-    return pooled.sort_values("available_on").reset_index(drop=True)
+    ordered_idx = list(recent.index)
+    seen_idx = set(ordered_idx)
+    for idx in strongest.index:
+        if idx not in seen_idx:
+            ordered_idx.append(idx)
+            seen_idx.add(idx)
+    return levels.loc[ordered_idx].sort_values("available_on").reset_index(drop=True)
 
 
 def _score_fib_pair(
-    high_row: pd.Series,
-    low_row: pd.Series,
+    high_row: Any,
+    low_row: Any,
     current_ts: pd.Timestamp,
     *,
-    scope: str,
+    settings: dict[str, Any],
 ) -> tuple[float, str] | None:
-    high_value = float(high_row["value"])
-    low_value = float(low_row["value"])
+    high_value = float(high_row.value)
+    low_value = float(low_row.value)
     if not np.isfinite(high_value) or not np.isfinite(low_value) or high_value <= low_value:
         return None
 
-    high_swing = pd.Timestamp(high_row["swing_date"])
-    low_swing = pd.Timestamp(low_row["swing_date"])
+    high_swing = pd.Timestamp(high_row.swing_date)
+    low_swing = pd.Timestamp(low_row.swing_date)
     if high_swing == low_swing:
         return None
     leg_direction = "bullish" if high_swing > low_swing else "bearish"
 
-    high_available = pd.Timestamp(high_row["available_on"])
-    low_available = pd.Timestamp(low_row["available_on"])
+    high_available = pd.Timestamp(high_row.available_on)
+    low_available = pd.Timestamp(low_row.available_on)
     newer_available = max(high_available, low_available)
     older_available = min(high_available, low_available)
     newer_age_days = max(0.0, (current_ts - newer_available).total_seconds() / 86400.0)
     older_age_days = max(0.0, (current_ts - older_available).total_seconds() / 86400.0)
     swing_span_days = abs((high_swing - low_swing).total_seconds() / 86400.0)
 
-    settings = _fib_scope_settings(scope)
-    score = float(high_row["level_score"]) + float(low_row["level_score"])
-    score += _tier_bonus(high_row.get("swing_tier", "")) + _tier_bonus(low_row.get("swing_tier", ""))
-    if leg_direction == "bullish" and str(high_row.get("structure_label", "")) in {"HH", "EQH"}:
+    score = float(high_row.level_score) + float(low_row.level_score)
+    score += _tier_bonus(getattr(high_row, "swing_tier", "")) + _tier_bonus(getattr(low_row, "swing_tier", ""))
+    if leg_direction == "bullish" and str(getattr(high_row, "structure_label", "")) in {"HH", "EQH"}:
         score += 0.75
-    if leg_direction == "bearish" and str(low_row.get("structure_label", "")) in {"LL", "EQL"}:
+    if leg_direction == "bearish" and str(getattr(low_row, "structure_label", "")) in {"LL", "EQL"}:
         score += 0.75
     score -= newer_age_days * float(settings["recency_penalty"])
     score -= older_age_days * float(settings["recency_penalty"]) * 0.20
@@ -299,38 +306,39 @@ def _select_active_fib_pair(
     *,
     scope: str,
 ) -> dict[str, Any] | None:
-    high_pool = _candidate_pool_for_fib(highs, current_ts, scope=scope)
-    low_pool = _candidate_pool_for_fib(lows, current_ts, scope=scope)
+    settings = _fib_scope_settings(scope)
+    high_pool = _candidate_pool_for_fib(highs, current_ts, settings=settings)
+    low_pool = _candidate_pool_for_fib(lows, current_ts, settings=settings)
     if high_pool.empty or low_pool.empty:
         return None
 
     best: dict[str, Any] | None = None
-    for _, high_row in high_pool.iterrows():
-        for _, low_row in low_pool.iterrows():
-            scored = _score_fib_pair(high_row, low_row, current_ts, scope=scope)
+    for high_row in high_pool.itertuples(index=False):
+        for low_row in low_pool.itertuples(index=False):
+            scored = _score_fib_pair(high_row, low_row, current_ts, settings=settings)
             if scored is None:
                 continue
             pair_score, leg_direction = scored
             candidate = {
                 "pair_score_adjusted": pair_score,
                 "leg_direction": leg_direction,
-                "anchor_high_date": pd.Timestamp(high_row["swing_date"]),
-                "anchor_high": float(high_row["value"]),
-                "high_score": float(high_row["level_score"]),
-                "high_label": high_row.get("structure_label"),
-                "high_tier": high_row.get("swing_tier"),
-                "anchor_low_date": pd.Timestamp(low_row["swing_date"]),
-                "anchor_low": float(low_row["value"]),
-                "low_score": float(low_row["level_score"]),
-                "low_label": low_row.get("structure_label"),
-                "low_tier": low_row.get("swing_tier"),
+                "anchor_high_date": pd.Timestamp(high_row.swing_date),
+                "anchor_high": float(high_row.value),
+                "high_score": float(high_row.level_score),
+                "high_label": getattr(high_row, "structure_label", None),
+                "high_tier": getattr(high_row, "swing_tier", None),
+                "anchor_low_date": pd.Timestamp(low_row.swing_date),
+                "anchor_low": float(low_row.value),
+                "low_score": float(low_row.level_score),
+                "low_label": getattr(low_row, "structure_label", None),
+                "low_tier": getattr(low_row, "swing_tier", None),
                 "pair_key": (
-                    f"{pd.Timestamp(low_row['swing_date']).date()}|{float(low_row['value']):.8f}"
-                    f"__{pd.Timestamp(high_row['swing_date']).date()}|{float(high_row['value']):.8f}"
+                    f"{pd.Timestamp(low_row.swing_date).date()}|{float(low_row.value):.8f}"
+                    f"__{pd.Timestamp(high_row.swing_date).date()}|{float(high_row.value):.8f}"
                 ),
                 "pair_available_on": max(
-                    pd.Timestamp(high_row["available_on"]),
-                    pd.Timestamp(low_row["available_on"]),
+                    pd.Timestamp(high_row.available_on),
+                    pd.Timestamp(low_row.available_on),
                 ),
             }
             if best is None or candidate["pair_score_adjusted"] > best["pair_score_adjusted"]:
@@ -575,6 +583,155 @@ def _attach_cross_scope_structure_features(base: pd.DataFrame) -> pd.DataFrame:
 # Column → scope dependency resolution
 # ---------------------------------------------------------------------------
 
+_BASE_FEATURE_COLUMNS = [
+    "close_time", "open", "high", "low", "close", "volume", "atr",
+    "market_bias_asof", "market_bias_after_close",
+    "structure_break_event_on_close",
+    "bos_up_on_close_flag", "bos_down_on_close_flag",
+    "choch_up_on_close_flag", "choch_down_on_close_flag",
+    "choch_any_on_close_flag", "bos_any_on_close_flag",
+    "confirmed_high_on_close_flag", "confirmed_low_on_close_flag",
+    "confirmed_high_label_on_close", "confirmed_low_label_on_close",
+]
+_ALL_SCOPES = ("local", "structural", "major", "global")
+_BREAK_STATE_SUFFIXES = (
+    "last_break_is_bullish",
+    "last_break_is_bearish",
+    "last_break_is_choch_up",
+    "last_break_is_choch_down",
+    "last_break_is_bos_up",
+    "last_break_is_bos_down",
+)
+_BREAK_EVENT_NAMES = ("bos_up", "bos_down", "choch_up", "choch_down")
+_CROSS_SCOPE_COLUMNS = {
+    "major_global_break_alignment_bullish",
+    "major_global_break_alignment_bearish",
+    "major_global_fib_alignment_bullish",
+    "major_global_fib_alignment_bearish",
+    "major_global_bullish_confluence_flag",
+    "major_global_bearish_confluence_flag",
+    "major_global_break_disagreement_flag",
+    "major_global_fib_disagreement_flag",
+    "major_pullback_long_candidate_flag",
+    "major_pullback_short_candidate_flag",
+    "global_continuation_long_flag",
+    "global_continuation_short_flag",
+}
+
+
+def _requested_columns_set(columns: list[str] | None) -> set[str] | None:
+    if columns is None:
+        return None
+    return set(columns)
+
+
+def _scopes_with_requested_prefixes(
+    requested: set[str] | None,
+    prefixes_by_scope: dict[str, tuple[str, ...]],
+) -> set[str]:
+    if requested is None:
+        return set(prefixes_by_scope)
+    scopes: set[str] = set()
+    for scope, prefixes in prefixes_by_scope.items():
+        if any(any(col.startswith(prefix) for prefix in prefixes) for col in requested):
+            scopes.add(scope)
+    return scopes
+
+
+def _requested_break_merge_scopes(requested: set[str] | None) -> set[str]:
+    if requested is None:
+        return set(_ALL_SCOPES)
+    scopes: set[str] = set()
+    cross_scope_requested = bool(requested & _CROSS_SCOPE_COLUMNS)
+    for scope in _ALL_SCOPES:
+        if any(col.startswith(f"{scope}_break_") for col in requested):
+            scopes.add(scope)
+        if any(col == f"{scope}_{suffix}" for col in requested for suffix in _BREAK_STATE_SUFFIXES):
+            scopes.add(scope)
+    if cross_scope_requested:
+        scopes.update({"major", "global"})
+    return scopes
+
+
+def _requested_break_state_scopes(requested: set[str] | None) -> set[str]:
+    if requested is None:
+        return set(_ALL_SCOPES)
+    scopes: set[str] = set()
+    cross_scope_requested = bool(requested & _CROSS_SCOPE_COLUMNS)
+    for scope in _ALL_SCOPES:
+        if any(col == f"{scope}_{suffix}" for col in requested for suffix in _BREAK_STATE_SUFFIXES):
+            scopes.add(scope)
+    if cross_scope_requested:
+        scopes.update({"major", "global"})
+    return scopes
+
+
+def _requested_break_event_scopes(requested: set[str] | None) -> dict[str, tuple[str, ...]]:
+    if requested is None:
+        return {scope: _BREAK_EVENT_NAMES for scope in _ALL_SCOPES}
+    scoped_events: dict[str, list[str]] = {}
+    for scope in _ALL_SCOPES:
+        events = [
+            event_name
+            for event_name in _BREAK_EVENT_NAMES
+            if any(
+                col in {
+                    f"{scope}_{event_name}_available_on",
+                    f"{scope}_{event_name}_score",
+                }
+                for col in requested
+            )
+        ]
+        if events:
+            scoped_events[scope] = events
+    return {scope: tuple(events) for scope, events in scoped_events.items()}
+
+
+def _requested_level_merge_scopes(requested: set[str] | None) -> set[str]:
+    prefixes = {
+        scope: (
+            f"{scope}_high_",
+            f"{scope}_low_",
+            f"{scope}_distance_to_high_pct",
+            f"{scope}_distance_to_low_pct",
+            f"{scope}_box_position",
+        )
+        for scope in _ALL_SCOPES
+    }
+    return _scopes_with_requested_prefixes(requested, prefixes)
+
+
+def _requested_rolling_event_scopes(requested: set[str] | None) -> set[str]:
+    prefixes = {
+        scope: (
+            f"{scope}_up_events_",
+            f"{scope}_down_events_",
+            f"{scope}_net_break_pressure_",
+        )
+        for scope in _ALL_SCOPES
+    }
+    return _scopes_with_requested_prefixes(requested, prefixes)
+
+
+def _select_feature_output_columns(
+    feature_matrix: pd.DataFrame,
+    columns: list[str] | None,
+) -> pd.DataFrame:
+    if columns is None:
+        return feature_matrix
+    keep: list[str] = []
+    for col in _BASE_FEATURE_COLUMNS:
+        if col in feature_matrix.columns and col not in keep:
+            keep.append(col)
+    missing = [col for col in columns if col not in feature_matrix.columns]
+    if missing:
+        raise KeyError(f"Requested BTC structure columns were not built: {missing}")
+    for col in columns:
+        if col not in keep:
+            keep.append(col)
+    return feature_matrix.loc[:, keep]
+
+
 def derive_fib_scopes(columns: list[str] | None) -> tuple[str, ...]:
     """Determine which fib scopes must be computed for *columns*.
 
@@ -617,21 +774,15 @@ def build_structure_feature_matrix(
     ranked_highs: pd.DataFrame | None = None,
     ranked_lows: pd.DataFrame | None = None,
     ranked_breaks: pd.DataFrame | None = None,
+    columns: list[str] | None = None,
 ) -> pd.DataFrame:
-    base = structure.features[[
-        "close_time", "open", "high", "low", "close", "volume", "atr",
-        "market_bias_asof", "market_bias_after_close",
-        "structure_break_event_on_close",
-        "bos_up_on_close_flag", "bos_down_on_close_flag",
-        "choch_up_on_close_flag", "choch_down_on_close_flag",
-        "choch_any_on_close_flag", "bos_any_on_close_flag",
-        "confirmed_high_on_close_flag", "confirmed_low_on_close_flag",
-        "confirmed_high_label_on_close", "confirmed_low_label_on_close",
-    ]].copy()
+    requested = _requested_columns_set(columns)
+    base = structure.features[_BASE_FEATURE_COLUMNS].copy()
     base["close_time"] = pd.to_datetime(base["close_time"], utc=True)
 
     if skip_ranking:
-        return base.sort_values("close_time").reset_index(drop=True)
+        base = base.sort_values("close_time").reset_index(drop=True)
+        return _select_feature_output_columns(base, columns)
 
     if ranked_highs is None:
         ranked_highs = rank_confirmed_levels(structure.confirmed_highs, kind="high")
@@ -640,31 +791,45 @@ def build_structure_feature_matrix(
     if ranked_breaks is None:
         ranked_breaks = rank_structure_breaks(structure.structure_breaks, structure.confirmed_highs, structure.confirmed_lows)
 
-    all_scopes = ("local", "structural", "major", "global")
-    for scope in all_scopes:
+    level_merge_scopes = _requested_level_merge_scopes(requested)
+    break_merge_scopes = _requested_break_merge_scopes(requested)
+    rolling_event_scopes = _requested_rolling_event_scopes(requested)
+    break_state_scopes = _requested_break_state_scopes(requested)
+    break_event_scopes = _requested_break_event_scopes(requested)
+
+    for scope in sorted(level_merge_scopes):
         base = _merge_last_levels(base, ranked_highs, kind="high", scope=scope)
         base = _merge_last_levels(base, ranked_lows, kind="low", scope=scope)
-        base = _merge_last_breaks(base, ranked_breaks, scope=scope)
         base = _attach_distance_features(base, scope=scope)
-    base = _rolling_event_counts(base, ranked_breaks, scopes=all_scopes)
+
+    for scope in sorted(break_merge_scopes):
+        base = _merge_last_breaks(base, ranked_breaks, scope=scope)
+
+    if rolling_event_scopes:
+        base = _rolling_event_counts(base, ranked_breaks, scopes=tuple(sorted(rolling_event_scopes)))
 
     for scope in fib_scopes:
         base = _build_fib_leg_features(base, ranked_highs, ranked_lows, scope=scope)
 
-    base = base.copy()
-    for scope in all_scopes:
+    if break_state_scopes or break_event_scopes:
+        base = base.copy()
+    for scope in sorted(break_state_scopes):
         base = _attach_scope_break_state_features(base, scope=scope)
-        for event_name in ("bos_up", "bos_down", "choch_up", "choch_down"):
+    for scope, event_names in break_event_scopes.items():
+        for event_name in event_names:
             base = _merge_last_break_event(base, ranked_breaks, scope=scope, event_name=event_name)
 
-    base = base.copy()
+    if fib_scopes:
+        base = base.copy()
     for scope in fib_scopes:
         base = _attach_scope_fib_zone_features(base, scope=scope)
 
     base = base.copy()
     if "major" in fib_scopes and "global" in fib_scopes:
-        base = _attach_cross_scope_structure_features(base)
-    return base.sort_values("close_time").reset_index(drop=True)
+        if requested is None or bool(requested & _CROSS_SCOPE_COLUMNS):
+            base = _attach_cross_scope_structure_features(base)
+    base = base.sort_values("close_time").reset_index(drop=True)
+    return _select_feature_output_columns(base, columns)
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +875,7 @@ def run_structure_feature_lab(
         ranked_highs=ranked_highs,
         ranked_lows=ranked_lows,
         ranked_breaks=ranked_breaks,
+        columns=columns,
     )
     return StructureLabArtifacts(
         ranked_highs=ranked_highs,

@@ -52,6 +52,28 @@ still developing or selecting the strategy.
 6. Create results.tsv under this folder to save summarized results.
 7. Confirm your research with the user take his approval and start.
 
+## Approval Gate
+
+HARD STOP: Before any research begins, you must:
+1. Read README.md and STRATEGY_EVOLUTION.md
+2. Identify the current baseline and its exact preference_score
+3. Propose a research area to the user
+4. Ask for explicit approval
+
+Until the user explicitly approves, you may only read files and summarize findings.
+
+Before approval, you must NOT:
+- create a research folder
+- create or edit a strategy file
+- create or edit results.tsv
+- run development or evaluation backtests
+- pick a final research direction on your own
+- begin the experiment loop
+
+The "NEVER STOP" experiment loop starts only AFTER explicit user approval.
+If any other instruction suggests acting autonomously, this approval gate takes precedence.
+Do not infer approval from silence, context, or unrelated follow-up questions.
+
 Note that developing strategies is very challenging. Before and after you start your research, you should think hard on your ideas, if you wish you can even research the internet, look for papers, blogpposts etc. to find new ideas.
 
 ## Research Workflow
@@ -126,6 +148,7 @@ You must work on your created strategy folder. You cannot implement already livi
 The evaluated backtester path must implement the strategy itself.
 
 You can calculate new indicators or use the provided data if you think it will be useful for the strategy.  (OHLCV, premium)
+
 In particular:
 
 - a live `SignalGenerator` and its backtest path must represent the same strategy logic
@@ -142,10 +165,7 @@ Do not modify files outside the research folder. You can import them, copy-paste
 
 NEVER test your strategies first on the evaluation. You develop then you test on the evaluation. If it is not good enough you discard them.
 
-Your research is independent of the other researchs you should not scan for other research folders but you should only look at the native claude-trader code for context.
-
-Any kind of cheating is forbidden. Your strategy should depend and calculate entries from the available information at the time of execution
-with no look-ahead bias. Refer STRATEGY_EVOLUTION.md for previous mistakes. 
+Any kind of cheating is forbidden. Your strategy should depend and calculate entries from the available information at the time of execution with no look-ahead bias.
 
 ## Logging results
 

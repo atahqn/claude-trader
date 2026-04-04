@@ -108,7 +108,11 @@ class DailyStructureProvider:
                     "close_time", keep="last",
                 ).sort_values("close_time").reset_index(drop=True)
             else:
-                frame = self._cached_frame
+                # Intraday cutoffs can advance without any newly closed daily
+                # candle. Reuse the cached feature matrix instead of rerunning
+                # the full structure lab on unchanged data.
+                self._computed_until = cutoff
+                return
         else:
             # First compute: full history from listing date
             candles = self._client.fetch_klines("BTC/USDT", "1d", _LISTING_START, cutoff)
