@@ -21,6 +21,7 @@ from .tracker import PositionTracker
 
 _INTENSIVE_POLL_LEAD_SECONDS = 120.0
 _PRE_POLL_LEAD_SECONDS = 10.0
+_OPEN_FILL_CHECK_SECONDS = 30.0
 
 
 @dataclass
@@ -74,6 +75,7 @@ class LiveEngine:
         # Pre-poll shared state
         self._pre_poll_balance: float | None = None
         self._last_reconcile_time: datetime | None = None
+        self._last_fill_check_time: datetime | None = None
 
         # Built during start()
         self._slots: list[_GeneratorSlot] = []
@@ -199,8 +201,10 @@ class LiveEngine:
             fills_now_utc = self._futures_client.server_now()
 
             # 1. Check for fills on existing positions
-            self._tracker.check_fills(fills_now_utc)
-            self._tracker.save_state()
+            if self._should_check_fills(fills_now_utc, check_interval):
+                self._tracker.check_fills(fills_now_utc)
+                self._tracker.save_state()
+                self._last_fill_check_time = fills_now_utc
 
             # 2. Pre-poll: capital check before upcoming boundaries
             pre_poll_now_utc = self._futures_client.server_now()
@@ -274,6 +278,30 @@ class LiveEngine:
             for pos in self._tracker.positions
         )
 
+    def _should_check_fills(self, now_utc: datetime, check_interval: float) -> bool:
+        """Throttle fill checks: 5s for PENDING_ENTRY, 30s for OPEN."""
+        if not any(
+            p.status in (PositionStatus.PENDING_ENTRY, PositionStatus.OPEN)
+            for p in self._tracker.positions
+        ):
+            return False
+        if self._last_fill_check_time is None:
+            return True
+        has_pending = any(
+            p.status is PositionStatus.PENDING_ENTRY
+            for p in self._tracker.positions
+        )
+        min_interval = check_interval if has_pending else _OPEN_FILL_CHECK_SECONDS
+        return (now_utc - self._last_fill_check_time).total_seconds() >= min_interval
+
+    def _fill_check_interval(self, check_interval: float) -> float:
+        """Return the appropriate fill-check interval for current positions."""
+        has_pending = any(
+            p.status is PositionStatus.PENDING_ENTRY
+            for p in self._tracker.positions
+        )
+        return check_interval if has_pending else _OPEN_FILL_CHECK_SECONDS
+
     def _sleep_interval_seconds(self, now_utc: datetime, check_interval: float) -> float:
         """Smart sleep: coarse when idle, intensive near boundaries."""
         seconds_until_boundary = max(
@@ -282,7 +310,7 @@ class LiveEngine:
         )
 
         if self._has_local_active_positions():
-            return min(check_interval, seconds_until_boundary)
+            return min(self._fill_check_interval(check_interval), seconds_until_boundary)
 
         lead = self._intensive_poll_lead_seconds(check_interval)
         if seconds_until_boundary <= lead:
