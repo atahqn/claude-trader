@@ -1530,6 +1530,7 @@ class SqueezeV8Strategy(SignalGenerator):
         had_short = len(emitted) > 0
         if self.enable_pullback_long and not had_short:
             pullback_sigs = self._check_pullback_long(df_feat, symbol, now)
+            emitted.extend(pullback_sigs)
 
         return emitted
 
