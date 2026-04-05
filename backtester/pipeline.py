@@ -65,11 +65,11 @@ class PreparedMarketContext:
     request: MarketDataRequest
     bundle: MarketContextBundle
     poll_candles: dict[str, list[Candle]] = field(default_factory=dict)
-    _hourly_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
+    _analysis_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
     _poll_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
-        self._hourly_candles = {
+        self._analysis_candles = {
             symbol: _frame_to_candles(context.frame)
             for symbol, context in self.bundle.by_symbol.items()
         }
@@ -85,13 +85,13 @@ class PreparedMarketContext:
     def for_symbol(self, symbol: str) -> SymbolMarketContext:
         return self.bundle.for_symbol(symbol)
 
-    def slice_hourly_candles(
+    def slice_analysis_candles(
         self,
         symbol: str,
         start: datetime,
         end: datetime,
     ) -> list[Candle]:
-        candles = self._hourly_candles.get(symbol, [])
+        candles = self._analysis_candles.get(symbol, [])
         if not candles:
             return []
         lo = bisect_left(candles, start, key=lambda c: c.open_time)
@@ -106,7 +106,7 @@ class PreparedMarketContext:
     ) -> list[Candle]:
         candles = self._poll_candles.get(symbol)
         if candles is None:
-            candles = self._hourly_candles.get(symbol, [])
+            candles = self._analysis_candles.get(symbol, [])
         if not candles:
             return []
         lo = bisect_left(candles, start, key=lambda c: c.open_time)
@@ -320,6 +320,7 @@ class _ChunkedWindowCache(Generic[T]):
 class BacktestExecutionSession:
     client: Any
     prepared_context: PreparedMarketContext | None = None
+    analysis_interval: str = "1h"
     minute_chunk: timedelta = timedelta(hours=6)
     agg_trade_chunk: timedelta = timedelta(minutes=15)
     use_chunk_cache: bool = True
@@ -327,6 +328,8 @@ class BacktestExecutionSession:
     _agg_trade_cache: _ChunkedWindowCache[AggTrade] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.prepared_context is not None:
+            self.analysis_interval = self.prepared_context.request.ohlcv_interval
         self._minute_cache = _ChunkedWindowCache(
             chunk_size=self.minute_chunk,
             fetcher=lambda symbol, start, end: self.client.fetch_klines(symbol, "1m", start, end),
@@ -338,15 +341,15 @@ class BacktestExecutionSession:
             time_selector=lambda trade: trade.timestamp,
         )
 
-    def fetch_hourly_candles(
+    def fetch_analysis_candles(
         self,
         symbol: str,
         start: datetime,
         end: datetime,
     ) -> list[Candle]:
         if self.prepared_context is not None and symbol in self.prepared_context.bundle.by_symbol:
-            return self.prepared_context.slice_hourly_candles(symbol, start, end)
-        return self.client.fetch_klines(symbol, "1h", start, end)
+            return self.prepared_context.slice_analysis_candles(symbol, start, end)
+        return self.client.fetch_klines(symbol, self.analysis_interval, start, end)
 
     def fetch_minute_candles(
         self,

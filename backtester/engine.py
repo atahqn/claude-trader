@@ -78,7 +78,7 @@ def _resolve_timeout_exit(
         )
 
     hour_start = timeout_time.replace(minute=0, second=0, microsecond=0)
-    hour_candles = session.fetch_hourly_candles(
+    hour_candles = session.fetch_analysis_candles(
         ticker,
         hour_start,
         hour_start + timedelta(hours=2),
@@ -114,7 +114,7 @@ def _resolve_entry_approximate(
     candle_start = candle_close_time - _interval_duration(candle_interval)
 
     if candle_interval == "1h":
-        candles = session.fetch_hourly_candles(ticker, candle_start, candle_close_time)
+        candles = session.fetch_analysis_candles(ticker, candle_start, candle_close_time)
         candle = next((c for c in reversed(candles) if c.close_time <= candle_close_time), None)
     else:
         minute_candles = session.fetch_minute_candles(ticker, candle_start, candle_close_time)
@@ -287,7 +287,7 @@ def backtest_signal(
     # ----- Step 3: Fetch 1h candles for resolution window -----
     holding_hours = signal.max_holding_hours
     resolution_end = entry_time + timedelta(hours=holding_hours)
-    hour_candles = session.fetch_hourly_candles(ticker, entry_time, resolution_end)
+    hour_candles = session.fetch_analysis_candles(ticker, entry_time, resolution_end)
 
     # ----- Step 4: Resolve exit (3-level hierarchy) -----
     def minute_fetcher(start, end):
