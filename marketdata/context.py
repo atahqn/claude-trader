@@ -119,6 +119,7 @@ def _candles_to_frame(candles: list[Candle]) -> pd.DataFrame:
             "low": candle.low,
             "close": candle.close,
             "volume": candle.volume,
+            "taker_buy_volume": candle.taker_buy_volume,
         }
         for candle in candles
     ]

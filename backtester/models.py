@@ -80,6 +80,7 @@ class Candle:
     low: float
     close: float
     volume: float = 0.0
+    taker_buy_volume: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)

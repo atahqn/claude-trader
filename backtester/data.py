@@ -115,6 +115,7 @@ def _parse_kline(row: list[Any]) -> Candle:
         low=float(row[3]),
         close=float(row[4]),
         volume=float(row[5]),
+        taker_buy_volume=float(row[9]) if len(row) > 9 else 0.0,
     )
 
 

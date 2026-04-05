@@ -45,7 +45,7 @@ still developing or selecting the strategy.
 
 1. Read README.md and STRATEGY_EVOLUTION.MD . 
 2. Discuss with the user on what to research. Usually 
-    STRATEGY_EVOLUTION.md file has some proposals or suggests ways for future research.
+    STRATEGY_EVOLUTION.md file has some proposals or suggests ways for future research. Note that research direction could be very general like improving some previous strategy. 
 3. Before starting your research you should understand the current baseline for your area. Discuss the current baseline and determine the 'preference_score' of the baseline.
 4. Create a directory with proper name for your research under the claude-trader.
 5. Create the strategy file that implements the SignalGenerator class under this folder. You can import other logic from other folders but the SignalGenerator implementation must be here.
@@ -140,6 +140,8 @@ Tie-breakers after `preference_score` are:
 Edit and refine your strategy.
 
 Use provided indicators from backtester/indicators.py or derive metrics that you think would be useful. Codebase exposes 5 Binance dataset types through MarketDataRequest: ohlcv, agg_trades (this is only available for l year so you cannot properly use this for signal generation), funding_rates, mark_price_klines, and premium_index_klines (marketdata/models.py:9, marketdata/bundle.py:45). You can use this data to create new indicators but doing so do not change directly the backtester/indicator.py but keep it in under the research folder.
+
+Kline data includes `taker_buy_volume` (the volume initiated by taker buy orders). The indicator system provides `volume_delta` (per-bar net taker aggression: `2 * taker_buy_volume - volume`) and `cvd` (cumulative volume delta, the running sum of `volume_delta`). These are available from ticker inception at any kline interval with no extra API calls.
 
 Additionally, the `btc_structure/` module provides daily BTC market structure features (regime, structural price levels, and structure break events) derived from daily OHLCV. These are accessed via `DailyStructureProvider` and can be merged onto intraday frames. See `btc_structure/README.md` for the full column reference, usage patterns, and computation cost.
 

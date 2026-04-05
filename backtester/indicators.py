@@ -12,7 +12,7 @@ _SLOPE_XS_20 = np.arange(20, dtype=float)
 _SLOPE_XS_20_SUM = float(_SLOPE_XS_20.sum())
 _SLOPE_XS_20_DOT = float(np.dot(_SLOPE_XS_20, _SLOPE_XS_20))
 _SLOPE_DENOM_20 = 20 * _SLOPE_XS_20_DOT - _SLOPE_XS_20_SUM ** 2
-_RAW_INDICATOR_INPUTS = frozenset({"open", "high", "low", "close", "volume"})
+_RAW_INDICATOR_INPUTS = frozenset({"open", "high", "low", "close", "volume", "taker_buy_volume"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +135,9 @@ _INDICATOR_SPECS: dict[str, IndicatorSpec] = {
     # --- Bollinger Band normalizations ---
     "bb_pct_b": IndicatorSpec("bb_pct_b", ("close", "bb_upper", "bb_lower"), 0),
     "bb_width": IndicatorSpec("bb_width", ("bb_upper", "bb_lower", "_bb_ma_20"), 0),
+    # --- CVD (Cumulative Volume Delta) ---
+    "volume_delta": IndicatorSpec("volume_delta", ("taker_buy_volume", "volume"), 0),
+    "cvd": IndicatorSpec("cvd", ("volume_delta",), 0),
 }
 
 
@@ -220,6 +223,11 @@ def _compute_indicator(name: str, frame: pd.DataFrame) -> pd.Series:
         return ((frame["close"] - frame["bb_lower"]) / band_range).replace([np.inf, -np.inf], np.nan)
     if name == "bb_width":
         return (frame["bb_upper"] - frame["bb_lower"]) / frame["_bb_ma_20"]
+    # --- CVD ---
+    if name == "volume_delta":
+        return 2 * frame["taker_buy_volume"] - frame["volume"]
+    if name == "cvd":
+        return frame["volume_delta"].cumsum()
     raise KeyError(f"unknown indicator: {name}")
 
 

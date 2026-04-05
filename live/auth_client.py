@@ -119,7 +119,8 @@ class BinanceFuturesClient:
         self._base_url = config.base_url
         self._rate_limiter = _RateLimiter(limit_per_minute=2400)
         self._time_sync_lock = threading.Lock()
-        self._time_offset_ms: int = 0
+        self._server_time_at_sync_ms: int = 0
+        self._monotonic_at_sync: float = 0.0
         self._last_time_sync_monotonic: float = 0.0
         self._last_sync_wall_ms: int = 0
         self._last_sync_monotonic_ms: int = 0
@@ -128,21 +129,22 @@ class BinanceFuturesClient:
     # -- Time sync -------------------------------------------------------------
 
     def _sync_server_time(self) -> None:
-        """Calculate offset between local clock and Binance server time."""
+        """Anchor server time to monotonic clock for drift-immune timestamps."""
         try:
-            local_before = int(time.time() * 1000)
+            mono_before = time.monotonic()
             url = f"{self._base_url}/fapi/v1/time"
             with urlopen(url) as response:
                 server_time = json.loads(response.read())["serverTime"]
-            local_after = int(time.time() * 1000)
-            local_mid = (local_before + local_after) // 2
-            self._time_offset_ms = server_time - local_mid
-            self._last_time_sync_monotonic = time.monotonic()
+            mono_after = time.monotonic()
+            self._server_time_at_sync_ms = server_time
+            self._monotonic_at_sync = (mono_before + mono_after) / 2
+            self._last_time_sync_monotonic = mono_after
             self._last_sync_wall_ms = int(time.time() * 1000)
-            self._last_sync_monotonic_ms = int(time.monotonic() * 1000)
-            if abs(self._time_offset_ms) > 500:
+            self._last_sync_monotonic_ms = int(mono_after * 1000)
+            wall_offset = server_time - int(time.time() * 1000)
+            if abs(wall_offset) > 500:
                 print(
-                    f"Clock offset: {self._time_offset_ms:+d}ms (synced with Binance)",
+                    f"Clock offset: {wall_offset:+d}ms (synced with Binance)",
                     file=sys.stderr,
                 )
         except Exception as exc:
@@ -168,7 +170,10 @@ class BinanceFuturesClient:
                 self._sync_server_time()
 
     def _timestamp_ms(self) -> int:
-        return int(time.time() * 1000) + self._time_offset_ms
+        if self._server_time_at_sync_ms > 0:
+            elapsed_ms = int((time.monotonic() - self._monotonic_at_sync) * 1000)
+            return self._server_time_at_sync_ms + elapsed_ms
+        return int(time.time() * 1000)
 
     def server_now(self) -> datetime:
         """Return current UTC time corrected for local clock drift."""

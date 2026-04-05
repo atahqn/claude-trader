@@ -82,6 +82,7 @@ _BASE_INDICATORS = (
     "ret_72h", "ret_24h",
     "mom_slope", "ema_20",
     "body", "body_ratio", "vol_ratio",
+    "volume_delta",
 )
 
 _WARMUP_BARS = max(required_warmup(_BASE_INDICATORS), 100)
@@ -266,6 +267,9 @@ def _conv_dipbuy(row: pd.Series, prev: pd.Series) -> tuple[bool, dict[str, objec
     vol_ratio = _safe(row, "vol_ratio", 1.0)
     if vol_ratio < 0.9:
         return False, {}, 0, 0
+    vd = _safe(row, "volume_delta", 0.0)
+    if vd <= 0:
+        return False, {}, 0, 0
     return True, {"pattern": "conv_dipbuy", "ret_72h": round(ret_72h, 2), "ret_24h": round(ret_24h, 2)}, 4.0, 2.0
 
 
@@ -330,6 +334,9 @@ def _struct_impulse(row: pd.Series) -> tuple[bool, dict[str, object], float, flo
     mom_slope = _safe(row, "mom_slope", 0.0)
     if mom_slope <= 0:
         return False, {}, 0, 0
+    vd = _safe(row, "volume_delta", 0.0)
+    if vd <= 0:
+        return False, {}, 0, 0
     return True, {"pattern": "struct_impulse", "impulse_atr": round(body / atr, 2), "ret_72h": round(ret_72h, 2)}, 4.0, 2.0
 
 
@@ -352,6 +359,9 @@ def _conv_impulse(row: pd.Series) -> tuple[bool, dict[str, object], float, float
         return False, {}, 0, 0
     atr_ratio = _safe(row, "atr_ratio", 1.0)
     if atr_ratio > 1.3:
+        return False, {}, 0, 0
+    vd = _safe(row, "volume_delta", 0.0)
+    if vd <= 0:
         return False, {}, 0, 0
     return True, {"pattern": "conv_impulse", "impulse_atr": round(body / atr, 2), "ret_72h": round(ret_72h, 2)}, 4.0, 2.0
 
@@ -416,6 +426,30 @@ def _apply_heuristic_v1_sizing(signals: list[Signal]) -> list[Signal]:
         meta["size_mult"] = round(mult, 4)
         meta["cluster_count"] = cluster
         result.append(replace(sig, size_multiplier=mult, metadata=meta))
+    return result
+
+
+# --- Exposure cap ---
+
+_MAX_TOTAL_SIZE_PER_TIMESTAMP = 2.5
+
+
+def _apply_exposure_cap(signals: list[Signal]) -> list[Signal]:
+    """Scale down signals when total size_multiplier exceeds the cap."""
+    from itertools import groupby
+    result: list[Signal] = []
+    for _, group in groupby(signals, key=lambda s: s.signal_date):
+        batch = list(group)
+        total = sum(s.size_multiplier for s in batch)
+        if total > _MAX_TOTAL_SIZE_PER_TIMESTAMP:
+            scale = _MAX_TOTAL_SIZE_PER_TIMESTAMP / total
+            for sig in batch:
+                new_mult = sig.size_multiplier * scale
+                meta = dict(sig.metadata)
+                meta["size_mult"] = round(new_mult, 4)
+                result.append(replace(sig, size_multiplier=new_mult, metadata=meta))
+        else:
+            result.extend(batch)
     return result
 
 
@@ -607,6 +641,7 @@ class CombinedLongStrategy(SignalGenerator):
                 "low": c.low,
                 "close": c.close,
                 "volume": c.volume,
+                "taker_buy_volume": c.taker_buy_volume,
             }
             for c in candles
         ]
@@ -829,6 +864,9 @@ class CombinedLongStrategy(SignalGenerator):
         if self.sizing_mode == "heuristic_v1":
             signals = _apply_heuristic_v1_sizing(signals)
 
+        # -- 7. Exposure cap: limit total size per timestamp ----------------
+        signals = _apply_exposure_cap(signals)
+
         return signals if signals else None
 
     # ------------------------------------------------------------------
@@ -985,5 +1023,8 @@ class CombinedLongStrategy(SignalGenerator):
             all_signals = _apply_tiered_v1_tp_sl(all_signals)
         if self.sizing_mode == "heuristic_v1":
             all_signals = _apply_heuristic_v1_sizing(all_signals)
+
+        # Exposure cap: limit total size per timestamp
+        all_signals = _apply_exposure_cap(all_signals)
 
         return all_signals
