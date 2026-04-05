@@ -143,9 +143,11 @@ class OrderExecutor:
 
         position.tp_order = self._client.place_take_profit_market(
             signal.ticker, close_side, tp_price, position_side,
+            quantity=position.quantity,
         )
         position.sl_order = self._client.place_stop_market(
             signal.ticker, close_side, sl_price, position_side,
+            quantity=position.quantity,
         )
 
     def close_position_market(self, position: LivePosition) -> ExchangeOrder:

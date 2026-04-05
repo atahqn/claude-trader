@@ -113,11 +113,32 @@ class PositionTracker:
                 all_exchange_positions = self._client.get_position_info()
             except Exception:
                 pass  # per-position fallback in _has_open_exchange_position
+
+        # Identify (symbol, side) pairs with multiple open positions so the
+        # exit-fill fast path is only used when a single position owns the
+        # entire exchange-level position.
+        side_counts: dict[tuple[str, str], int] = {}
+        for p in self._positions:
+            if p.status is PositionStatus.OPEN:
+                key = (
+                    _symbol_for_api(p.signal.ticker),
+                    "LONG" if p.signal.position_type is PositionType.LONG else "SHORT",
+                )
+                side_counts[key] = side_counts.get(key, 0) + 1
+
         for pos in self._positions:
             if pos.status is PositionStatus.PENDING_ENTRY:
                 self._check_entry_fill(pos, now_utc)
             elif pos.status is PositionStatus.OPEN:
-                exit_closed = self._check_exit_fills(pos, now_utc, all_exchange_positions)
+                key = (
+                    _symbol_for_api(pos.signal.ticker),
+                    "LONG" if pos.signal.position_type is PositionType.LONG else "SHORT",
+                )
+                shares_side = side_counts.get(key, 1) > 1
+                exit_closed = self._check_exit_fills(
+                    pos, now_utc, all_exchange_positions,
+                    skip_fast_path=shares_side,
+                )
                 if exit_closed is not False:
                     continue
                 self._check_timeout(pos, now_utc)
@@ -375,12 +396,16 @@ class PositionTracker:
         pos: LivePosition,
         now_utc: datetime,
         all_exchange_positions: list[dict[str, Any]] | None = None,
+        *,
+        skip_fast_path: bool = False,
     ) -> bool | None:
-        # Fast path: when prefetched position data shows the position still
-        # open, neither TP nor SL has fully triggered — skip order queries.
+        # Fast path: when only one position owns the exchange-level side and
+        # that side is still open, no TP/SL can have triggered — skip order
+        # queries.  Disabled when multiple positions share the same side
+        # because a per-quantity TP/SL fill leaves the exchange position open.
         if all_exchange_positions is not None:
             exchange_open = self._has_open_exchange_position(pos, all_exchange_positions)
-            if exchange_open is True:
+            if exchange_open is True and not skip_fast_path:
                 return False
         else:
             exchange_open = None
