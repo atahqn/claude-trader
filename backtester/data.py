@@ -46,7 +46,9 @@ class _DiskCache:
     def set(self, namespace: str, key_parts: list[str], payload: Any) -> None:
         path = self._path(namespace, key_parts)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        tmp.replace(path)
 
     def _path(self, namespace: str, key_parts: list[str]) -> Path:
         digest = hashlib.sha256("::".join(key_parts).encode()).hexdigest()
@@ -174,10 +176,12 @@ class BinanceClient:
     cache_root: Path = _CACHE_ROOT
     _disk_cache: _DiskCache = field(init=False, repr=False)
     _mem_cache: dict[str, Any] = field(init=False, repr=False, default_factory=dict)
+    _mem_lock: threading.Lock = field(init=False, repr=False)
     _rate_limiter: _RateLimiter = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._disk_cache = _DiskCache(self.cache_root)
+        self._mem_lock = threading.Lock()
         limit = 2400 if self.market_type is MarketType.FUTURES else 6000
         self._rate_limiter = _RateLimiter(limit_per_minute=limit)
 
@@ -349,10 +353,11 @@ class BinanceClient:
         start: datetime,
         end: datetime,
         request: MarketDataRequest,
+        max_workers: int = 8,
     ) -> MarketDataBundle:
         from marketdata.bundle import build_market_data_bundle
 
-        return build_market_data_bundle(self, symbols, start, end, request)
+        return build_market_data_bundle(self, symbols, start, end, request, max_workers=max_workers)
 
     def fetch_market_context_bundle(
         self,
@@ -360,10 +365,11 @@ class BinanceClient:
         start: datetime,
         end: datetime,
         request: MarketDataRequest,
+        max_workers: int = 8,
     ):
         from marketdata.context import fetch_market_context_bundle
 
-        return fetch_market_context_bundle(self, symbols, start, end, request)
+        return fetch_market_context_bundle(self, symbols, start, end, request, max_workers=max_workers)
 
     # -- Internal ------------------------------------------------------------
 
@@ -450,14 +456,16 @@ class BinanceClient:
     def _get_json(self, path: str, params: dict[str, Any], *, weight: int) -> Any:
         # In-memory cache
         mem_key = path + "|" + "&".join(f"{k}={params[k]}" for k in sorted(params))
-        if mem_key in self._mem_cache:
-            return self._mem_cache[mem_key]
+        with self._mem_lock:
+            if mem_key in self._mem_cache:
+                return self._mem_cache[mem_key]
 
         # Disk cache
         cache_key = [path] + [f"{k}={params[k]}" for k in sorted(params)]
         cached = self._disk_cache.get("binance", cache_key)
         if cached is not None:
-            self._mem_cache[mem_key] = cached
+            with self._mem_lock:
+                self._mem_cache[mem_key] = cached
             return cached
 
         # HTTP request with retry
@@ -489,5 +497,6 @@ class BinanceClient:
                 continue
 
             self._disk_cache.set("binance", cache_key, payload)
-            self._mem_cache[mem_key] = payload
+            with self._mem_lock:
+                self._mem_cache[mem_key] = payload
             return payload

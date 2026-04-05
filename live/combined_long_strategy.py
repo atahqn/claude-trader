@@ -528,6 +528,10 @@ class CombinedLongStrategy(SignalGenerator):
         self._candle_buffers: dict[str, list] = {}
         self._last_poll_time: datetime | None = None
 
+    @property
+    def cooldown_hours(self) -> float:
+        return self.cooldown_h
+
     def __str__(self) -> str:
         parts = [
             f"CombinedLong(br>={self.breadth_pct:.0%}",

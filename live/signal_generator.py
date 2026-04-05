@@ -89,6 +89,15 @@ class SignalGenerator(ABC):
             ),
         )
 
+    @property
+    def cooldown_hours(self) -> float:
+        """Minimum hours between signals for the same symbol.
+
+        Used by the parallel evaluator to enforce cooldown across chunk
+        boundaries.  Override if your strategy enforces a cooldown.
+        """
+        return 0.0
+
     @abstractmethod
     def poll(self) -> Signal | list[Signal] | None:
         """Return new signal(s), or ``None`` when the strategy has nothing to do."""

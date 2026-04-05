@@ -141,6 +141,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--data-max-workers",
+        type=int,
+        default=8,
+        help="Max threads for parallel symbol data fetching (default: 8).",
+    )
+    parser.add_argument(
+        "--backtest-max-workers",
+        type=int,
+        default=0,
+        help="Max threads for parallel signal backtesting (0 = auto, caps at 16; 1 = sequential).",
+    )
+    parser.add_argument(
         "--output-dir",
         default="",
         help="Optional output directory. Defaults to outputs/strategy_eval/<strategy>_<windows>_<mode>_<timestamp>.",
@@ -413,11 +425,33 @@ def main() -> int:
                 if args.entry_delay_seconds is not None
                 else PortfolioConfig().entry_delay_seconds
             ),
+            data_max_workers=args.data_max_workers,
+            backtest_max_workers=args.backtest_max_workers,
         )
+        # Build a strategy factory for parallel signal generation.
+        strategy_factory = None
+        if len(args.strategy) == 1:
+            spec = args.strategy[0]
+            module_spec, _, attr_name = spec.partition(":")
+            module_name = _normalize_module_name(module_spec)
+            if attr_name:
+                strategy_factory = (module_name, attr_name, strategy_kwargs)
+        else:
+            # Composite: list of (module, class, {}) tuples.
+            parts = []
+            for spec in args.strategy:
+                module_spec, _, attr_name = spec.partition(":")
+                if not attr_name:
+                    parts = None
+                    break
+                parts.append((_normalize_module_name(module_spec), attr_name, {}))
+            strategy_factory = parts
+
         evaluator = StrategyEvaluator(
             symbols=symbols,
             config=config,
             cooldown_warmup=timedelta(days=args.cooldown_warmup_days),
+            strategy_factory=strategy_factory,
         )
         report = evaluator.evaluate(strategy, windows)
         summary = report.overall_summary()

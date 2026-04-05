@@ -73,9 +73,10 @@ def fetch_market_context_bundle(
     start: datetime,
     end: datetime,
     request: MarketDataRequest,
+    max_workers: int = 8,
 ) -> MarketContextBundle:
     return build_market_context_bundle(
-        client.fetch_market_data_bundle(symbols, start, end, request)
+        client.fetch_market_data_bundle(symbols, start, end, request, max_workers=max_workers)
     )
 
 

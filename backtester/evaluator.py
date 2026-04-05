@@ -8,18 +8,26 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import random as _random_module
 from bisect import bisect_left
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from .engine import DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS, backtest_signals
+from .engine import (
+    DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS,
+    _compute_stats,
+    _process_batch,
+    backtest_signals,
+)
 from .eval_windows import CATEGORY_DESCRIPTIONS, EvalWindow
-from .models import BacktestResult, ExitReason, PositionType
-from .pipeline import BacktestExecutionSession, prepare_market_context
+from .models import BacktestResult, ExitReason, PositionType, Signal, TradeResult
+from .pipeline import BacktestExecutionSession, PreparedMarketContext, prepare_market_context
 
 if TYPE_CHECKING:
     from live.signal_generator import SignalGenerator
@@ -60,6 +68,8 @@ class PortfolioConfig:
     seed: int | None = None
     risk_free_rate_annual: float = DEFAULT_USD_RISK_FREE_RATE_ANNUAL
     entry_delay_seconds: int = DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS
+    data_max_workers: int = 8
+    backtest_max_workers: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +466,9 @@ class EvaluationReport:
                 "approximate": self.config.approximate,
                 "seed": self.config.seed,
                 "risk_free_rate_annual": self.config.risk_free_rate_annual,
+                "entry_delay_seconds": self.config.entry_delay_seconds,
+                "data_max_workers": self.config.data_max_workers,
+                "backtest_max_workers": self.config.backtest_max_workers,
             },
             "total_windows": len(self.window_results),
             "windows": [
@@ -500,6 +513,285 @@ def _format_metric(value: float, *, width: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Period-level parallel backtesting
+# ---------------------------------------------------------------------------
+
+
+def _resolve_signals_parallel(
+    *,
+    signals: list[Signal],
+    approximate: bool,
+    seed: int | None,
+    entry_delay_seconds: int,
+    max_workers: int,
+    client: object = None,
+) -> list[TradeResult]:
+    """Resolve a flat list of signals in parallel using ProcessPoolExecutor.
+
+    Each process creates its own BinanceClient (with shared disk cache).
+    No PreparedMarketContext is passed — processes use the disk cache directly.
+    Returns trades in the same order as the input signals.
+    """
+    if not signals:
+        return []
+
+    parent_rng = _random_module.Random(seed)
+    signal_seeds = [parent_rng.getrandbits(64) for _ in signals]
+
+    def _sequential() -> list[TradeResult]:
+        c = client
+        if c is None:
+            from .data import BinanceClient
+            c = BinanceClient()
+        session = BacktestExecutionSession(client=c)
+        from .engine import backtest_signal
+
+        trades: list[TradeResult] = []
+        for signal, sig_seed in zip(signals, signal_seeds):
+            rng = _random_module.Random(sig_seed)
+            trades.append(backtest_signal(
+                signal, approximate=approximate, rng=rng,
+                session=session, default_entry_delay_seconds=entry_delay_seconds,
+            ))
+        return trades
+
+    effective_workers = (
+        min(len(signals), max_workers or (os.cpu_count() or 4))
+        if max_workers != 1
+        else 1
+    )
+
+    if effective_workers <= 1:
+        return _sequential()
+
+    indexed = [
+        (i, sig, sig_seed)
+        for i, (sig, sig_seed) in enumerate(zip(signals, signal_seeds))
+    ]
+    batch_size = math.ceil(len(indexed) / effective_workers)
+    batches = [indexed[i : i + batch_size] for i in range(0, len(indexed), batch_size)]
+
+    try:
+        all_indexed: list[tuple[int, TradeResult]] = []
+        with ProcessPoolExecutor(max_workers=len(batches)) as pool:
+            futures = [
+                pool.submit(
+                    _process_batch, batch, approximate, entry_delay_seconds, None,
+                )
+                for batch in batches
+            ]
+            for future in as_completed(futures):
+                all_indexed.extend(future.result())
+        all_indexed.sort(key=lambda x: x[0])
+        return [t for _, t in all_indexed]
+    except (TypeError, AttributeError):
+        return _sequential()
+
+
+def _backtest_period(
+    *,
+    window_slices: list[tuple[EvalWindow, list[Signal], int, int]],
+    ctx: PreparedMarketContext,
+    approximate: bool,
+    seed: int | None,
+    entry_delay_seconds: int,
+    max_workers: int,
+    client: object,
+) -> list[BacktestResult]:
+    """Backtest all signals in a period, optionally using multiprocessing.
+
+    Collects signals from all windows, batches them across worker processes,
+    then re-distributes results to per-window BacktestResults.
+    """
+    import os
+    import random as _random_module
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    # Flatten all window signals into one list with (global_idx, window_idx) tracking.
+    all_signals: list[Signal] = []
+    window_offsets: list[tuple[int, int]] = []  # (start_idx, count) per window
+    for _, w_sigs, _, _ in window_slices:
+        offset = len(all_signals)
+        all_signals.extend(w_sigs)
+        window_offsets.append((offset, len(w_sigs)))
+
+    # Empty period — return empty results for each window.
+    if not all_signals:
+        return [
+            BacktestResult(trades=[], **_compute_stats([]))
+            for _ in window_slices
+        ]
+
+    # Derive deterministic per-signal seeds.
+    parent_rng = _random_module.Random(seed)
+    signal_seeds = [parent_rng.getrandbits(64) for _ in all_signals]
+
+    effective_workers = (
+        min(len(all_signals), max_workers or (os.cpu_count() or 4))
+        if max_workers != 1
+        else 1
+    )
+
+    if effective_workers <= 1:
+        # Sequential path.
+        session = BacktestExecutionSession(client=client, prepared_context=ctx)
+        from .engine import backtest_signal
+
+        all_trades: list[TradeResult] = []
+        for signal, sig_seed in zip(all_signals, signal_seeds):
+            rng = _random_module.Random(sig_seed)
+            result = backtest_signal(
+                signal,
+                approximate=approximate,
+                rng=rng,
+                session=session,
+                default_entry_delay_seconds=entry_delay_seconds,
+            )
+            all_trades.append(result)
+    else:
+        # Parallel path — batch across processes.
+        indexed = [
+            (i, sig, sig_seed)
+            for i, (sig, sig_seed) in enumerate(zip(all_signals, signal_seeds))
+        ]
+        batch_size = math.ceil(len(indexed) / effective_workers)
+        batches = [
+            indexed[i : i + batch_size]
+            for i in range(0, len(indexed), batch_size)
+        ]
+
+        try:
+            all_indexed: list[tuple[int, TradeResult]] = []
+            with ProcessPoolExecutor(max_workers=len(batches)) as pool:
+                futures = [
+                    pool.submit(
+                        _process_batch,
+                        batch,
+                        approximate,
+                        entry_delay_seconds,
+                        ctx,
+                    )
+                    for batch in batches
+                ]
+                for future in as_completed(futures):
+                    all_indexed.extend(future.result())
+            all_indexed.sort(key=lambda x: x[0])
+            all_trades = [t for _, t in all_indexed]
+        except (TypeError, AttributeError):
+            # Context or signals not picklable — fall back to sequential.
+            session = BacktestExecutionSession(client=client, prepared_context=ctx)
+            from .engine import backtest_signal
+
+            all_trades = []
+            for signal, sig_seed in zip(all_signals, signal_seeds):
+                rng = _random_module.Random(sig_seed)
+                all_trades.append(backtest_signal(
+                    signal, approximate=approximate, rng=rng,
+                    session=session,
+                    default_entry_delay_seconds=entry_delay_seconds,
+                ))
+
+
+    # Re-distribute trades to per-window results.
+    results: list[BacktestResult] = []
+    for start_idx, count in window_offsets:
+        window_trades = all_trades[start_idx : start_idx + count]
+        window_trades.sort(key=lambda t: t.entry_time)
+        results.append(BacktestResult(trades=window_trades, **_compute_stats(window_trades)))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Cooldown enforcement across chunk/period boundaries
+# ---------------------------------------------------------------------------
+
+
+def _enforce_cooldown(
+    signals: list[Signal],
+    cooldown_hours: float,
+) -> list[Signal]:
+    """Remove signals that violate per-symbol cooldown.
+
+    Expects *signals* sorted by ``signal_date``.  Keeps the first signal
+    for each symbol and drops any subsequent signal within *cooldown_hours*
+    of the previous kept signal for the same symbol.
+    """
+    if cooldown_hours <= 0:
+        return signals
+    last_by_symbol: dict[str, datetime] = {}
+    kept: list[Signal] = []
+    for sig in signals:
+        sym = sig.ticker
+        last = last_by_symbol.get(sym)
+        if last is not None:
+            hours = (sig.signal_date - last).total_seconds() / 3600.0
+            if hours < cooldown_hours:
+                continue
+        last_by_symbol[sym] = sig.signal_date
+        kept.append(sig)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# Parallel signal generation worker (top-level for pickle)
+# ---------------------------------------------------------------------------
+
+
+# A strategy factory is either a single (module, class, kwargs) tuple or
+# a list of them for composite strategies.
+StrategyFactory = (
+    tuple[str, str, dict[str, Any]]
+    | list[tuple[str, str, dict[str, Any]]]
+)
+
+
+def _build_generator_from_factory(
+    factory: StrategyFactory,
+) -> Any:
+    """Reconstruct a SignalGenerator from a factory spec."""
+    import importlib
+
+    if isinstance(factory, list):
+        from live.signal_generator import CompositeSignalGenerator
+
+        generators = [_build_generator_from_factory(f) for f in factory]
+        return CompositeSignalGenerator(generators)
+
+    module_name, class_name, kwargs = factory
+    module = importlib.import_module(module_name)
+    strategy_cls = getattr(module, class_name)
+    return strategy_cls(**kwargs)
+
+
+def _generate_period_signals(
+    period_idx: int,
+    strategy_factory: StrategyFactory,
+    symbols: list[str],
+    signal_start: datetime,
+    signal_end: datetime,
+    fetch_end: datetime,
+    request: Any,
+    warmup_bars: int,
+    data_max_workers: int,
+) -> tuple[int, PreparedMarketContext, list[Signal]]:
+    """Worker: create a fresh strategy + client, generate signals for one period."""
+    from .data import BinanceClient
+
+    generator = _build_generator_from_factory(strategy_factory)
+
+    client = BinanceClient()
+    ctx = prepare_market_context(
+        symbols, signal_start, fetch_end,
+        client=client, request=request,
+        warmup_bars=warmup_bars,
+        max_workers=data_max_workers,
+    )
+    signals = generator.generate_backtest_signals(ctx, symbols, signal_start, signal_end)
+    signals.sort(key=lambda s: s.signal_date)
+    return period_idx, ctx, signals
+
+
+# ---------------------------------------------------------------------------
 # Evaluator
 # ---------------------------------------------------------------------------
 
@@ -513,10 +805,12 @@ class StrategyEvaluator:
         config: PortfolioConfig = PortfolioConfig(),
         client: BinanceClient | None = None,
         cooldown_warmup: timedelta = timedelta(days=14),
+        strategy_factory: tuple[str, str, dict[str, Any]] | None = None,
     ) -> None:
         self._symbols = symbols
         self._config = config
         self._cooldown_warmup = cooldown_warmup
+        self._strategy_factory = strategy_factory
         if client is None:
             from .data import BinanceClient as _BinanceClient
 
@@ -534,63 +828,166 @@ class StrategyEvaluator:
             gap_threshold=self._cooldown_warmup,
         )
 
-        all_window_results: list[WindowResult] = []
+        request = generator.market_data_request()
+        max_w = self._config.data_max_workers or (os.cpu_count() or 4)
+        can_parallel = self._strategy_factory is not None and max_w > 1
+        cooldown_h = generator.cooldown_hours
 
+        # ------------------------------------------------------------------
+        # Build chunk list: subdivide periods so we have >= max_w chunks.
+        # Each chunk: (chunk_idx, period_idx, windows, sig_start, sig_end,
+        #              fetch_end)
+        # ------------------------------------------------------------------
+        period_params: list[tuple[list[EvalWindow], datetime, datetime, datetime]] = []
         for period_windows in periods:
             earliest_start = min(w.start for w in period_windows)
             latest_end = max(w.end for w in period_windows)
-
             signal_start = earliest_start - self._cooldown_warmup
             signal_end = latest_end
             fetch_end = signal_end + timedelta(hours=_DATA_BUFFER_HOURS)
+            period_params.append((period_windows, signal_start, signal_end, fetch_end))
 
-            request = generator.market_data_request()
-            ctx = prepare_market_context(
-                self._symbols,
-                signal_start,
-                fetch_end,
-                client=self._client,
-                request=request,
-                warmup_bars=100,
-            )
+        chunks: list[tuple[int, int, list[EvalWindow], datetime, datetime, datetime]] = []
+        chunk_idx = 0
+        for period_idx, (pw, sig_start, sig_end, fetch_end) in enumerate(period_params):
+            period_dur = sig_end - sig_start
+            # Subdivide if parallel is available and the period is large
+            # enough relative to the number of workers.
+            _MIN_CHUNK_DUR = timedelta(days=7)
+            n_chunks = 1
+            if can_parallel and len(periods) < max_w:
+                # Subdivide so each chunk is at least 1 week.
+                n_chunks = min(
+                    max(1, max_w // max(len(periods), 1)),
+                    max(1, int(period_dur / _MIN_CHUNK_DUR)),
+                )
+            if n_chunks > 1:
+                chunk_dur = period_dur / n_chunks
+                for ci in range(n_chunks):
+                    c_sig_start = sig_start + chunk_dur * ci
+                    c_sig_end = sig_start + chunk_dur * (ci + 1)
+                    if ci == n_chunks - 1:
+                        c_sig_end = sig_end  # avoid float drift
+                    c_fetch_end = c_sig_end + timedelta(hours=_DATA_BUFFER_HOURS)
+                    chunks.append((chunk_idx, period_idx, pw, c_sig_start, c_sig_end, c_fetch_end))
+                    chunk_idx += 1
+            else:
+                chunks.append((chunk_idx, period_idx, pw, sig_start, sig_end, fetch_end))
+                chunk_idx += 1
 
-            all_signals = generator.generate_backtest_signals(
-                ctx, self._symbols, signal_start, signal_end,
-            )
-            all_signals.sort(key=lambda s: s.signal_date)
+        # ------------------------------------------------------------------
+        # Phase 1: Signal generation — parallel across chunks.
+        # ------------------------------------------------------------------
+        # Result per chunk: (chunk_idx, period_idx, ctx, signals)
+        chunk_results: list[tuple[int, int, PreparedMarketContext, list[Signal]]]
 
-            session = BacktestExecutionSession(
-                client=self._client,
-                prepared_context=ctx,
-            )
+        if not can_parallel or len(chunks) <= 1:
+            chunk_results = []
+            for ci, period_idx, pw, sig_start, sig_end, fetch_end in chunks:
+                ctx = prepare_market_context(
+                    self._symbols, sig_start, fetch_end,
+                    client=self._client, request=request,
+                    warmup_bars=100, max_workers=self._config.data_max_workers,
+                )
+                sigs = generator.generate_backtest_signals(
+                    ctx, self._symbols, sig_start, sig_end,
+                )
+                sigs.sort(key=lambda s: s.signal_date)
+                chunk_results.append((ci, period_idx, ctx, sigs))
+        else:
+            try:
+                chunk_results = []
+                effective_w = min(len(chunks), max_w)
+                with ProcessPoolExecutor(max_workers=effective_w) as pool:
+                    futures = {
+                        pool.submit(
+                            _generate_period_signals,
+                            ci,
+                            self._strategy_factory,
+                            list(self._symbols),
+                            sig_start, sig_end, fetch_end,
+                            request, 100,
+                            1,  # data_max_workers=1 inside each process
+                        ): (ci, period_idx)
+                        for ci, period_idx, _, sig_start, sig_end, fetch_end in chunks
+                    }
+                    for future in as_completed(futures):
+                        ci, period_idx = futures[future]
+                        result_ci, ctx, sigs = future.result()
+                        chunk_results.append((ci, period_idx, ctx, sigs))
+                chunk_results.sort(key=lambda x: x[0])
+            except (TypeError, AttributeError):
+                chunk_results = []
+                for ci, period_idx, pw, sig_start, sig_end, fetch_end in chunks:
+                    ctx = prepare_market_context(
+                        self._symbols, sig_start, fetch_end,
+                        client=self._client, request=request,
+                        warmup_bars=100, max_workers=self._config.data_max_workers,
+                    )
+                    sigs = generator.generate_backtest_signals(
+                        ctx, self._symbols, sig_start, sig_end,
+                    )
+                    sigs.sort(key=lambda s: s.signal_date)
+                    chunk_results.append((ci, period_idx, ctx, sigs))
 
-            for window in period_windows:
-                lo = bisect_left(all_signals, window.start, key=lambda s: s.signal_date)
-                hi = bisect_left(all_signals, window.end, key=lambda s: s.signal_date)
-                w_sigs = all_signals[lo:hi]
+        # ------------------------------------------------------------------
+        # Merge chunks per period and enforce cooldown.
+        # ------------------------------------------------------------------
+        period_signals: dict[int, list[Signal]] = defaultdict(list)
+        for _, period_idx, _, sigs in chunk_results:
+            period_signals[period_idx].extend(sigs)
+
+        for period_idx in period_signals:
+            merged = sorted(period_signals[period_idx], key=lambda s: s.signal_date)
+            period_signals[period_idx] = _enforce_cooldown(merged, cooldown_h)
+
+        # ------------------------------------------------------------------
+        # Phase 2: Backtest resolution — batch ALL signals, resolve in parallel.
+        # ------------------------------------------------------------------
+        all_signals_flat: list[Signal] = []
+        window_info: list[tuple[EvalWindow, int, int, int, int]] = []
+
+        for period_idx, (pw, _, _, _) in enumerate(period_params):
+            sigs = period_signals.get(period_idx, [])
+            for window in pw:
+                lo = bisect_left(sigs, window.start, key=lambda s: s.signal_date)
+                hi = bisect_left(sigs, window.end, key=lambda s: s.signal_date)
+                w_sigs = sigs[lo:hi]
                 short_count = sum(
                     1 for s in w_sigs if s.position_type is PositionType.SHORT
                 )
                 long_count = len(w_sigs) - short_count
+                offset = len(all_signals_flat)
+                all_signals_flat.extend(w_sigs)
+                window_info.append((window, short_count, long_count, offset, len(w_sigs)))
 
-                result = backtest_signals(
-                    w_sigs,
-                    client=self._client,
-                    approximate=self._config.approximate,
-                    seed=self._config.seed,
-                    session=session,
-                    default_entry_delay_seconds=self._config.entry_delay_seconds,
-                )
+        if all_signals_flat:
+            all_trades = _resolve_signals_parallel(
+                signals=all_signals_flat,
+                approximate=self._config.approximate,
+                seed=self._config.seed,
+                entry_delay_seconds=self._config.entry_delay_seconds,
+                max_workers=self._config.backtest_max_workers,
+                client=self._client,
+            )
+        else:
+            all_trades = []
 
-                all_window_results.append(
-                    WindowResult(
-                        window=window,
-                        backtest=result,
-                        signal_count=len(w_sigs),
-                        short_count=short_count,
-                        long_count=long_count,
-                    )
+        # Re-distribute trades to per-window results.
+        all_window_results: list[WindowResult] = []
+        for window, short_count, long_count, offset, count in window_info:
+            window_trades = all_trades[offset : offset + count]
+            window_trades.sort(key=lambda t: t.entry_time)
+            stats = _compute_stats(window_trades)
+            all_window_results.append(
+                WindowResult(
+                    window=window,
+                    backtest=BacktestResult(trades=window_trades, **stats),
+                    signal_count=len(window_trades),
+                    short_count=short_count,
+                    long_count=long_count,
                 )
+            )
 
         return EvaluationReport(
             window_results=all_window_results,
