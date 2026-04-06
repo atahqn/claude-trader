@@ -43,9 +43,8 @@ still developing or selecting the strategy.
 
 ## Research Preparation
 
-1. Read README.md and STRATEGY_EVOLUTION.MD . 
-2. Discuss with the user on what to research. Usually 
-    STRATEGY_EVOLUTION.md file has some proposals or suggests ways for future research. Note that research direction could be very general like improving some previous strategy. 
+1. Read README.md. 
+2. Discuss with the user on what to research. Note that research direction could be very general like improving some previous strategy. 
 3. Before starting your research you should understand the current baseline for your area. Discuss the current baseline and determine the 'preference_score' of the baseline.
 4. Create a directory with proper name for your research under the claude-trader.
 5. Create the strategy file that implements the SignalGenerator class under this folder. You can import other logic from other folders but the SignalGenerator implementation must be here.
@@ -55,7 +54,7 @@ still developing or selecting the strategy.
 ## Approval Gate
 
 HARD STOP: Before any research begins, you must:
-1. Read README.md and STRATEGY_EVOLUTION.md
+1. Read README.md 
 2. Identify the current baseline and its exact preference_score
 3. Propose a research area to the user
 4. Ask for explicit approval
@@ -95,8 +94,8 @@ The allowed workflow is:
 
 - during development, run `python run_strategy_eval.py --strategy ... --windows development --approximate` to understand how strategy performs and refine it. 
     You are encouraged to use --aproximate mode while researching for efficiency.
-- after the idea is frozen, run `python run_strategy_eval.py --strategy ... --windows evaluation`. Evaluate in exact mode. Approximate results are good ways to compare strategies
-but final strategies performance should be reported as exact score.
+- after the idea is frozen, run `python run_strategy_eval.py --strategy ... --windows evaluation` --aproximate. Use approximate mode in all your research.
+
 - use the evaluation result only to understand how good the final idea actually is. Do not use eval windows when developing! 
 
 But the strategy is only considered to have generalized if it performs well on

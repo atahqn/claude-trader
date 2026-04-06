@@ -1,99 +1,217 @@
 # claude-trader
+
 Bu kod, Cevat Ticari Şirketinin mülkiyetindedir. Şirketin yazılı izni (cevat.ticari@cevat.com) olmadan kullanılması, Türkiye Cumhuriyeti yasalarının 3149'uncu maddesinin 7'nci fıkrası uyarınca kesinlike yasaktır 😂.
 
-This codebase is designed for LLMs to draft and backtest their strategies and to later deploy them.
+A framework for drafting, backtesting, and live-deploying crypto trading
+strategies on Binance Futures. The two core paths — backtesting and live
+trading — share a single abstraction: the **SignalGenerator**. You write one
+strategy class and it works in both contexts.
+
+```
+claude-trader/
+├── backtester/                 # Backtest engine & evaluation pipeline
+│   ├── models.py               # Signal, TradeResult, BacktestResult
+│   ├── pipeline.py             # PreparedMarketContext, BacktestExecutionSession
+│   ├── evaluator.py            # StrategyEvaluator, EvaluationReport
+│   ├── engine.py               # backtest_signal(), backtest_signals()
+│   ├── validation.py           # validate_no_lookahead()
+│   └── data.py                 # BinanceClient (cached API fetcher)
+├── live/                       # Live trading engine
+│   ├── signal_generator.py     # SignalGenerator base class
+│   ├── engine.py               # LiveEngine (main loop)
+│   ├── executor.py             # OrderExecutor (signal → exchange orders)
+│   ├── tracker.py              # PositionTracker (position lifecycle)
+│   ├── models.py               # LiveConfig, LivePosition, GeneratorBudget
+│   └── run.py                  # Entry point for live trading
+├── marketdata/
+│   └── models.py               # MarketDataRequest, SymbolMarketContext
+└── run_strategy_eval.py        # Entry point for backtest evaluation
+```
 
 
-## Backtester Architecture
+## SignalGenerator — The Core Abstraction
 
-The shared backtester now supports a staged research pipeline:
+**File:** `live/signal_generator.py`
 
-1. `prepare_market_context(...)`
-   Fetch hourly market data once per symbol for the backtest interval plus
-   warmup, with optional listing-history futures datasets via
-   `MarketDataRequest` (`funding_rates`, `mark_price_klines`,
-   `premium_index_klines`). If a strategy requests a lower
-   `poll_interval` than its analysis interval, the prepared context also
-   carries the lower-timeframe poll candles needed for preview-style replay.
-2. Feature stage
-   Strategies compute aligned symbol-level features once from prepared hourly
-   context.
-3. Signal stage
-   Strategies generate candidate `Signal` objects from prepared context instead
-   of fetching candles internally. Live strategies that support historical
-   replay expose `generate_backtest_signals(...)` through the shared
-   `SignalGenerator` interface. This supports both close-only replay and
-   lower poll-interval replay such as `1h` analysis with `15m`, `5m`, or
-   `1m` polling.
-4. Evaluation stage
-   `StrategyEvaluator` groups windows into contiguous fetch periods, reuses a
-   shared `BacktestExecutionSession`, and resolves each scored window through
-   `backtest_signals(...)`.
-5. Validation stage
-   `validate_no_lookahead(...)` replays sampled signals against truncated
-   market context to catch future-data leaks in signal generation.
-6. Execution stage
-   Exact resolution uses a shared `BacktestExecutionSession` with chunked lazy
-   caches for `1m` candles and `aggTrades`, so overlapping trades reuse the
-   same exact data windows.
+Every strategy extends `SignalGenerator`. It declares two methods that make the
+strategy work across both paths:
 
-### New Shared Entry Points
+| Method | Used by | Purpose |
+|--------|---------|---------|
+| `poll()` | Live engine | Returns `Signal`(s) for the current market state during live trading |
+| `generate_backtest_signals(prepared_context, symbols, start, end)` | Backtester | Returns all `Signal`s for a historical window using prepared market data |
 
-- `backtester.StrategyEvaluator`
-- `backtester.validate_no_lookahead`
-- `backtester.prepare_market_context`
-- `backtester.BacktestExecutionSession`
-- `backtester.DEVELOPMENT_WINDOWS`
-- `backtester.EVALUATION_WINDOWS`
-- `backtester.ALL_WINDOWS`
+Both methods produce the same `Signal` object (`backtester/models.py`), which
+carries everything needed to execute a trade: ticker, direction, TP/SL levels,
+leverage, entry type, and timing constraints.
 
-`backtest_signal()` remains available as the compatibility fallback for direct
-single-signal evaluation.
+A strategy also declares:
 
-### Evaluation Standard
+- **`symbols`** — which tickers it trades
+- **`market_data_request()`** — what datasets it needs (OHLCV, funding rates, mark price klines, etc.)
+- **`analysis_interval`** / **`poll_interval`** — candle timeframe for analysis and optional faster polling
+- **`cooldown_hours`** — minimum time between signals on the same symbol
 
-Strategy evaluation should use the shared evaluator and the
-coded window calendar instead of one-off `*_eval.py` scripts.
+### Signal
 
-- Development: `DEVELOPMENT_WINDOWS`
-- Evaluation: `EVALUATION_WINDOWS`
-- Full report: `ALL_WINDOWS`
-- One-time signal-generation bias check per strategy version:
-  `validate_no_lookahead(...)`
+**File:** `backtester/models.py`
+
+A `Signal` is the contract between strategy logic and execution. Key fields:
+
+- `signal_date`, `ticker`, `position_type` (LONG/SHORT)
+- `tp_pct` / `sl_pct` or `tp_price` / `sl_price` — exit levels
+- `leverage`, `entry_price` (None = market order, else limit)
+- `entry_delay_seconds`, `fill_timeout_seconds`, `max_holding_hours`
+- `size_multiplier`, `metadata`
+
+The same Signal object is interpreted by both the backtester's resolution
+engine and the live order executor.
+
+
+## Backtesting
+
+The backtester evaluates a `SignalGenerator` across canonical time windows.
+The entry point is `run_strategy_eval.py`.
+
+### Pipeline
+
+1. **Market data preparation** (`backtester/pipeline.py` →
+   `prepare_market_context()`): fetches hourly candles (plus optional datasets
+   like funding rates) for all symbols across the evaluation period, including
+   warmup bars for indicator computation.
+
+2. **Signal generation**: the evaluator calls
+   `generator.generate_backtest_signals(prepared_context, symbols, start, end)`.
+   The strategy iterates over the prepared candles and returns `Signal` objects.
+   This is the method every strategy **must implement** to be backtestable.
+
+3. **Signal resolution** (`backtester/engine.py` → `backtest_signal()`):
+   each signal is resolved into a `TradeResult` using a multi-level fallback:
+   agg trades (tick-level) → 1m candles → 1h candles. Market data is fetched
+   on demand via `BacktestExecutionSession` with shared disk caches.
+
+4. **Aggregation** (`backtester/evaluator.py` → `StrategyEvaluator`):
+   groups windows into contiguous fetch periods for efficiency, runs signal
+   generation and resolution in parallel, and produces an `EvaluationReport`
+   with per-window and per-category metrics (win rate, PnL, drawdown, profit
+   factor).
+
+5. **Lookahead validation** (`backtester/validation.py` →
+   `validate_no_lookahead()`): truncates market context to each signal's
+   timestamp and re-runs generation. If a signal disappears, it was using
+   future data.
+
+### Evaluation Windows
+
+The evaluator uses a coded window calendar instead of ad-hoc date ranges:
+
+- `DEVELOPMENT_WINDOWS` — tune and iterate
+- `EVALUATION_WINDOWS` — out-of-sample generalization check
+- `ALL_WINDOWS` — full report
 
 ### Drawdown Semantics
 
-When `run_strategy_eval.py` prints the category table, each row's `DD` is
-recomputed from the resolved trades in that category only, in chronological
-order after filtering to that category. The summary line's `MDD` is the `ALL`
-row drawdown, computed from the full chronological trade stream across every
-selected window.
+In the category table output, each row's `DD` is computed from trades in that
+category only. The summary `MDD` is computed from the full chronological trade
+stream across all selected windows.
 
 
-## Live Functionality
+## Live Trading
 
-The live layer is responsible for:
+The live engine polls signal generators on their declared interval, converts
+signals to exchange orders, and manages positions through their full lifecycle.
+The entry point is `live/run.py`.
 
-- loading exchange credentials and runtime settings
-- polling signal generators
-- checking capital and position-slot availability before execution
-- submitting entries and protective exits
-- tracking open positions and timeouts
-- reconciling local state with exchange state
+### Components
 
-Configuration can be loaded from environment variables or
-`~/.claude_trader/live_config.json`. The live runner scripts also accept
-`--config /path/to/live_config.json` to read a specific JSON config file.
-Signal-generation parameters such as ATR gates, TP/SL percentages, RSI
-thresholds, and other strategy logic stay in strategy code and generated
-signals, while live runtime controls stay in live config.
+**LiveEngine** (`live/engine.py`): the main loop. Each registered generator
+gets a `_GeneratorSlot` with its own budget and poll schedule. On each tick the
+engine:
+1. Checks fills on pending/open positions via the tracker
+2. Polls each generator whose interval boundary has passed
+3. For each returned signal, checks capital and slot availability, then hands
+   it to the executor
 
-Environment variables:
+**OrderExecutor** (`live/executor.py`): converts a `Signal` into exchange
+orders — sets leverage, computes quantity, places the entry order (market or
+limit), then places TP/SL bracket orders after fill.
 
-- `BINANCE_API_KEY`
-- `BINANCE_API_SECRET`
-- `BINANCE_BASE_URL`
-- `BINANCE_POSITION_SIZE`
-- `BINANCE_MAX_POSITIONS`
-- `BINANCE_ORDER_CHECK_INTERVAL`
-- `BINANCE_TESTNET`
+**PositionTracker** (`live/tracker.py`): manages position state
+(`PENDING_ENTRY` → `OPEN` → `CLOSED`/`FAILED`), persists state to
+`~/.claude_trader/live_state.json` so positions survive restarts, and
+reconciles with the exchange on startup.
+
+### Multi-Strategy Support
+
+`LiveEngine` accepts multiple `(generator, GeneratorBudget)` pairs. It
+validates that symbol spaces are disjoint (no symbol traded by two generators)
+and polls each on its own schedule. For backtesting the same composition, use
+`CompositeSignalGenerator` from `live/signal_generator.py`.
+
+### Configuration
+
+Loaded from environment variables or `~/.claude_trader/live_config.json`.
+The `--config` flag overrides the default path.
+
+| Variable | Purpose |
+|----------|---------|
+| `BINANCE_API_KEY` | API key |
+| `BINANCE_API_SECRET` | API secret |
+| `BINANCE_BASE_URL` | Endpoint (default: `https://fapi.binance.com`) |
+| `BINANCE_POSITION_SIZE` | Position size in USDT |
+| `BINANCE_MAX_POSITIONS` | Max concurrent positions |
+| `BINANCE_ORDER_CHECK_INTERVAL` | Seconds between fill checks |
+| `BINANCE_TESTNET` | Use testnet |
+
+Strategy parameters (TP/SL, thresholds, gates) live in strategy code and the
+signals they produce — not in live config.
+
+
+## Writing a Strategy
+
+```python
+from live.signal_generator import SignalGenerator
+from backtester.models import Signal, PositionType
+from backtester.pipeline import PreparedMarketContext
+
+class MyStrategy(SignalGenerator):
+    @property
+    def symbols(self):
+        return ["BTCUSDT", "ETHUSDT"]
+
+    def generate_backtest_signals(self, prepared_context, symbols, start, end):
+        signals = []
+        for symbol in symbols:
+            candles = prepared_context.slice_analysis_candles(symbol, start, end)
+            for c in candles:
+                if some_condition(c):
+                    signals.append(Signal(
+                        signal_date=c.close_time,
+                        position_type=PositionType.LONG,
+                        ticker=symbol,
+                        tp_pct=3.0,
+                        sl_pct=1.5,
+                    ))
+        return signals
+
+    def poll(self):
+        # Live: check current market, return Signal or None
+        return None
+```
+
+**Backtest it:**
+```bash
+python run_strategy_eval.py --strategy my_strategy.py:MyStrategy --windows development
+```
+
+**Deploy it live:**
+```python
+from live.engine import LiveEngine
+from live.models import LiveConfig, GeneratorBudget
+
+engine = LiveEngine(
+    generators=[(MyStrategy(), GeneratorBudget(position_size_usdt=100, max_positions=3))],
+    config=LiveConfig.load(),
+)
+engine.start()
+```
