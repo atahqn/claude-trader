@@ -157,6 +157,29 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional output directory. Defaults to outputs/strategy_eval/<strategy>_<windows>_<mode>_<timestamp>.",
     )
+    parser.add_argument(
+        "--equity-curve",
+        action="store_true",
+        default=False,
+        help="Generate a granular equity curve plot from intermediate candle data.",
+    )
+    parser.add_argument(
+        "--equity-interval",
+        default="15m",
+        help="Candle interval for equity curve granularity (default: 15m).",
+    )
+    parser.add_argument(
+        "--position-size-usdt",
+        type=float,
+        default=10_000.0,
+        help="Position size in USDT per trade for equity curve (default: 10000).",
+    )
+    parser.add_argument(
+        "--starting-capital",
+        type=float,
+        default=10_000.0,
+        help="Starting capital in USDT for equity curve (default: 10000).",
+    )
     return parser.parse_args()
 
 
@@ -488,6 +511,38 @@ def main() -> int:
             table=report.format_table(),
             resolution_breakdown=resolution_breakdown,
         )
+
+        if args.equity_curve:
+            from backtester.data import BinanceClient
+            from backtester.equity_curve import (
+                compute_granular_equity_curve,
+                plot_equity_curve,
+                save_equity_csv,
+            )
+
+            all_trades = [t for wr in report.window_results for t in wr.backtest.trades]
+            client = BinanceClient()
+            points = compute_granular_equity_curve(
+                all_trades,
+                client,
+                interval=args.equity_interval,
+                position_size_usdt=args.position_size_usdt,
+                starting_capital=args.starting_capital,
+                max_workers=args.data_max_workers,
+            )
+            if points:
+                curve_title = f"{strategy_name} \u2014 Equity Curve ({args.equity_interval})"
+                plot_path = plot_equity_curve(
+                    points,
+                    saved_dir / "equity_curve.html",
+                    title=curve_title,
+                    starting_capital=args.starting_capital,
+                    interval=args.equity_interval,
+                )
+                csv_path = save_equity_csv(points, saved_dir / "equity_curve.csv")
+                print(f"Equity curve: {plot_path}")
+                print(f"Equity data:  {csv_path}")
+
         return 0
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -1,0 +1,4 @@
+# Third-party Python dependencies used by this repository.
+numpy==2.2.6
+pandas==2.3.3
+plotly==6.1.2
