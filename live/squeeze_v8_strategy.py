@@ -998,6 +998,205 @@ def _generate_pullback_long_signals(
     return signals
 
 
+# ---------------------------------------------------------------------------
+# Vectorized backtest-path scanners (replace per-row iloc loops)
+# ---------------------------------------------------------------------------
+
+
+def _generate_squeeze_short_signals_vec(
+    frame: pd.DataFrame,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    config: SqueezeV8Config,
+) -> list[Signal]:
+    """Vectorized squeeze SHORT signal generation for backtesting.
+
+    Produces identical results to ``_generate_squeeze_short_signals`` but
+    replaces the per-row Python loop with vectorized boolean masks.  Only
+    the cooldown pass and signal construction iterate — over the tiny
+    subset of rows (~1-2%) that pass all gates.
+    """
+    if frame.empty:
+        return []
+
+    prev_sq = frame["squeeze_count"].shift(1)
+    mom = frame["mom_slope"]
+    atr_r = frame["atr_ratio"]
+    rsi = frame["rsi_14"].fillna(50.0)
+
+    candidate = (
+        mom.notna() & atr_r.notna()
+        & atr_r.le(config.atr_ratio_max)
+        & prev_sq.ge(config.min_squeeze_bars)
+        & ~frame["squeeze_on"].astype(bool)
+        & mom.lt(0)
+        & rsi.ge(config.short_rsi_floor)
+        & (frame["close_time"] >= start)
+        & (frame["close_time"] < end)
+    )
+    first_eval = max(min(config.warmup_bars - 1, len(frame) - 1), 1)
+    candidate.iloc[:first_eval] = False
+
+    # Sequential cooldown over candidates only
+    cooldown_sec = config.short_cooldown_h * 3600
+    ct_values = frame["close_time"].values
+    kept_indices: list[int] = []
+    last_short_time = None
+    for idx in candidate.values.nonzero()[0]:
+        ct = pd.Timestamp(ct_values[idx])
+        if last_short_time is not None and (ct - last_short_time).total_seconds() < cooldown_sec:
+            continue
+        last_short_time = ct
+        kept_indices.append(int(idx))
+
+    # Signal construction over the small kept set
+    signals: list[Signal] = []
+    for idx in kept_indices:
+        row = frame.iloc[idx]
+        prev = frame.iloc[idx - 1]
+        close_time = row["close_time"]
+        rsi_val = _safe_value(row, "rsi_14", 50.0)
+        mom_val = _safe_value(row, "mom_slope", 0.0)
+        atr_val = _safe_value(row, "atr_ratio", 1.0)
+        sq_count = int(_safe_value(prev, "squeeze_count", 0.0))
+        metadata: dict[str, object] = {
+            "strategy": "squeeze_v8.3_short",
+            "mom": round(mom_val, 6),
+            "rsi": round(rsi_val, 1),
+            "atr_ratio": round(atr_val, 2),
+            "sq_count": sq_count,
+        }
+        signal = _build_squeeze_short_signal(
+            signal_date=close_time,
+            symbol=symbol,
+            config=config,
+            metadata=metadata,
+        )
+        signals.append(signal)
+    return signals
+
+
+def _generate_pullback_long_signals_vec(
+    frame: pd.DataFrame,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    *,
+    long_tp: float = 4.0,
+    long_sl: float = 2.0,
+    long_cooldown_h: float = 12.0,
+    long_ret_max: float = _LONG_RET_MAX,
+    max_holding_hours: int = 72,
+    leverage: float = 1.0,
+    market_type: MarketType = MarketType.FUTURES,
+    taker_fee_rate: float = 0.0005,
+) -> list[Signal]:
+    """Vectorized pullback LONG signal generation for backtesting.
+
+    Produces identical results to ``_generate_pullback_long_signals`` but
+    replaces per-row iloc lookback scans with precomputed rolling columns.
+    """
+    if frame.empty or len(frame) < _PULLBACK_WARMUP_BARS + 2:
+        return []
+
+    # Support: bb_mid if bb_mid > 0 else ema20 (line 866-868)
+    bb_mid = frame["_bb_ma_20"].fillna(0.0)
+    ema20 = frame["ema_20"]
+    support = bb_mid.where(bb_mid > 0, ema20)
+    atr = frame["atr_14"]
+
+    # prev_support: _safe_value(prev, "_bb_ma_20", _safe_value(prev, "ema_20", support))
+    prev_bb = frame["_bb_ma_20"].shift(1)
+    prev_ema = frame["ema_20"].shift(1)
+    prev_support = prev_bb.where(prev_bb.notna(), prev_ema.where(prev_ema.notna(), support))
+
+    # Lookback support for rolling: _safe_value(lb_row, "_bb_ma_20", _safe_value(lb_row, "ema_20", 0.0))
+    lb_support = frame["_bb_ma_20"].where(
+        frame["_bb_ma_20"].notna(),
+        frame["ema_20"].where(frame["ema_20"].notna(), 0.0),
+    )
+    close_above_lb_support = (frame["close"] > lb_support)
+
+    # Above-support lookback: bars [i-6, ..., i-2] = rolling(5).shift(2)
+    above_support_5 = close_above_lb_support.rolling(5, min_periods=1).sum().shift(2)
+
+    # Impulse lookback: bars [i-10, ..., i-2] = rolling(9).shift(2)
+    impulse_9 = (
+        (frame["high"] >= frame["bb_upper"].fillna(float("inf")))
+        .rolling(9, min_periods=1).max().shift(2).fillna(0).astype(bool)
+    )
+
+    body = frame["close"] - frame["open"]
+    bar_range = frame["high"] - frame["low"]
+
+    candidate = (
+        ema20.notna() & atr.notna() & atr.gt(0)
+        & frame["ret_72h"].between(10.0, long_ret_max)
+        & frame["rsi_14"].fillna(50.0).le(75.0)
+        & frame["atr_ratio"].fillna(1.0).le(1.2)
+        & frame["mom_slope"].fillna(0.0).gt(0)
+        & (frame["close"] > support + 0.3 * atr)
+        & body.gt(0) & bar_range.gt(0) & (body / bar_range).ge(0.4)
+        & (frame["low"].shift(1) <= prev_support)
+        & (frame["close"].shift(1) >= prev_support - 1.0 * atr)
+        & above_support_5.ge(2.5)
+        & impulse_9
+        & (frame["close_time"] >= start) & (frame["close_time"] < end)
+    )
+    first_eval = max(_PULLBACK_WARMUP_BARS, 2)
+    candidate.iloc[:first_eval] = False
+
+    # Sequential cooldown over candidates only
+    cooldown_sec = long_cooldown_h * 3600
+    ct_values = frame["close_time"].values
+    kept_indices: list[int] = []
+    last_signal_time = None
+    for idx in candidate.values.nonzero()[0]:
+        ct = pd.Timestamp(ct_values[idx])
+        if last_signal_time is not None and (ct - last_signal_time).total_seconds() < cooldown_sec:
+            continue
+        last_signal_time = ct
+        kept_indices.append(int(idx))
+
+    # Signal construction over the small kept set
+    signals: list[Signal] = []
+    for idx in kept_indices:
+        row = frame.iloc[idx]
+        close_time = row["close_time"]
+        # Recompute metadata values matching _check_pullback_entry
+        row_support = float(support.iloc[idx])
+        row_atr = float(atr.iloc[idx])
+        prev_row = frame.iloc[idx - 1]
+        prev_low_val = float(prev_row["low"])
+        prev_support_val = float(prev_support.iloc[idx])
+        reclaim_strength = (float(row["close"]) - row_support) / row_atr if row_atr > 0 else 0.0
+        pullback_depth = (prev_support_val - prev_low_val) / row_atr if row_atr > 0 else 0.0
+        metadata: dict[str, object] = {
+            "strategy": "pullback_long",
+            "ret_72h": round(_safe_value(row, "ret_72h", 0.0), 2),
+            "rsi": round(_safe_value(row, "rsi_14", 50.0), 2),
+            "atr_ratio": round(_safe_value(row, "atr_ratio", 1.0), 3),
+            "pullback_depth": round(pullback_depth, 3),
+            "mom_slope": round(_safe_value(row, "mom_slope", 0.0), 6),
+            "reclaim_strength": round(reclaim_strength, 3),
+        }
+        signal = Signal(
+            signal_date=close_time,
+            position_type=PositionType.LONG,
+            ticker=symbol,
+            tp_pct=long_tp,
+            sl_pct=long_sl,
+            leverage=leverage,
+            market_type=market_type,
+            taker_fee_rate=taker_fee_rate,
+            max_holding_hours=max_holding_hours,
+            metadata=metadata,
+        )
+        signals.append(signal)
+    return signals
+
+
 def _resolve_short_long_conflicts(signals: list[Signal]) -> list[Signal]:
     """If SHORT and LONG fire for same ticker at same time, SHORT wins."""
     short_keys: set[tuple[datetime, str]] = set()
@@ -1119,19 +1318,19 @@ def generate_squeeze_v8_signals(
         )
         selected_symbols = symbols or list(frames)
 
-        # Squeeze SHORT signals
+        # Squeeze SHORT signals (vectorized backtest path)
         signals: list[Signal] = []
         for symbol in selected_symbols:
             frame = frames.get(symbol)
             if frame is None:
                 continue
             signals.extend(
-                _generate_squeeze_short_signals(
+                _generate_squeeze_short_signals_vec(
                     frame, symbol, active_start, active_end, active_config,
                 )
             )
 
-    # Pullback LONG signals
+    # Pullback LONG signals (vectorized backtest path)
     if active_config.enable_pullback_long:
         available_symbols = [
             s for s in selected_symbols if s in prepared_context.symbols
@@ -1144,7 +1343,7 @@ def generate_squeeze_v8_signals(
             if pf is None or pf.empty:
                 continue
             signals.extend(
-                _generate_pullback_long_signals(
+                _generate_pullback_long_signals_vec(
                     pf, symbol, active_start, active_end,
                     long_tp=active_config.long_tp,
                     long_sl=active_config.long_sl,
@@ -1182,6 +1381,16 @@ class SqueezeV8Strategy(SignalGenerator):
     @property
     def symbols(self) -> list[str]:
         return list(SYMBOLS)
+
+    @property
+    def cooldown_hours(self) -> float:
+        if self.short_cooldown_h != self.long_cooldown_h:
+            raise ValueError(
+                f"evaluator cooldown assumes equal short/long cooldown "
+                f"(got short={self.short_cooldown_h}, long={self.long_cooldown_h}); "
+                f"if they diverge, _enforce_cooldown needs per-side cooldown support"
+            )
+        return self.short_cooldown_h
 
     def __init__(
         self,
