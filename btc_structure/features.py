@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
+from collections import namedtuple
 from dataclasses import dataclass
 from typing import Any
 
@@ -348,6 +350,107 @@ def _select_active_fib_pair(
     return best
 
 
+# ---------------------------------------------------------------------------
+# Optimized pair selection — replaces per-timestamp pandas sorts with
+# pre-sorted arrays + bisect and caches the winning pair when the
+# candidate pool is unchanged between consecutive timestamps.
+# ---------------------------------------------------------------------------
+
+_LevelRow = namedtuple("_LevelRow", [
+    "value", "swing_date_ns", "available_on_ns",
+    "level_score", "swing_tier", "structure_label",
+    "swing_date_ts", "available_on_ts",
+])
+
+_NANOS_PER_DAY = 86_400 * 10**9
+
+
+def _extract_level_rows(df: pd.DataFrame) -> list[_LevelRow]:
+    """Pre-extract DataFrame rows into lightweight namedtuples."""
+    rows: list[_LevelRow] = []
+    for r in df.itertuples(index=False):
+        sd = pd.Timestamp(r.swing_date)
+        ao = pd.Timestamp(r.available_on)
+        rows.append(_LevelRow(
+            value=float(r.value),
+            swing_date_ns=sd.value,
+            available_on_ns=ao.value,
+            level_score=float(r.level_score),
+            swing_tier=getattr(r, "swing_tier", None),
+            structure_label=getattr(r, "structure_label", None),
+            swing_date_ts=sd,
+            available_on_ts=ao,
+        ))
+    return rows
+
+
+def _candidate_indices(
+    avail_ns: np.ndarray,
+    score_order: np.ndarray,
+    current_ts_ns: int,
+    cutoff_ns: int | None,
+    top_n: int,
+) -> tuple[int, ...]:
+    """Return sorted positional indices of the candidate pool.
+
+    Equivalent to ``_candidate_pool_for_fib`` but uses bisect on pre-sorted
+    arrays instead of per-call pandas filter + sort.
+    """
+    upper = bisect_right(avail_ns, current_ts_ns)
+    lower = bisect_left(avail_ns, cutoff_ns) if cutoff_ns is not None else 0
+    if upper <= lower:
+        return ()
+    # Recency top_n: last top_n positions in the window
+    recency_start = max(lower, upper - top_n)
+    indices = set(range(recency_start, upper))
+    # Score top_n: scan pre-computed argsort, pick first top_n in window
+    count = 0
+    for idx in score_order:
+        if lower <= idx < upper:
+            indices.add(idx)
+            count += 1
+            if count >= top_n:
+                break
+    return tuple(sorted(indices))
+
+
+def _score_pair_fast(
+    high: _LevelRow,
+    low: _LevelRow,
+    current_ts_ns: int,
+    settings: dict[str, Any],
+) -> tuple[float, str] | None:
+    """Score a (high, low) pair — same logic as ``_score_fib_pair`` but
+    operates on pre-extracted namedtuples with int64-ns timestamps."""
+    if not np.isfinite(high.value) or not np.isfinite(low.value) or high.value <= low.value:
+        return None
+    if high.swing_date_ns == low.swing_date_ns:
+        return None
+    leg_direction = "bullish" if high.swing_date_ns > low.swing_date_ns else "bearish"
+
+    newer_avail = max(high.available_on_ns, low.available_on_ns)
+    older_avail = min(high.available_on_ns, low.available_on_ns)
+    newer_age_days = max(0.0, (current_ts_ns - newer_avail) / _NANOS_PER_DAY)
+    older_age_days = max(0.0, (current_ts_ns - older_avail) / _NANOS_PER_DAY)
+    swing_span_days = abs(high.swing_date_ns - low.swing_date_ns) / _NANOS_PER_DAY
+
+    score = high.level_score + low.level_score
+    score += _tier_bonus(high.swing_tier or "") + _tier_bonus(low.swing_tier or "")
+    if leg_direction == "bullish" and high.structure_label in ("HH", "EQH"):
+        score += 0.75
+    if leg_direction == "bearish" and low.structure_label in ("LL", "EQL"):
+        score += 0.75
+    penalty = float(settings["recency_penalty"])
+    score -= newer_age_days * penalty
+    score -= older_age_days * penalty * 0.20
+
+    lookback_days = settings["lookback_days"]
+    if lookback_days is not None and swing_span_days > float(lookback_days):
+        score -= (swing_span_days - float(lookback_days)) * penalty * 0.10
+
+    return score, leg_direction
+
+
 def _build_fib_leg_features(
     base: pd.DataFrame,
     ranked_highs: pd.DataFrame,
@@ -400,12 +503,101 @@ def _build_fib_leg_features(
         return pd.concat([base, stub_df], axis=1)
 
     work = base.sort_values("close_time").reset_index(drop=True).copy()
+
+    # --- Optimized pair selection ----------------------------------------
+    # Pre-extract level data into plain arrays / namedtuples so the hot
+    # loop avoids per-timestamp DataFrame sorts entirely.
+    settings = _fib_scope_settings(scope)
+    top_n = int(settings["top_n"])
+    lookback_days = settings["lookback_days"]
+
+    high_rows = _extract_level_rows(highs)
+    low_rows = _extract_level_rows(lows)
+
+    highs_avail_ns = pd.DatetimeIndex(highs["available_on"]).asi8
+    lows_avail_ns = pd.DatetimeIndex(lows["available_on"]).asi8
+
+    high_scores = np.array([r.level_score for r in high_rows])
+    high_score_order = np.lexsort((-highs_avail_ns, -high_scores))
+    low_scores = np.array([r.level_score for r in low_rows])
+    low_score_order = np.lexsort((-lows_avail_ns, -low_scores))
+
+    lookback_ns = int(pd.Timedelta(days=int(lookback_days)).value) if lookback_days is not None else None
+    timestamps_ns = pd.DatetimeIndex(work["close_time"]).asi8
+
+    prev_hi_idx: tuple[int, ...] | None = None
+    prev_lo_idx: tuple[int, ...] | None = None
+    prev_best_pair: tuple[int, int] | None = None  # (hi, lo) indices of winner
+
     pair_rows: list[dict[str, Any]] = []
     last_pair: dict[str, Any] | None = None
-    for current_ts in pd.to_datetime(work["close_time"], utc=True):
-        selected = _select_active_fib_pair(highs, lows, current_ts, scope=scope)
+
+    for ts_ns in timestamps_ns:
+        cutoff_ns = (ts_ns - lookback_ns) if lookback_ns is not None else None
+
+        hi_idx = _candidate_indices(highs_avail_ns, high_score_order, ts_ns, cutoff_ns, top_n)
+        lo_idx = _candidate_indices(lows_avail_ns, low_score_order, ts_ns, cutoff_ns, top_n)
+
+        if not hi_idx or not lo_idx:
+            selected = None
+        elif hi_idx == prev_hi_idx and lo_idx == prev_lo_idx and prev_best_pair is not None:
+            # Pool unchanged — pair ranking is preserved (uniform age shift),
+            # so just recompute the score for the same winning pair.
+            bhi, blo = prev_best_pair
+            scored = _score_pair_fast(high_rows[bhi], low_rows[blo], ts_ns, settings)
+            if scored is not None:
+                selected = last_pair.copy() if last_pair is not None else None
+                if selected is not None:
+                    selected["pair_score_adjusted"] = scored[0]
+            else:
+                selected = None
+        else:
+            # Pool changed — full pair scoring
+            best: dict[str, Any] | None = None
+            best_hi_lo: tuple[int, int] | None = None
+            for hi in hi_idx:
+                h = high_rows[hi]
+                for lo in lo_idx:
+                    l = low_rows[lo]
+                    scored = _score_pair_fast(h, l, ts_ns, settings)
+                    if scored is None:
+                        continue
+                    pair_score, leg_dir = scored
+                    candidate = {
+                        "pair_score_adjusted": pair_score,
+                        "leg_direction": leg_dir,
+                        "anchor_high_date": h.swing_date_ts,
+                        "anchor_high": h.value,
+                        "high_score": h.level_score,
+                        "high_label": h.structure_label,
+                        "high_tier": h.swing_tier,
+                        "anchor_low_date": l.swing_date_ts,
+                        "anchor_low": l.value,
+                        "low_score": l.level_score,
+                        "low_label": l.structure_label,
+                        "low_tier": l.swing_tier,
+                        "pair_key": (
+                            f"{l.swing_date_ts.date()}|{l.value:.8f}"
+                            f"__{h.swing_date_ts.date()}|{h.value:.8f}"
+                        ),
+                        "pair_available_on": max(h.available_on_ts, l.available_on_ts),
+                    }
+                    if best is None or pair_score > best["pair_score_adjusted"]:
+                        best = candidate
+                        best_hi_lo = (hi, lo)
+                    elif pair_score == best["pair_score_adjusted"] and candidate["pair_available_on"] > best["pair_available_on"]:
+                        best = candidate
+                        best_hi_lo = (hi, lo)
+            selected = best
+            prev_best_pair = best_hi_lo
+
+        prev_hi_idx = hi_idx
+        prev_lo_idx = lo_idx
         if selected is not None:
             last_pair = selected
+            if prev_best_pair is None and hi_idx and lo_idx:
+                # Shouldn't happen, but guard against it
+                pass
         pair_rows.append(last_pair.copy() if last_pair is not None else {})
 
     pair_df = pd.DataFrame(pair_rows)

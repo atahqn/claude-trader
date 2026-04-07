@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 import sys
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,30 +31,57 @@ _CACHE_ROOT = Path.home() / ".claude_trader" / "cache"
 
 
 # ---------------------------------------------------------------------------
-# Disk cache (SHA-256 keyed JSON, ported from kriptistan cache.py)
+# Disk cache (SHA-256 keyed pickle)
 # ---------------------------------------------------------------------------
+
+_CACHE_VERSION = 2  # bumped from 1 (JSON) to 2 (pickle)
+
 
 class _DiskCache:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
+        self._check_version()
+
+    def _check_version(self) -> None:
+        marker = self.root / ".cache_version"
+        if marker.exists():
+            try:
+                v = int(marker.read_text().strip())
+            except (ValueError, OSError):
+                v = 0
+            if v >= _CACHE_VERSION:
+                return
+        # Old or missing version — wipe stale JSON entries
+        legacy_dir = self.root / "binance"
+        if legacy_dir.exists():
+            stale = list(legacy_dir.glob("*.json"))
+            if stale:
+                for f in stale:
+                    f.unlink(missing_ok=True)
+                warnings.warn(
+                    f"Cleared {len(stale)} legacy JSON cache files. "
+                    f"Data will be re-fetched from Binance on next access.",
+                    stacklevel=2,
+                )
+        marker.write_text(str(_CACHE_VERSION))
 
     def get(self, namespace: str, key_parts: list[str]) -> Any | None:
         path = self._path(namespace, key_parts)
         if not path.exists():
             return None
-        return json.loads(path.read_text())
+        return pickle.loads(path.read_bytes())
 
     def set(self, namespace: str, key_parts: list[str], payload: Any) -> None:
         path = self._path(namespace, key_parts)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        tmp.write_bytes(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
         tmp.replace(path)
 
     def _path(self, namespace: str, key_parts: list[str]) -> Path:
         digest = hashlib.sha256("::".join(key_parts).encode()).hexdigest()
-        return self.root / namespace / f"{digest}.json"
+        return self.root / namespace / f"{digest}.pkl"
 
 
 # ---------------------------------------------------------------------------
