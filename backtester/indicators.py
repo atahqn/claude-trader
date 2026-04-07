@@ -14,6 +14,13 @@ _SLOPE_XS_20_DOT = float(np.dot(_SLOPE_XS_20, _SLOPE_XS_20))
 _SLOPE_DENOM_20 = 20 * _SLOPE_XS_20_DOT - _SLOPE_XS_20_SUM ** 2
 _RAW_INDICATOR_INPUTS = frozenset({"open", "high", "low", "close", "volume", "taker_buy_volume"})
 
+_T3_PERIOD = 5
+_T3_VFACTOR = 0.7
+_T3_C1 = -_T3_VFACTOR ** 3
+_T3_C2 = 3 * _T3_VFACTOR ** 2 + 3 * _T3_VFACTOR ** 3
+_T3_C3 = -6 * _T3_VFACTOR ** 2 - 3 * _T3_VFACTOR - 3 * _T3_VFACTOR ** 3
+_T3_C4 = 1 + 3 * _T3_VFACTOR + _T3_VFACTOR ** 3 + 3 * _T3_VFACTOR ** 2
+
 
 @dataclass(frozen=True, slots=True)
 class IndicatorSpec:
@@ -138,6 +145,14 @@ _INDICATOR_SPECS: dict[str, IndicatorSpec] = {
     # --- CVD (Cumulative Volume Delta) ---
     "volume_delta": IndicatorSpec("volume_delta", ("taker_buy_volume", "volume"), 0),
     "cvd": IndicatorSpec("cvd", ("volume_delta",), 0),
+    # --- Tilson T3 ---
+    "_t3_e1": IndicatorSpec("_t3_e1", ("close",), 0),
+    "_t3_e2": IndicatorSpec("_t3_e2", ("_t3_e1",), 0),
+    "_t3_e3": IndicatorSpec("_t3_e3", ("_t3_e2",), 0),
+    "_t3_e4": IndicatorSpec("_t3_e4", ("_t3_e3",), 0),
+    "_t3_e5": IndicatorSpec("_t3_e5", ("_t3_e4",), 0),
+    "_t3_e6": IndicatorSpec("_t3_e6", ("_t3_e5",), 0),
+    "t3": IndicatorSpec("t3", ("_t3_e3", "_t3_e4", "_t3_e5", "_t3_e6"), 0),
 }
 
 
@@ -228,6 +243,22 @@ def _compute_indicator(name: str, frame: pd.DataFrame) -> pd.Series:
         return 2 * frame["taker_buy_volume"] - frame["volume"]
     if name == "cvd":
         return frame["volume_delta"].cumsum()
+    # --- Tilson T3 ---
+    if name == "_t3_e1":
+        return frame["close"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e2":
+        return frame["_t3_e1"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e3":
+        return frame["_t3_e2"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e4":
+        return frame["_t3_e3"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e5":
+        return frame["_t3_e4"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e6":
+        return frame["_t3_e5"].ewm(span=_T3_PERIOD).mean()
+    if name == "t3":
+        return (_T3_C1 * frame["_t3_e6"] + _T3_C2 * frame["_t3_e5"]
+                + _T3_C3 * frame["_t3_e4"] + _T3_C4 * frame["_t3_e3"])
     raise KeyError(f"unknown indicator: {name}")
 
 

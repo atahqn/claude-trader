@@ -29,6 +29,7 @@ from backtester import PortfolioConfig, StrategyEvaluator
 from backtester.eval_windows import (
     ALL_WINDOWS,
     BULL_DEVELOPMENT_WINDOWS,
+    COMPLETE_WINDOWS,
     DEVELOPMENT_WINDOWS,
     EVALUATION_WINDOWS,
     HOLDOUT_WINDOWS,
@@ -41,6 +42,7 @@ from backtester.eval_windows import (
     RANDOM_DEVELOPMENT_WINDOWS,
     RANDOM_EVALUATION_WINDOWS,
     STRESS_DEVELOPMENT_WINDOWS,
+    TEST_WINDOWS,
     EvalWindow,
 )
 from live.signal_generator import CompositeSignalGenerator, SignalGenerator
@@ -48,6 +50,7 @@ from live.signal_generator import CompositeSignalGenerator, SignalGenerator
 
 WINDOW_ALIASES: dict[str, list[EvalWindow]] = {
     "all": ALL_WINDOWS,
+    "complete": COMPLETE_WINDOWS,
     "dev": DEVELOPMENT_WINDOWS,
     "development": DEVELOPMENT_WINDOWS,
     "eval": EVALUATION_WINDOWS,
@@ -57,6 +60,7 @@ WINDOW_ALIASES: dict[str, list[EvalWindow]] = {
     "oos3": OOS3_WINDOWS,
     "oos4": OOS4_WINDOWS,
     "oos5": OOS5_WINDOWS,
+    "test": TEST_WINDOWS,
     "legacy_development": LEGACY_DEVELOPMENT_WINDOWS,
     "development_stress": STRESS_DEVELOPMENT_WINDOWS,
     "development_bull": BULL_DEVELOPMENT_WINDOWS,
@@ -89,10 +93,20 @@ def parse_args() -> argparse.Namespace:
         "--windows",
         default="eval",
         help=(
-            "Window pack: eval, dev, all, holdout, oos2, oos3, oos4, oos5, "
+            "Window pack: eval, dev, all, complete, test, holdout, oos2, oos3, oos4, oos5, "
             "legacy_development, development_stress, development_bull, "
             "development_pairs, development_random, evaluation_random."
         ),
+    )
+    parser.add_argument(
+        "--start",
+        default="",
+        help="Custom period start date (YYYY-MM-DD). Used with --end to define an arbitrary evaluation window.",
+    )
+    parser.add_argument(
+        "--end",
+        default="",
+        help="Custom period end date (YYYY-MM-DD). Used with --start to define an arbitrary evaluation window.",
     )
     parser.add_argument(
         "--symbols",
@@ -425,7 +439,17 @@ def main() -> int:
     args = parse_args()
     try:
         strategy_kwargs = parse_strategy_kwargs(args.strategy_kwargs)
-        window_label, windows = resolve_windows(args.windows)
+        if args.start and args.end:
+            start_dt = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=UTC)
+            end_dt = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=UTC)
+            if end_dt <= start_dt:
+                raise ValueError("--end must be after --start")
+            window_label = f"{args.start}_to_{args.end}"
+            windows = [EvalWindow(window_label, start_dt, end_dt, "custom")]
+        elif args.start or args.end:
+            raise ValueError("Both --start and --end are required for a custom period")
+        else:
+            window_label, windows = resolve_windows(args.windows)
         strategy, strategy_name, strategy_spec = _load_strategies(
             args.strategy, strategy_kwargs,
         )

@@ -26,7 +26,9 @@ Calendar summary
 ----------------
   58 development windows  (24 legacy + 10 stress + 4 bullish + 8 paired regime + 12 random)
   41 evaluation windows   (7 primary holdout + 4 secondary OOS + 6 tertiary OOS + 4 bull OOS + 8 paired regime OOS + 12 random)
-  99 total windows        spanning Nov 2020 – Mar 2026
+  62 test windows         (uncovered post-2023 gaps, 7-day blocks)
+  99 dev+eval windows     spanning Nov 2020 – Mar 2026
+ 161 complete windows     including test coverage
 """
 
 from __future__ import annotations
@@ -266,7 +268,79 @@ RANDOM_EVALUATION_WINDOWS: list[EvalWindow] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Combined evaluation (41) and full calendar (99)
+# Test windows (62)
+# Every 7-day period after 2023-01-01 not covered by any development or
+# evaluation window. Gaps shorter than 7 days are skipped; longer gaps are
+# split into contiguous 7-day blocks (sub-7-day remainders dropped).
+# ---------------------------------------------------------------------------
+
+TEST_WINDOWS: list[EvalWindow] = [
+    EvalWindow("TEST_W1", _dt(2023, 1, 1), _dt(2023, 1, 8), "test"),
+    EvalWindow("TEST_W2", _dt(2023, 1, 15), _dt(2023, 1, 22), "test"),
+    EvalWindow("TEST_W3", _dt(2023, 1, 22), _dt(2023, 1, 29), "test"),
+    EvalWindow("TEST_W4", _dt(2023, 1, 29), _dt(2023, 2, 5), "test"),
+    EvalWindow("TEST_W5", _dt(2023, 2, 26), _dt(2023, 3, 5), "test"),
+    EvalWindow("TEST_W6", _dt(2023, 3, 5), _dt(2023, 3, 12), "test"),
+    EvalWindow("TEST_W7", _dt(2023, 3, 12), _dt(2023, 3, 19), "test"),
+    EvalWindow("TEST_W8", _dt(2023, 3, 19), _dt(2023, 3, 26), "test"),
+    EvalWindow("TEST_W9", _dt(2023, 3, 26), _dt(2023, 4, 2), "test"),
+    EvalWindow("TEST_W10", _dt(2023, 4, 2), _dt(2023, 4, 9), "test"),
+    EvalWindow("TEST_W11", _dt(2023, 4, 9), _dt(2023, 4, 16), "test"),
+    EvalWindow("TEST_W12", _dt(2023, 4, 16), _dt(2023, 4, 23), "test"),
+    EvalWindow("TEST_W13", _dt(2023, 4, 23), _dt(2023, 4, 30), "test"),
+    EvalWindow("TEST_W14", _dt(2023, 4, 30), _dt(2023, 5, 7), "test"),
+    EvalWindow("TEST_W15", _dt(2023, 5, 7), _dt(2023, 5, 14), "test"),
+    EvalWindow("TEST_W16", _dt(2023, 5, 14), _dt(2023, 5, 21), "test"),
+    EvalWindow("TEST_W17", _dt(2023, 6, 11), _dt(2023, 6, 18), "test"),
+    EvalWindow("TEST_W18", _dt(2023, 6, 18), _dt(2023, 6, 25), "test"),
+    EvalWindow("TEST_W19", _dt(2023, 6, 25), _dt(2023, 7, 2), "test"),
+    EvalWindow("TEST_W20", _dt(2023, 7, 15), _dt(2023, 7, 22), "test"),
+    EvalWindow("TEST_W21", _dt(2023, 7, 22), _dt(2023, 7, 29), "test"),
+    EvalWindow("TEST_W22", _dt(2023, 7, 29), _dt(2023, 8, 5), "test"),
+    EvalWindow("TEST_W23", _dt(2023, 8, 5), _dt(2023, 8, 12), "test"),
+    EvalWindow("TEST_W24", _dt(2023, 8, 19), _dt(2023, 8, 26), "test"),
+    EvalWindow("TEST_W25", _dt(2023, 8, 26), _dt(2023, 9, 2), "test"),
+    EvalWindow("TEST_W26", _dt(2023, 9, 2), _dt(2023, 9, 9), "test"),
+    EvalWindow("TEST_W27", _dt(2023, 11, 4), _dt(2023, 11, 11), "test"),
+    EvalWindow("TEST_W28", _dt(2023, 11, 18), _dt(2023, 11, 25), "test"),
+    EvalWindow("TEST_W29", _dt(2023, 11, 25), _dt(2023, 12, 2), "test"),
+    EvalWindow("TEST_W30", _dt(2023, 12, 2), _dt(2023, 12, 9), "test"),
+    EvalWindow("TEST_W31", _dt(2023, 12, 16), _dt(2023, 12, 23), "test"),
+    EvalWindow("TEST_W32", _dt(2023, 12, 23), _dt(2023, 12, 30), "test"),
+    EvalWindow("TEST_W33", _dt(2023, 12, 30), _dt(2024, 1, 6), "test"),
+    EvalWindow("TEST_W34", _dt(2024, 1, 13), _dt(2024, 1, 20), "test"),
+    EvalWindow("TEST_W35", _dt(2024, 1, 20), _dt(2024, 1, 27), "test"),
+    EvalWindow("TEST_W36", _dt(2024, 1, 27), _dt(2024, 2, 3), "test"),
+    EvalWindow("TEST_W37", _dt(2024, 2, 3), _dt(2024, 2, 10), "test"),
+    EvalWindow("TEST_W38", _dt(2024, 2, 10), _dt(2024, 2, 17), "test"),
+    EvalWindow("TEST_W39", _dt(2024, 4, 6), _dt(2024, 4, 13), "test"),
+    EvalWindow("TEST_W40", _dt(2024, 5, 21), _dt(2024, 5, 28), "test"),
+    EvalWindow("TEST_W41", _dt(2024, 7, 6), _dt(2024, 7, 13), "test"),
+    EvalWindow("TEST_W42", _dt(2024, 7, 13), _dt(2024, 7, 20), "test"),
+    EvalWindow("TEST_W43", _dt(2024, 9, 7), _dt(2024, 9, 14), "test"),
+    EvalWindow("TEST_W44", _dt(2024, 9, 14), _dt(2024, 9, 21), "test"),
+    EvalWindow("TEST_W45", _dt(2024, 9, 21), _dt(2024, 9, 28), "test"),
+    EvalWindow("TEST_W46", _dt(2024, 10, 5), _dt(2024, 10, 12), "test"),
+    EvalWindow("TEST_W47", _dt(2024, 11, 22), _dt(2024, 11, 29), "test"),
+    EvalWindow("TEST_W48", _dt(2024, 12, 29), _dt(2025, 1, 5), "test"),
+    EvalWindow("TEST_W49", _dt(2025, 1, 5), _dt(2025, 1, 12), "test"),
+    EvalWindow("TEST_W50", _dt(2025, 2, 12), _dt(2025, 2, 19), "test"),
+    EvalWindow("TEST_W51", _dt(2025, 4, 29), _dt(2025, 5, 6), "test"),
+    EvalWindow("TEST_W52", _dt(2025, 5, 13), _dt(2025, 5, 20), "test"),
+    EvalWindow("TEST_W53", _dt(2025, 5, 20), _dt(2025, 5, 27), "test"),
+    EvalWindow("TEST_W54", _dt(2025, 6, 22), _dt(2025, 6, 29), "test"),
+    EvalWindow("TEST_W55", _dt(2025, 7, 19), _dt(2025, 7, 26), "test"),
+    EvalWindow("TEST_W56", _dt(2025, 7, 26), _dt(2025, 8, 2), "test"),
+    EvalWindow("TEST_W57", _dt(2025, 9, 21), _dt(2025, 9, 28), "test"),
+    EvalWindow("TEST_W58", _dt(2025, 10, 18), _dt(2025, 10, 25), "test"),
+    EvalWindow("TEST_W59", _dt(2025, 10, 25), _dt(2025, 11, 1), "test"),
+    EvalWindow("TEST_W60", _dt(2025, 12, 4), _dt(2025, 12, 11), "test"),
+    EvalWindow("TEST_W61", _dt(2025, 12, 27), _dt(2026, 1, 3), "test"),
+    EvalWindow("TEST_W62", _dt(2026, 2, 5), _dt(2026, 2, 12), "test"),
+]
+
+# ---------------------------------------------------------------------------
+# Combined evaluation (41), full calendar (99), and complete calendar (161)
 # ---------------------------------------------------------------------------
 
 EVALUATION_WINDOWS: list[EvalWindow] = (
@@ -279,6 +353,8 @@ EVALUATION_WINDOWS: list[EvalWindow] = (
 )
 
 ALL_WINDOWS: list[EvalWindow] = DEVELOPMENT_WINDOWS + EVALUATION_WINDOWS
+
+COMPLETE_WINDOWS: list[EvalWindow] = ALL_WINDOWS + TEST_WINDOWS
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +374,7 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "oos4": "strong bull pre-23",
     "oos5": "bull/bear/flat pairs",
     "evaluation_random": "random blocks",
+    "test": "uncovered post-2023 gaps",
 }
 
 

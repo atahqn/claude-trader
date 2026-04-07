@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -14,6 +14,7 @@ from marketdata import (
     MarketDataRequest,
     SymbolMarketContext,
 )
+from marketdata.key_levels import KeyLevels, compute_key_levels_series
 
 from .models import AggTrade, Candle
 from .preview import interval_to_timedelta
@@ -65,6 +66,7 @@ class PreparedMarketContext:
     request: MarketDataRequest
     bundle: MarketContextBundle
     poll_candles: dict[str, list[Candle]] = field(default_factory=dict)
+    key_levels_data: dict[str, list[tuple[datetime, KeyLevels]]] = field(default_factory=dict)
     _analysis_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
     _poll_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
 
@@ -113,6 +115,16 @@ class PreparedMarketContext:
         hi = bisect_left(candles, end, key=lambda c: c.open_time)
         return candles[lo:hi]
 
+    def get_key_levels(self, symbol: str, t: datetime) -> KeyLevels | None:
+        """Return the key levels at or just before timestamp *t*, or ``None``."""
+        entries = self.key_levels_data.get(symbol)
+        if not entries:
+            return None
+        idx = bisect_right(entries, t, key=lambda e: e[0]) - 1
+        if idx < 0:
+            return None
+        return entries[idx][1]
+
     def truncated_to(self, t: datetime) -> PreparedMarketContext:
         """Return a copy with all data after *t* physically removed.
 
@@ -143,6 +155,10 @@ class PreparedMarketContext:
             sym: [c for c in candles if c.close_time <= t]
             for sym, candles in self.poll_candles.items()
         }
+        truncated_kl = {
+            sym: [(ts, kl) for ts, kl in entries if ts <= t]
+            for sym, entries in self.key_levels_data.items()
+        }
         return PreparedMarketContext(
             start=self.start,
             end=self.end,
@@ -150,6 +166,7 @@ class PreparedMarketContext:
             request=self.request,
             bundle=truncated_bundle,
             poll_candles=truncated_poll,
+            key_levels_data=truncated_kl,
         )
 
 
@@ -180,6 +197,24 @@ def _truncate_raw_datasets(
                 f"Add truncation logic before using this in validation."
             )
     return truncated
+
+
+def _fetch_symbol_key_levels(
+    client: "BinanceClient",
+    symbol: str,
+    kl_start: datetime,
+    hourly_start: datetime,
+    end: datetime,
+    timestamps: list[datetime],
+) -> list[tuple[datetime, KeyLevels]]:
+    """Fetch multi-TF candles for *symbol* and compute key levels."""
+    h4 = client.fetch_klines(symbol, "4h", kl_start, end)
+    daily = client.fetch_klines(symbol, "1d", kl_start, end)
+    weekly = client.fetch_klines(symbol, "1w", kl_start, end)
+    monthly = client.fetch_klines(symbol, "1M", kl_start, end)
+    hourly = client.fetch_klines(symbol, "1h", hourly_start, end)
+    kl_series = compute_key_levels_series(h4, daily, weekly, monthly, hourly, timestamps)
+    return list(zip(timestamps, kl_series))
 
 
 def prepare_market_context(
@@ -227,6 +262,35 @@ def prepare_market_context(
                 }
                 for future in as_completed(futures):
                     poll_candles[futures[future]] = future.result()
+    key_levels_data: dict[str, list[tuple[datetime, KeyLevels]]] = {}
+    if request.include_key_levels and symbols:
+        kl_start = datetime(max(fetch_start.year - 1, 1), 1, 1, tzinfo=UTC)
+        hourly_start = fetch_start - timedelta(days=7)
+
+        kl_tasks: list[tuple[str, list[datetime]]] = []
+        for symbol in symbols:
+            smc = bundle.by_symbol.get(symbol)
+            if smc is not None and not smc.frame.empty:
+                kl_tasks.append((symbol, list(smc.frame["close_time"])))
+
+        if kl_tasks:
+            if max_workers <= 1 or len(kl_tasks) <= 1:
+                for sym, timestamps in kl_tasks:
+                    key_levels_data[sym] = _fetch_symbol_key_levels(
+                        client, sym, kl_start, hourly_start, end, timestamps,
+                    )
+            else:
+                with ThreadPoolExecutor(max_workers=min(max_workers, len(kl_tasks))) as pool:
+                    futures = {
+                        pool.submit(
+                            _fetch_symbol_key_levels,
+                            client, sym, kl_start, hourly_start, end, timestamps,
+                        ): sym
+                        for sym, timestamps in kl_tasks
+                    }
+                    for future in as_completed(futures):
+                        key_levels_data[futures[future]] = future.result()
+
     return PreparedMarketContext(
         start=start,
         end=end,
@@ -234,6 +298,7 @@ def prepare_market_context(
         request=request,
         bundle=bundle,
         poll_candles=poll_candles,
+        key_levels_data=key_levels_data,
     )
 
 

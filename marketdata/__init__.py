@@ -6,6 +6,7 @@ from .context import (
     fetch_market_context_bundle,
 )
 from .bundle import build_market_data_bundle
+from .key_levels import KeyLevels
 from .models import (
     DataRequirement,
     FundingRate,
@@ -17,6 +18,7 @@ from .models import (
 __all__ = [
     "DataRequirement",
     "FundingRate",
+    "KeyLevels",
     "MarketContextBundle",
     "MarketDataBundle",
     "MarketDataRequest",

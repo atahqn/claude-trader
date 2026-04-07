@@ -10,6 +10,9 @@ Every researcher will be given the current state of the research
 and current best preference score. An improvement to this score defines succesful research.
 If not succesful researcher should delete the logic and strategy it created.
 
+(preference_score is coverage_penalty * (gross_positive_weeks / gross_negative_weeks) * (total_pnl / max_drawdown) —
+  essentially omega ratio times PnL-to-drawdown ratio, scaled down by a coverage penalty which penalizes weeks with 0 trades by: sqrt(active_weeks / total_weeks).)
+
 This means:
 
 - research should aim to improve unseen evaluation performance
@@ -45,19 +48,12 @@ still developing or selecting the strategy.
 
 1. Read README.md. 
 2. Discuss with the user on what to research. Note that research direction could be very general like improving some previous strategy. 
-3. Before starting your research you should understand the current baseline for your area. Discuss the current baseline and determine the 'preference_score' of the baseline.
+    Your research is either new or continuation of some other research. If it is continuation, user will explain what you are continuing on and what context you need. If not you start from scratch. Do not read already available research.
+3. Before starting your research you should understand the related parts of the code explained in the README.md.
 4. Create a directory with proper name for your research under the claude-trader.
 5. Create the strategy file that implements the SignalGenerator class under this folder. You can import other logic from other folders but the SignalGenerator implementation must be here.
 6. Create results.tsv under this folder to save summarized results.
-7. Confirm your research with the user take his approval and start.
-
-## Approval Gate
-
-HARD STOP: Before any research begins, you must:
-1. Read README.md 
-2. Identify the current baseline and its exact preference_score
-3. Propose a research area to the user
-4. Ask for explicit approval
+7. Confirm your research with the user, ask him for the preference_score to beat, take his approval and start.
 
 Until the user explicitly approves, you may only read files and summarize findings.
 
@@ -138,17 +134,13 @@ Tie-breakers after `preference_score` are:
 
 Edit and refine your strategy.
 
-Use provided indicators from backtester/indicators.py or derive metrics that you think would be useful. Codebase exposes 5 Binance dataset types through MarketDataRequest: ohlcv, agg_trades (this is only available for l year so you cannot properly use this for signal generation), funding_rates, mark_price_klines, and premium_index_klines (marketdata/models.py:9, marketdata/bundle.py:45). You can use this data to create new indicators but doing so do not change directly the backtester/indicator.py but keep it in under the research folder.
+Use provided indicators from `backtester/indicators.py` (RSI, ATR, Bollinger Bands, Keltner Channels, squeeze, ADX, CVD, Tilson T3, and more) or derive your own. Do not modify `backtester/indicators.py` directly — keep custom indicators under the research folder.
 
-Kline data includes `taker_buy_volume` (the volume initiated by taker buy orders). The indicator system provides `volume_delta` (per-bar net taker aggression: `2 * taker_buy_volume - volume`) and `cvd` (cumulative volume delta, the running sum of `volume_delta`). These are available from ticker inception at any kline interval with no extra API calls.
-
-Additionally, the `btc_structure/` module provides daily BTC market structure features (regime, structural price levels, and structure break events) derived from daily OHLCV. These are accessed via `DailyStructureProvider` and can be merged onto intraday frames. See `btc_structure/README.md` for the full column reference, usage patterns, and computation cost.
+The codebase provides several data sources and feature systems. See `marketdata/README.md` for the full reference on available Binance datasets (OHLCV, funding rates, mark/premium klines), all technical indicators, and multi-timeframe key levels (`include_key_levels=True` on `MarketDataRequest`). See `btc_structure/README.md` for daily BTC market structure features (regime, structural price levels, and structure break events).
 
 You must work on your created strategy folder. You cannot implement already living strategies. You can import, copy or change them in your folder.
 
 The evaluated backtester path must implement the strategy itself.
-
-You can calculate new indicators or use the provided data if you think it will be useful for the strategy.  (OHLCV, premium)
 
 In particular:
 

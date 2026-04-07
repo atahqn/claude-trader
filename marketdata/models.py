@@ -28,6 +28,7 @@ class MarketDataRequest:
     )
     ohlcv_interval: str = "1h"
     poll_ohlcv_interval: str | None = None
+    include_key_levels: bool = False
 
     def __post_init__(self) -> None:
         if not self.datasets:
@@ -45,11 +46,13 @@ class MarketDataRequest:
         interval: str = "1h",
         *,
         poll_interval: str | None = None,
+        include_key_levels: bool = False,
     ) -> "MarketDataRequest":
         return cls(
             datasets=frozenset({DataRequirement.OHLCV}),
             ohlcv_interval=interval,
             poll_ohlcv_interval=poll_interval,
+            include_key_levels=include_key_levels,
         )
 
 
