@@ -714,24 +714,26 @@ def _enforce_cooldown(
     signals: list[Signal],
     cooldown_hours: float,
 ) -> list[Signal]:
-    """Remove signals that violate per-symbol cooldown.
+    """Remove signals that violate per-symbol, per-side cooldown.
 
     Expects *signals* sorted by ``signal_date``.  Keeps the first signal
-    for each symbol and drops any subsequent signal within *cooldown_hours*
-    of the previous kept signal for the same symbol.
+    for each ``(symbol, position_type)`` pair and drops any subsequent
+    signal within *cooldown_hours* of the previous kept signal for the
+    same pair.  Keying on position_type prevents a SHORT from suppressing
+    a LONG on the same symbol (they have independent cooldowns).
     """
     if cooldown_hours <= 0:
         return signals
-    last_by_symbol: dict[str, datetime] = {}
+    last_by_key: dict[tuple[str, PositionType], datetime] = {}
     kept: list[Signal] = []
     for sig in signals:
-        sym = sig.ticker
-        last = last_by_symbol.get(sym)
+        key = (sig.ticker, sig.position_type)
+        last = last_by_key.get(key)
         if last is not None:
             hours = (sig.signal_date - last).total_seconds() / 3600.0
             if hours < cooldown_hours:
                 continue
-        last_by_symbol[sym] = sig.signal_date
+        last_by_key[key] = sig.signal_date
         kept.append(sig)
     return kept
 
@@ -894,6 +896,7 @@ def _generate_period_signals(
     warmup_bars: int,
     data_max_workers: int,
     calibration_config: tuple[int, int, datetime] | None = None,
+    indicators: tuple[str, ...] = (),
 ) -> tuple[int, PreparedMarketContext, list[Signal]]:
     """Worker: create a fresh strategy + client, generate signals for one period."""
     from .data import BinanceClient
@@ -904,7 +907,7 @@ def _generate_period_signals(
     ctx = prepare_market_context(
         symbols, signal_start, fetch_end,
         client=client, request=request,
-        warmup_bars=warmup_bars,
+        warmup_bars=warmup_bars, indicators=indicators,
         max_workers=data_max_workers,
     )
     if calibration_config is not None and generator.needs_calibration:
@@ -969,8 +972,12 @@ class StrategyEvaluator:
         if uses_calibration:
             validate_calibration_config(generator)
 
-        # Warmup must cover calibration lookback when calibration is active.
-        warmup_bars = 100
+        # Warmup must cover indicator needs and calibration lookback.
+        indicators = generator.indicator_request()
+        warmup_bars = generator.required_warmup_bars
+        if indicators:
+            from .indicators import required_warmup as _ind_warmup
+            warmup_bars = max(warmup_bars, _ind_warmup(indicators))
         if uses_calibration:
             interval_td = interval_to_timedelta(request.ohlcv_interval)
             interval_hours = interval_td.total_seconds() / 3600
@@ -1030,7 +1037,8 @@ class StrategyEvaluator:
                 ctx = prepare_market_context(
                     self._symbols, sig_start, fetch_end,
                     client=self._client, request=request,
-                    warmup_bars=warmup_bars, max_workers=self._config.data_max_workers,
+                    warmup_bars=warmup_bars, indicators=indicators,
+                    max_workers=self._config.data_max_workers,
                 )
                 if uses_calibration:
                     anchor = period_params[period_idx][1]
@@ -1064,6 +1072,7 @@ class StrategyEvaluator:
                                 generator.calibration_lookback_hours,
                                 period_params[period_idx][1],
                             ) if uses_calibration else None,
+                            indicators,
                         ): (ci, period_idx)
                         for ci, period_idx, _, sig_start, sig_end, fetch_end in chunks
                     }
@@ -1078,7 +1087,8 @@ class StrategyEvaluator:
                     ctx = prepare_market_context(
                         self._symbols, sig_start, fetch_end,
                         client=self._client, request=request,
-                        warmup_bars=warmup_bars, max_workers=self._config.data_max_workers,
+                        warmup_bars=warmup_bars, indicators=indicators,
+                        max_workers=self._config.data_max_workers,
                     )
                     if uses_calibration:
                         anchor = period_params[period_idx][1]

@@ -48,7 +48,9 @@ leverage, entry type, and timing constraints.
 A strategy also declares:
 
 - **`symbols`** — which tickers it trades
-- **`market_data_request()`** — what datasets it needs (OHLCV, funding rates, mark price klines, etc.)
+- **`market_data_request()`** — what raw datasets it needs (OHLCV, funding rates, mark price klines, etc.)
+- **`indicator_request()`** — which indicator columns to precompute on each symbol's OHLCV frame (e.g. `("rsi_14", "bb_upper", "atr")`). The framework runs `compute_indicator_frame()` once per symbol during data preparation and caches the result in `PreparedMarketContext`; access it via `ctx.indicator_frame(symbol)`. Warmup bars for the requested indicators are added automatically.
+- **`required_warmup_bars`** — how many extra bars to fetch before the signal window for indicator history (default 100). When `indicator_request()` is declared, the framework ensures at least `required_warmup(indicator_request())` bars; set this higher only if you need additional bars.
 - **`analysis_interval`** / **`poll_interval`** — candle timeframe for analysis and optional faster polling
 - **`cooldown_hours`** — minimum time between signals on the same symbol
 
@@ -179,14 +181,19 @@ class MyStrategy(SignalGenerator):
     def symbols(self):
         return ["BTCUSDT", "ETHUSDT"]
 
+    def indicator_request(self):
+        return ("rsi_14", "bb_upper", "bb_lower", "atr")
+
     def generate_backtest_signals(self, prepared_context, symbols, start, end):
         signals = []
         for symbol in symbols:
-            candles = prepared_context.slice_analysis_candles(symbol, start, end)
-            for c in candles:
-                if some_condition(c):
+            # indicator_frame() has precomputed rsi_14, bb_upper, etc.
+            df = prepared_context.indicator_frame(symbol)
+            mask = (df["close_time"] >= start) & (df["close_time"] < end)
+            for _, row in df[mask].iterrows():
+                if row["rsi_14"] < 30 and row["close"] < row["bb_lower"]:
                     signals.append(Signal(
-                        signal_date=c.close_time,
+                        signal_date=row["close_time"],
                         position_type=PositionType.LONG,
                         ticker=symbol,
                         tp_pct=3.0,

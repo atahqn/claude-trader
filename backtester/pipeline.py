@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import threading
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
+
+import pandas as pd
 
 from marketdata import (
     DataRequirement,
@@ -69,6 +71,7 @@ class PreparedMarketContext:
     key_levels_data: dict[str, list[tuple[datetime, KeyLevels]]] = field(default_factory=dict)
     _analysis_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
     _poll_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
+    _indicator_frames: dict[str, pd.DataFrame] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         self._analysis_candles = {
@@ -125,6 +128,15 @@ class PreparedMarketContext:
             return None
         return entries[idx][1]
 
+    def indicator_frame(self, symbol: str) -> pd.DataFrame:
+        """Return the precomputed indicator frame for *symbol*.
+
+        Only available when the evaluator was given a generator that
+        declares ``indicator_request()``.  Raises ``KeyError`` if no
+        indicator frame exists for *symbol*.
+        """
+        return self._indicator_frames[symbol]
+
     def truncated_to(self, t: datetime) -> PreparedMarketContext:
         """Return a copy with all data after *t* physically removed.
 
@@ -159,7 +171,7 @@ class PreparedMarketContext:
             sym: [(ts, kl) for ts, kl in entries if ts <= t]
             for sym, entries in self.key_levels_data.items()
         }
-        return PreparedMarketContext(
+        ctx = PreparedMarketContext(
             start=self.start,
             end=self.end,
             fetch_start=self.fetch_start,
@@ -168,6 +180,10 @@ class PreparedMarketContext:
             poll_candles=truncated_poll,
             key_levels_data=truncated_kl,
         )
+        for sym, df in self._indicator_frames.items():
+            if not df.empty:
+                ctx._indicator_frames[sym] = df[df["close_time"] <= t].copy()
+        return ctx
 
 
 def _truncate_raw_datasets(
@@ -226,6 +242,7 @@ def prepare_market_context(
     request: MarketDataRequest | None = None,
     warmup: timedelta | None = None,
     warmup_bars: int = 0,
+    indicators: Sequence[str] = (),
     max_workers: int = 8,
 ) -> PreparedMarketContext:
     if request is None:
@@ -291,7 +308,7 @@ def prepare_market_context(
                     for future in as_completed(futures):
                         key_levels_data[futures[future]] = future.result()
 
-    return PreparedMarketContext(
+    ctx = PreparedMarketContext(
         start=start,
         end=end,
         fetch_start=fetch_start,
@@ -300,6 +317,15 @@ def prepare_market_context(
         poll_candles=poll_candles,
         key_levels_data=key_levels_data,
     )
+    if indicators:
+        from .indicators import compute_indicator_frame
+
+        for symbol, smc in bundle.by_symbol.items():
+            if not smc.frame.empty:
+                ctx._indicator_frames[symbol] = compute_indicator_frame(
+                    smc.frame, indicators,
+                )
+    return ctx
 
 
 T = TypeVar("T")

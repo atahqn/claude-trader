@@ -123,6 +123,31 @@ class SignalGenerator(ABC):
             return current
         return datetime.now(UTC)
 
+    @property
+    def required_warmup_bars(self) -> int:
+        """Minimum number of warmup bars the strategy needs.
+
+        The evaluator fetches this many extra bars before the signal window
+        so that indicators have enough history.  If ``indicator_request()``
+        is also declared, the framework ensures at least
+        ``required_warmup(indicator_request())`` bars automatically; set
+        this higher only when you need additional bars beyond the indicator
+        minimum.  Default is 100 for backward compatibility.
+        """
+        return 100
+
+    def indicator_request(self) -> tuple[str, ...]:
+        """Declare indicator columns to precompute on each symbol's OHLCV frame.
+
+        Return indicator names recognised by ``compute_indicator_frame()``.
+        The framework precomputes these in ``PreparedMarketContext`` and
+        makes them available via ``ctx.indicator_frame(symbol)``.
+
+        When declared, the framework automatically ensures enough warmup
+        bars are fetched for the requested indicators.
+        """
+        return ()
+
     def market_data_request(self) -> MarketDataRequest:
         """Declare the datasets this strategy needs.
 
@@ -247,6 +272,17 @@ class CompositeSignalGenerator(SignalGenerator):
                         f"'{seen[symbol]}' and '{gen.strategy_id}'"
                     )
                 seen[symbol] = gen.strategy_id
+
+    @property
+    def required_warmup_bars(self) -> int:
+        return max((g.required_warmup_bars for g in self._generators), default=100)
+
+    def indicator_request(self) -> tuple[str, ...]:
+        seen: dict[str, None] = {}
+        for g in self._generators:
+            for ind in g.indicator_request():
+                seen.setdefault(ind, None)
+        return tuple(seen)
 
     @property
     def strategy_id(self) -> str:
