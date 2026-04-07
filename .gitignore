@@ -7,3 +7,4 @@ venv/
 .env
 live/run_rsi_filtered.py
 live/rsi_filtered_strategy.py
+tests/
