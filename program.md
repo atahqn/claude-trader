@@ -6,9 +6,6 @@ This file defines the research rules for strategy development in this repo.
 
 The general goal is to create strategies that trade better on
 `EVALUATION_WINDOWS` in short have a better preference_score in this time window. 
-Every researcher will be given the current state of the research
-and current best preference score. An improvement to this score defines succesful research.
-If not succesful researcher should delete the logic and strategy it created.
 
 (preference_score is coverage_penalty * (gross_positive_weeks / gross_negative_weeks) * (total_pnl / max_drawdown) —
   essentially omega ratio times PnL-to-drawdown ratio, scaled down by a coverage penalty which penalizes weeks with 0 trades by: sqrt(active_weeks / total_weeks).)
@@ -51,7 +48,7 @@ still developing or selecting the strategy.
     Your research is either new or continuation of some other research. If it is continuation, user will explain what you are continuing on and what context you need. If not you start from scratch. Do not read already available research.
 3. Before starting your research you should understand the related parts of the code explained in the README.md.
 4. Create a directory with proper name for your research under the claude-trader.
-5. Create the strategy file that implements the SignalGenerator class under this folder. You can import other logic from other folders but the SignalGenerator implementation must be here.
+5. Create the strategy file that implements the SignalGenerator class under this folder. You can import other logic from other folders if you wish, but the SignalGenerator implementation must be here.
 6. Create results.tsv under this folder to save summarized results.
 7. Confirm your research with the user, ask him for the preference_score to beat, take his approval and start.
 

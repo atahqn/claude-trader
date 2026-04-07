@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random as _random_module
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .models import (
     AggTrade,
@@ -12,6 +12,14 @@ from .models import (
     PositionType,
     ResolutionLevel,
 )
+
+import os as _os
+
+try:
+    from resolver_rs import resolve_exit_rs as _rs_resolve_exit
+    _RUST_AVAILABLE = not _os.environ.get("RESOLVER_NO_RUST")
+except ImportError:
+    _RUST_AVAILABLE = False
 
 
 def compute_tp_sl_prices(
@@ -127,7 +135,19 @@ AggTradeFetcher = Callable[[datetime, datetime], list[AggTrade]]
 ApproximationLogger = Callable[[str], None]
 
 
-def resolve_exit(
+def _dt_to_ms(dt: datetime) -> int:
+    """Convert datetime to UTC milliseconds since epoch."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _ms_to_dt(ms: int) -> datetime:
+    """Convert UTC milliseconds to timezone-aware UTC datetime."""
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+
+def _resolve_exit_py(
     hour_candles: list[Candle],
     position_type: PositionType,
     tp_price: float,
@@ -506,3 +526,80 @@ def _barrier_outcome_for_candles(
     if not tp_touched and not sl_touched:
         return ExitReason.TIMEOUT
     return ExitReason.TP if tp_touched else ExitReason.SL
+
+
+def resolve_exit(
+    hour_candles: list[Candle],
+    position_type: PositionType,
+    tp_price: float,
+    sl_price: float,
+    entry_time: datetime,
+    minute_fetcher: MinuteFetcher,
+    agg_trade_fetcher: AggTradeFetcher,
+    end_time: datetime | None = None,
+    approximate: bool = False,
+    rng: _random_module.Random | None = None,
+    logger: ApproximationLogger | None = None,
+) -> ExitResolution | None:
+    """3-level hierarchical exit resolution: HOUR -> MINUTE -> TRADE.
+
+    Dispatches to the native Rust implementation when available, otherwise
+    falls back to the pure-Python resolver.
+    """
+    if _RUST_AVAILABLE and not approximate:
+        candle_tuples = [
+            (_dt_to_ms(c.open_time), _dt_to_ms(c.close_time), c.high, c.low)
+            for c in hour_candles
+        ]
+
+        def _wrap_min(start_ms: int, end_ms: int):
+            candles = minute_fetcher(_ms_to_dt(start_ms), _ms_to_dt(end_ms))
+            return [
+                (_dt_to_ms(c.open_time), _dt_to_ms(c.close_time), c.high, c.low)
+                for c in candles
+            ]
+
+        def _wrap_agg(start_ms: int, end_ms: int):
+            trades = agg_trade_fetcher(_ms_to_dt(start_ms), _ms_to_dt(end_ms))
+            return [(_dt_to_ms(t.timestamp), t.price) for t in trades]
+
+        seed = rng.getrandbits(64) if (approximate and rng is not None) else None
+
+        result = _rs_resolve_exit(
+            candle_tuples,
+            position_type is PositionType.LONG,
+            tp_price,
+            sl_price,
+            _dt_to_ms(entry_time),
+            _wrap_min,
+            _wrap_agg,
+            _dt_to_ms(end_time) if end_time is not None else None,
+            approximate,
+            seed,
+        )
+
+        if result is None:
+            return None
+
+        reason_str, time_ms, price, level_str, used_fallback = result
+        return ExitResolution(
+            reason=ExitReason(reason_str),
+            exit_time=_ms_to_dt(time_ms),
+            exit_price=price,
+            resolution_level=ResolutionLevel(level_str),
+            used_fallback=used_fallback,
+        )
+
+    return _resolve_exit_py(
+        hour_candles,
+        position_type,
+        tp_price,
+        sl_price,
+        entry_time,
+        minute_fetcher,
+        agg_trade_fetcher,
+        end_time,
+        approximate,
+        rng,
+        logger,
+    )
