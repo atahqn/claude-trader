@@ -36,6 +36,7 @@ class _GeneratorSlot:
     poll_interval_seconds: float
     last_pre_poll_boundary: datetime | None = None
     last_signal_poll_boundary: datetime | None = None
+    last_calibration_time: datetime | None = None
 
 
 class LiveEngine:
@@ -104,6 +105,11 @@ class LiveEngine:
             for slot in self._slots:
                 slot.generator.setup(self._market_client)
 
+            # Initial calibration for adaptive strategies
+            for slot in self._slots:
+                if slot.generator.needs_calibration:
+                    self._run_calibration(slot, self._futures_client.server_now())
+
             self._running = True
 
             def _shutdown(signum: int, frame: Any) -> None:
@@ -130,8 +136,12 @@ class LiveEngine:
     # -- Slot construction & validation -----------------------------------------
 
     def _build_slots(self) -> None:
+        from backtester.calibration import validate_calibration_config
+
         self._slots = []
         for gen, budget in self._generator_inputs:
+            if gen.needs_calibration:
+                validate_calibration_config(gen)
             market_request = gen.market_data_request()
             poll_interval = market_request.effective_poll_ohlcv_interval
             poll_seconds = float(interval_to_seconds(poll_interval))
@@ -173,12 +183,18 @@ class LiveEngine:
             file=sys.stderr,
         )
         for slot in self._slots:
+            calib_info = ""
+            if slot.generator.needs_calibration:
+                calib_info = (
+                    f" | calibration: every {slot.generator.calibration_interval_hours}h"
+                    f" lookback {slot.generator.calibration_lookback_hours}h"
+                )
             print(
                 f"  Slot '{slot.strategy_id}': "
                 f"poll={slot.poll_interval} | "
                 f"size={slot.budget.position_size_usdt} USDT | "
                 f"max_positions={slot.budget.max_positions} | "
-                f"symbols={len(slot.declared_symbols)}",
+                f"symbols={len(slot.declared_symbols)}{calib_info}",
                 file=sys.stderr,
             )
         try:
@@ -205,6 +221,9 @@ class LiveEngine:
                 self._tracker.check_fills(fills_now_utc)
                 self._tracker.save_state()
                 self._last_fill_check_time = fills_now_utc
+
+            # 1.5. Recalibrate adaptive strategies if due
+            self._maybe_recalibrate(fills_now_utc)
 
             # 2. Pre-poll: capital check before upcoming boundaries
             pre_poll_now_utc = self._futures_client.server_now()
@@ -318,6 +337,144 @@ class LiveEngine:
 
         coarse_sleep = seconds_until_boundary - lead
         return max(check_interval, coarse_sleep)
+
+    # -- Adaptive calibration ---------------------------------------------------
+
+    def _maybe_recalibrate(self, now_utc: datetime) -> None:
+        """Recalibrate adaptive strategies whose interval has elapsed."""
+        for slot in self._slots:
+            if not slot.generator.needs_calibration:
+                continue
+            if slot.last_calibration_time is None:
+                # Initial calibration should have run in start(); skip here.
+                continue
+            interval = timedelta(hours=slot.generator.calibration_interval_hours)
+            if now_utc - slot.last_calibration_time >= interval:
+                self._run_calibration(slot, now_utc)
+
+    def _run_calibration(self, slot: _GeneratorSlot, now_utc: datetime) -> None:
+        """Fetch lookback data, search parameters, and set active_params."""
+        import pandas as pd
+
+        from backtester.calibration import search_parameters
+        from live.signal_generator import CompositeSignalGenerator
+
+        gen = slot.generator
+        lookback_hours = gen.calibration_lookback_hours
+        # For composites, use the max lookback across calibrating children.
+        if isinstance(gen, CompositeSignalGenerator):
+            children = gen.calibration_children()
+            if not children:
+                return
+            lookback_hours = max(c.calibration_lookback_hours for c in children)
+
+        lookback_start = now_utc - timedelta(hours=lookback_hours)
+        assert self._market_client is not None
+
+        try:
+            frames: list[pd.DataFrame] = []
+            for symbol in gen.symbols:
+                candles = self._market_client.fetch_klines(
+                    symbol=symbol.replace("/", ""),
+                    interval=gen.analysis_interval,
+                    start=lookback_start,
+                    end=now_utc,
+                )
+                if candles:
+                    # Exclude in-progress candles: only completed bars.
+                    completed = [c for c in candles if c.close_time < now_utc]
+                    if not completed:
+                        continue
+                    rows = [
+                        {
+                            "open_time": c.open_time,
+                            "close_time": c.close_time,
+                            "open": c.open,
+                            "high": c.high,
+                            "low": c.low,
+                            "close": c.close,
+                            "volume": c.volume,
+                            "taker_buy_volume": c.taker_buy_volume,
+                            "symbol": symbol,
+                        }
+                        for c in completed
+                    ]
+                    frames.append(pd.DataFrame(rows))
+
+            if not frames:
+                print(
+                    f"Calibration skipped for {slot.strategy_id}: no lookback data",
+                    file=sys.stderr,
+                )
+                return
+
+            raw_frame = pd.concat(frames, ignore_index=True)
+
+            # Calibrate each child independently for composites.
+            if isinstance(gen, CompositeSignalGenerator):
+                any_success = False
+                for child in gen.calibration_children():
+                    child_symbols = set(child.symbols)
+                    child_frame = raw_frame[raw_frame["symbol"].isin(child_symbols)]
+                    if child_frame.empty:
+                        continue
+                    if self._calibrate_single_live(
+                        child, child_frame, now_utc, slot.strategy_id,
+                    ):
+                        any_success = True
+                if any_success:
+                    slot.last_calibration_time = now_utc
+            else:
+                if self._calibrate_single_live(gen, raw_frame, now_utc, slot.strategy_id):
+                    slot.last_calibration_time = now_utc
+
+        except Exception as exc:
+            print(
+                f"Calibration failed for {slot.strategy_id}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _calibrate_single_live(
+        self,
+        gen: SignalGenerator,
+        raw_frame: Any,
+        now_utc: datetime,
+        slot_id: str,
+    ) -> bool:
+        """Calibrate a single generator. Returns True on success."""
+        from backtester.calibration import search_parameters
+
+        frame = gen.build_calibration_frame(raw_frame, now_utc)
+        if frame is None or frame.empty:
+            print(
+                f"Calibration skipped for {slot_id}/{gen.strategy_id}: "
+                f"build_calibration_frame returned empty",
+                file=sys.stderr,
+            )
+            return False
+
+        result = search_parameters(
+            param_space=gen.param_space(),
+            score_fn=gen.score_params,
+            frame=frame,
+        )
+
+        if result is not None:
+            gen.active_params = result.best_params
+            print(
+                f"Calibrated {slot_id}/{gen.strategy_id}: "
+                f"params={result.best_params} "
+                f"score={result.best_score:.4f} "
+                f"({result.candidates_evaluated} candidates)",
+                file=sys.stderr,
+            )
+            return True
+
+        print(
+            f"Calibration returned no result for {slot_id}/{gen.strategy_id}",
+            file=sys.stderr,
+        )
+        return False
 
     # -- Pre-poll: shared reconcile + balance ----------------------------------
 

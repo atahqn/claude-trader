@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from .models import Signal
@@ -26,6 +26,26 @@ if TYPE_CHECKING:
 class LookaheadViolation:
     signal: Signal
     detail: str
+
+
+def _generate_signals(
+    generator: "SignalGenerator",
+    ctx: "PreparedMarketContext",
+    symbols: list[str],
+    start: datetime,
+    end: datetime,
+) -> list[Signal]:
+    """Generate signals using the calibration-aware path when needed."""
+    if not generator.needs_calibration:
+        return generator.generate_backtest_signals(ctx, symbols, start, end)
+
+    from .evaluator import _generate_signals_with_calibration
+
+    return _generate_signals_with_calibration(
+        generator, ctx, symbols, start, end,
+        calib_interval=timedelta(hours=generator.calibration_interval_hours),
+        calib_lookback=timedelta(hours=generator.calibration_lookback_hours),
+    )
 
 
 def validate_no_lookahead(
@@ -67,8 +87,8 @@ def validate_no_lookahead(
     seed:
         RNG seed for reproducible sampling.
     """
-    all_signals = generator.generate_backtest_signals(
-        prepared_context, symbols, start, end,
+    all_signals = _generate_signals(
+        generator, prepared_context, symbols, start, end,
     )
     if not all_signals:
         return []
@@ -79,8 +99,8 @@ def validate_no_lookahead(
     violations: list[LookaheadViolation] = []
     for signal in sampled:
         truncated_ctx = prepared_context.truncated_to(signal.signal_date)
-        trunc_signals = generator.generate_backtest_signals(
-            truncated_ctx, symbols, start, end,
+        trunc_signals = _generate_signals(
+            generator, truncated_ctx, symbols, start, end,
         )
         if not _signal_present(signal, trunc_signals):
             violations.append(

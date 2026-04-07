@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import pandas as pd
 
 from marketdata import MarketDataRequest
 
@@ -30,6 +32,56 @@ class SignalGenerator(ABC):
 
     analysis_interval: str = "1h"
     poll_interval: str | None = None
+
+    # -- Adaptive calibration (opt-in) ----------------------------------------
+    needs_calibration: bool = False
+    calibration_interval_hours: int = 168      # how often to recalibrate
+    calibration_lookback_hours: int = 720      # max history for calibration
+
+    @property
+    def active_params(self) -> dict[str, Any]:
+        """Current calibrated parameters, set by the framework."""
+        return getattr(self, "_active_params", {})
+
+    @active_params.setter
+    def active_params(self, value: dict[str, Any]) -> None:
+        self._active_params = value
+
+    def param_space(self) -> dict[str, list]:
+        """Search space for calibration.
+
+        Return a dict mapping parameter names to candidate value lists.
+        Example: ``{"tp_pct": [2.0, 2.5, 3.0], "rsi_thresh": [25, 30, 35]}``
+
+        Only called when ``needs_calibration`` is ``True``.
+        """
+        return {}
+
+    def score_params(self, params: dict[str, Any], frame: pd.DataFrame) -> float:
+        """Score a candidate parameter set on historical data.
+
+        Called by the calibration search for each combination from
+        :meth:`param_space`.  *frame* is a DataFrame covering the lookback
+        window (may include indicator columns if :meth:`build_calibration_frame`
+        adds them).
+
+        Return a float where **higher is better**.
+        """
+        return 0.0
+
+    def build_calibration_frame(
+        self, frame: pd.DataFrame, t: datetime,
+    ) -> pd.DataFrame:
+        """Filter / enrich the lookback data before calibration scoring.
+
+        *frame* contains the last ``calibration_lookback_hours`` of OHLCV data
+        across all symbols (with a ``symbol`` column), where every row has
+        ``close_time < t``.
+
+        Override to select a regime subset, add indicators, etc.
+        Default: returns *frame* unchanged.
+        """
+        return frame
 
     @property
     def strategy_id(self) -> str:
@@ -135,14 +187,55 @@ class CompositeSignalGenerator(SignalGenerator):
     ``StrategyEvaluator`` without any evaluator changes.
     """
 
+    @property
+    def needs_calibration(self) -> bool:  # type: ignore[override]
+        return any(g.needs_calibration for g in self._generators)
+
+    @property
+    def calibration_interval_hours(self) -> int:  # type: ignore[override]
+        children = self.calibration_children()
+        return children[0].calibration_interval_hours if children else 168
+
+    @property
+    def calibration_lookback_hours(self) -> int:  # type: ignore[override]
+        children = self.calibration_children()
+        return children[0].calibration_lookback_hours if children else 720
+
+    def calibration_children(self) -> list[SignalGenerator]:
+        """Return child generators that require calibration."""
+        return [g for g in self._generators if g.needs_calibration]
+
     def __init__(self, generators: list[SignalGenerator]) -> None:
         if not generators:
             raise ValueError("CompositeSignalGenerator requires at least one generator")
         self._generators = list(generators)
         self._validate_symbol_space()
-        self._all_symbols = []
+        self._validate_calibration_agreement()
+        self._all_symbols: list[str] = []
         for gen in self._generators:
             self._all_symbols.extend(gen.symbols)
+
+    def _validate_calibration_agreement(self) -> None:
+        """All calibrating children must share the same interval and lookback."""
+        children = self.calibration_children()
+        if len(children) <= 1:
+            return
+        first = children[0]
+        for child in children[1:]:
+            if child.calibration_interval_hours != first.calibration_interval_hours:
+                raise ValueError(
+                    f"Calibration interval conflict in CompositeSignalGenerator: "
+                    f"'{first.strategy_id}' uses {first.calibration_interval_hours}h "
+                    f"but '{child.strategy_id}' uses {child.calibration_interval_hours}h. "
+                    f"All calibrating children must share the same calibration_interval_hours."
+                )
+            if child.calibration_lookback_hours != first.calibration_lookback_hours:
+                raise ValueError(
+                    f"Calibration lookback conflict in CompositeSignalGenerator: "
+                    f"'{first.strategy_id}' uses {first.calibration_lookback_hours}h "
+                    f"but '{child.strategy_id}' uses {child.calibration_lookback_hours}h. "
+                    f"All calibrating children must share the same calibration_lookback_hours."
+                )
 
     def _validate_symbol_space(self) -> None:
         seen: dict[str, str] = {}

@@ -19,6 +19,9 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import pandas as pd
+
+from .calibration import CalibrationResult, search_parameters, validate_calibration_config
 from .engine import (
     DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS,
     _compute_stats,
@@ -28,9 +31,10 @@ from .engine import (
 from .eval_windows import CATEGORY_DESCRIPTIONS, EvalWindow
 from .models import BacktestResult, ExitReason, PositionType, Signal, TradeResult
 from .pipeline import BacktestExecutionSession, PreparedMarketContext, prepare_market_context
+from .preview import interval_to_timedelta
 
 if TYPE_CHECKING:
-    from live.signal_generator import SignalGenerator
+    from live.signal_generator import CompositeSignalGenerator, SignalGenerator
 
     from .data import BinanceClient
 
@@ -763,6 +767,122 @@ def _build_generator_from_factory(
     return strategy_cls(**kwargs)
 
 
+def _build_calibration_frame(
+    ctx: PreparedMarketContext,
+    symbols: list[str],
+    lookback_start: datetime,
+    lookback_end: datetime,
+) -> pd.DataFrame | None:
+    """Build a combined OHLCV frame for the calibration lookback window."""
+    frames: list[pd.DataFrame] = []
+    for symbol in symbols:
+        try:
+            smc = ctx.for_symbol(symbol)
+        except KeyError:
+            continue
+        if smc.frame.empty:
+            continue
+        mask = (smc.frame["close_time"] >= lookback_start) & (smc.frame["close_time"] < lookback_end)
+        sliced = smc.frame.loc[mask]
+        if not sliced.empty:
+            chunk = sliced.copy()
+            chunk["symbol"] = symbol
+            frames.append(chunk)
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
+def _calibrate_generator(
+    generator: Any,
+    ctx: PreparedMarketContext,
+    symbols: list[str],
+    chunk_start: datetime,
+    calib_lookback: timedelta,
+) -> None:
+    """Run one calibration cycle and set ``active_params`` on *generator*."""
+    from live.signal_generator import CompositeSignalGenerator
+
+    lookback_start = chunk_start - calib_lookback
+
+    if isinstance(generator, CompositeSignalGenerator):
+        for child in generator.calibration_children():
+            child_symbols = [s for s in symbols if s in child.symbols]
+            _calibrate_single(child, ctx, child_symbols, lookback_start, chunk_start)
+    else:
+        _calibrate_single(generator, ctx, symbols, lookback_start, chunk_start)
+
+
+def _calibrate_single(
+    generator: Any,
+    ctx: PreparedMarketContext,
+    symbols: list[str],
+    lookback_start: datetime,
+    lookback_end: datetime,
+) -> None:
+    raw_frame = _build_calibration_frame(ctx, symbols, lookback_start, lookback_end)
+    if raw_frame is None or raw_frame.empty:
+        return
+    frame = generator.build_calibration_frame(raw_frame, lookback_end)
+    if frame is None or frame.empty:
+        return
+    result = search_parameters(
+        param_space=generator.param_space(),
+        score_fn=generator.score_params,
+        frame=frame,
+    )
+    if result is not None:
+        generator.active_params = result.best_params
+
+
+def _generate_signals_with_calibration(
+    generator: Any,
+    ctx: PreparedMarketContext,
+    symbols: list[str],
+    sig_start: datetime,
+    sig_end: datetime,
+    calib_interval: timedelta,
+    calib_lookback: timedelta,
+    calibration_anchor: datetime | None = None,
+) -> list[Signal]:
+    """Generate signals with rolling recalibration.
+
+    Calibration points are anchored to *calibration_anchor* (defaults to
+    *sig_start*) so that parallel chunks sharing the same anchor produce
+    identical calibration schedules.
+    """
+    if calibration_anchor is None:
+        calibration_anchor = sig_start
+
+    # Build deterministic calibration boundaries within [sig_start, sig_end).
+    interval_secs = calib_interval.total_seconds()
+    elapsed = (sig_start - calibration_anchor).total_seconds()
+    k = max(0, int(elapsed // interval_secs))
+
+    boundaries: list[datetime] = []
+    t = calibration_anchor + timedelta(seconds=k * interval_secs)
+    while t < sig_end:
+        boundaries.append(t)
+        t += calib_interval
+    if not boundaries:
+        boundaries = [sig_start]
+
+    all_signals: list[Signal] = []
+    for i, calib_time in enumerate(boundaries):
+        _calibrate_generator(generator, ctx, symbols, calib_time, calib_lookback)
+
+        gen_start = max(sig_start, calib_time)
+        gen_end = boundaries[i + 1] if i + 1 < len(boundaries) else sig_end
+        gen_end = min(gen_end, sig_end)
+
+        if gen_start < gen_end:
+            sigs = generator.generate_backtest_signals(ctx, symbols, gen_start, gen_end)
+            all_signals.extend(sigs)
+
+    all_signals.sort(key=lambda s: s.signal_date)
+    return all_signals
+
+
 def _generate_period_signals(
     period_idx: int,
     strategy_factory: StrategyFactory,
@@ -773,6 +893,7 @@ def _generate_period_signals(
     request: Any,
     warmup_bars: int,
     data_max_workers: int,
+    calibration_config: tuple[int, int, datetime] | None = None,
 ) -> tuple[int, PreparedMarketContext, list[Signal]]:
     """Worker: create a fresh strategy + client, generate signals for one period."""
     from .data import BinanceClient
@@ -786,7 +907,16 @@ def _generate_period_signals(
         warmup_bars=warmup_bars,
         max_workers=data_max_workers,
     )
-    signals = generator.generate_backtest_signals(ctx, symbols, signal_start, signal_end)
+    if calibration_config is not None and generator.needs_calibration:
+        interval_h, lookback_h, anchor = calibration_config
+        signals = _generate_signals_with_calibration(
+            generator, ctx, symbols, signal_start, signal_end,
+            calib_interval=timedelta(hours=interval_h),
+            calib_lookback=timedelta(hours=lookback_h),
+            calibration_anchor=anchor,
+        )
+    else:
+        signals = generator.generate_backtest_signals(ctx, symbols, signal_start, signal_end)
     signals.sort(key=lambda s: s.signal_date)
     return period_idx, ctx, signals
 
@@ -832,6 +962,19 @@ class StrategyEvaluator:
         max_w = self._config.data_max_workers or (os.cpu_count() or 4)
         can_parallel = self._strategy_factory is not None and max_w > 1
         cooldown_h = generator.cooldown_hours
+
+        uses_calibration = generator.needs_calibration
+        calib_interval = timedelta(hours=generator.calibration_interval_hours)
+        calib_lookback = timedelta(hours=generator.calibration_lookback_hours)
+        if uses_calibration:
+            validate_calibration_config(generator)
+
+        # Warmup must cover calibration lookback when calibration is active.
+        warmup_bars = 100
+        if uses_calibration:
+            interval_td = interval_to_timedelta(request.ohlcv_interval)
+            interval_hours = interval_td.total_seconds() / 3600
+            warmup_bars = max(warmup_bars, int(generator.calibration_lookback_hours / interval_hours))
 
         # ------------------------------------------------------------------
         # Build chunk list: subdivide periods so we have >= max_w chunks.
@@ -887,11 +1030,19 @@ class StrategyEvaluator:
                 ctx = prepare_market_context(
                     self._symbols, sig_start, fetch_end,
                     client=self._client, request=request,
-                    warmup_bars=100, max_workers=self._config.data_max_workers,
+                    warmup_bars=warmup_bars, max_workers=self._config.data_max_workers,
                 )
-                sigs = generator.generate_backtest_signals(
-                    ctx, self._symbols, sig_start, sig_end,
-                )
+                if uses_calibration:
+                    anchor = period_params[period_idx][1]
+                    sigs = _generate_signals_with_calibration(
+                        generator, ctx, self._symbols, sig_start, sig_end,
+                        calib_interval, calib_lookback,
+                        calibration_anchor=anchor,
+                    )
+                else:
+                    sigs = generator.generate_backtest_signals(
+                        ctx, self._symbols, sig_start, sig_end,
+                    )
                 sigs.sort(key=lambda s: s.signal_date)
                 chunk_results.append((ci, period_idx, ctx, sigs))
         else:
@@ -906,8 +1057,13 @@ class StrategyEvaluator:
                             self._strategy_factory,
                             list(self._symbols),
                             sig_start, sig_end, fetch_end,
-                            request, 100,
+                            request, warmup_bars,
                             1,  # data_max_workers=1 inside each process
+                            (
+                                generator.calibration_interval_hours,
+                                generator.calibration_lookback_hours,
+                                period_params[period_idx][1],
+                            ) if uses_calibration else None,
                         ): (ci, period_idx)
                         for ci, period_idx, _, sig_start, sig_end, fetch_end in chunks
                     }
@@ -922,11 +1078,19 @@ class StrategyEvaluator:
                     ctx = prepare_market_context(
                         self._symbols, sig_start, fetch_end,
                         client=self._client, request=request,
-                        warmup_bars=100, max_workers=self._config.data_max_workers,
+                        warmup_bars=warmup_bars, max_workers=self._config.data_max_workers,
                     )
-                    sigs = generator.generate_backtest_signals(
-                        ctx, self._symbols, sig_start, sig_end,
-                    )
+                    if uses_calibration:
+                        anchor = period_params[period_idx][1]
+                        sigs = _generate_signals_with_calibration(
+                            generator, ctx, self._symbols, sig_start, sig_end,
+                            calib_interval, calib_lookback,
+                            calibration_anchor=anchor,
+                        )
+                    else:
+                        sigs = generator.generate_backtest_signals(
+                            ctx, self._symbols, sig_start, sig_end,
+                        )
                     sigs.sort(key=lambda s: s.signal_date)
                     chunk_results.append((ci, period_idx, ctx, sigs))
 
