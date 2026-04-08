@@ -5,6 +5,8 @@
 //! When installed, `backtester.resolver` dispatches here automatically;
 //! otherwise it falls back to pure Python.
 
+use std::cell::RefCell;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -604,17 +606,25 @@ fn resolve_exit_rs(
         .collect();
     let side = if is_long { Side::Long } else { Side::Short };
 
+    let fetch_err: RefCell<Option<PyErr>> = RefCell::new(None);
+
     let mut fetch_min = |start: i64, end: i64| -> Vec<Candle> {
-        minute_fetcher
-            .call1(py, (start, end))
-            .map(|obj| to_candles(py, &obj))
-            .unwrap_or_default()
+        match minute_fetcher.call1(py, (start, end)) {
+            Ok(obj) => to_candles(py, &obj),
+            Err(e) => {
+                *fetch_err.borrow_mut() = Some(e);
+                Vec::new()
+            }
+        }
     };
     let mut fetch_agg = |start: i64, end: i64| -> Vec<Trade> {
-        agg_trade_fetcher
-            .call1(py, (start, end))
-            .map(|obj| to_trades(py, &obj))
-            .unwrap_or_default()
+        match agg_trade_fetcher.call1(py, (start, end)) {
+            Ok(obj) => to_trades(py, &obj),
+            Err(e) => {
+                *fetch_err.borrow_mut() = Some(e);
+                Vec::new()
+            }
+        }
     };
 
     let result = if approximate {
@@ -644,6 +654,10 @@ fn resolve_exit_rs(
             &mut fetch_agg,
         )
     };
+
+    if let Some(e) = fetch_err.into_inner() {
+        return Err(e);
+    }
 
     Ok(result.map(|r| {
         (

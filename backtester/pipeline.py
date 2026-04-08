@@ -72,16 +72,36 @@ class PreparedMarketContext:
     _analysis_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
     _poll_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
     _indicator_frames: dict[str, pd.DataFrame] = field(init=False, repr=False, default_factory=dict)
+    _data_ranges: dict[str, tuple[datetime, datetime]] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
-        self._analysis_candles = {
-            symbol: _frame_to_candles(context.frame)
-            for symbol, context in self.bundle.by_symbol.items()
-        }
         self._poll_candles = {
             symbol: list(rows)
             for symbol, rows in self.poll_candles.items()
         }
+
+    def _ensure_analysis_candles(self, symbol: str) -> list[Candle]:
+        candles = self._analysis_candles.get(symbol)
+        if candles is None:
+            context = self.bundle.by_symbol.get(symbol)
+            candles = _frame_to_candles(context.frame) if context else []
+            self._analysis_candles[symbol] = candles
+        return candles
+
+    def data_range(self, symbol: str) -> tuple[datetime, datetime] | None:
+        """Return (first_open_time, last_logical_end) from actual frame data."""
+        cached = self._data_ranges.get(symbol)
+        if cached is not None:
+            return cached
+        smc = self.bundle.by_symbol.get(symbol)
+        if smc is None or smc.frame.empty:
+            return None
+        first_open = smc.frame["open_time"].iloc[0]
+        last_open = smc.frame["open_time"].iloc[-1]
+        interval_td = interval_to_timedelta(self.request.ohlcv_interval)
+        bounds = (first_open, last_open + interval_td)
+        self._data_ranges[symbol] = bounds
+        return bounds
 
     @property
     def symbols(self) -> list[str]:
@@ -96,7 +116,7 @@ class PreparedMarketContext:
         start: datetime,
         end: datetime,
     ) -> list[Candle]:
-        candles = self._analysis_candles.get(symbol, [])
+        candles = self._ensure_analysis_candles(symbol)
         if not candles:
             return []
         lo = bisect_left(candles, start, key=lambda c: c.open_time)
@@ -111,7 +131,7 @@ class PreparedMarketContext:
     ) -> list[Candle]:
         candles = self._poll_candles.get(symbol)
         if candles is None:
-            candles = self._analysis_candles.get(symbol, [])
+            candles = self._ensure_analysis_candles(symbol)
         if not candles:
             return []
         lo = bisect_left(candles, start, key=lambda c: c.open_time)
@@ -403,7 +423,6 @@ class _ChunkedWindowCache(Generic[T]):
                 rows.extend(chunk[lo:hi])
             cursor += self.chunk_size
 
-        rows.sort(key=self.time_selector)
         return rows
 
 
@@ -438,8 +457,11 @@ class BacktestExecutionSession:
         start: datetime,
         end: datetime,
     ) -> list[Candle]:
-        if self.prepared_context is not None and symbol in self.prepared_context.bundle.by_symbol:
-            return self.prepared_context.slice_analysis_candles(symbol, start, end)
+        ctx = self.prepared_context
+        if ctx is not None and symbol in ctx.bundle.by_symbol:
+            dr = ctx.data_range(symbol)
+            if dr is not None and dr[0] <= start and dr[1] >= end:
+                return ctx.slice_analysis_candles(symbol, start, end)
         return self.client.fetch_klines(symbol, self.analysis_interval, start, end)
 
     def fetch_minute_candles(

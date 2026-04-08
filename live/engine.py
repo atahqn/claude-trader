@@ -457,6 +457,7 @@ class LiveEngine:
             param_space=gen.param_space(),
             score_fn=gen.score_params,
             frame=frame,
+            prepare_fn=gen.prepare_score_context,
         )
 
         if result is not None:

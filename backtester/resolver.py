@@ -546,7 +546,7 @@ def resolve_exit(
     Dispatches to the native Rust implementation when available, otherwise
     falls back to the pure-Python resolver.
     """
-    if _RUST_AVAILABLE and not approximate:
+    if _RUST_AVAILABLE:
         candle_tuples = [
             (_dt_to_ms(c.open_time), _dt_to_ms(c.close_time), c.high, c.low)
             for c in hour_candles

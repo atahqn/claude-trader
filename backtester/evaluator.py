@@ -529,11 +529,15 @@ def _resolve_signals_parallel(
     entry_delay_seconds: int,
     max_workers: int,
     client: object = None,
+    signal_contexts: list[PreparedMarketContext | None] | None = None,
 ) -> list[TradeResult]:
-    """Resolve a flat list of signals in parallel using ProcessPoolExecutor.
+    """Resolve a flat list of signals, optionally with per-signal contexts.
 
-    Each process creates its own BinanceClient (with shared disk cache).
-    No PreparedMarketContext is passed — processes use the disk cache directly.
+    When *signal_contexts* is provided, each signal can be resolved against
+    its originating PreparedMarketContext (avoiding disk I/O for 1h candles).
+    Contexts are only used on the sequential path — the parallel path still
+    relies on the shared disk cache.
+
     Returns trades in the same order as the input signals.
     """
     if not signals:
@@ -547,11 +551,18 @@ def _resolve_signals_parallel(
         if c is None:
             from .data import BinanceClient
             c = BinanceClient()
-        session = BacktestExecutionSession(client=c)
+        first_ctx = signal_contexts[0] if signal_contexts else None
+        session = BacktestExecutionSession(client=c, prepared_context=first_ctx)
         from .engine import backtest_signal
 
         trades: list[TradeResult] = []
-        for signal, sig_seed in zip(signals, signal_seeds):
+        for i, (signal, sig_seed) in enumerate(zip(signals, signal_seeds)):
+            if signal_contexts is not None:
+                ctx = signal_contexts[i]
+                if session.prepared_context is not ctx:
+                    session.prepared_context = ctx
+                    if ctx is not None:
+                        session.analysis_interval = ctx.request.ohlcv_interval
             rng = _random_module.Random(sig_seed)
             trades.append(backtest_signal(
                 signal, approximate=approximate, rng=rng,
@@ -559,11 +570,19 @@ def _resolve_signals_parallel(
             ))
         return trades
 
-    effective_workers = (
-        min(len(signals), max_workers or (os.cpu_count() or 4))
-        if max_workers != 1
-        else 1
-    )
+    # Heuristic: approximate + in-memory contexts → sequential is faster
+    # than pickle overhead.  Explicit max_workers > 1 overrides the hint.
+    use_sequential_hint = approximate and signal_contexts is not None
+
+    if max_workers == 0:
+        if use_sequential_hint:
+            effective_workers = 1
+        else:
+            effective_workers = min(len(signals), os.cpu_count() or 4)
+    elif max_workers == 1:
+        effective_workers = 1
+    else:
+        effective_workers = min(len(signals), max_workers)
 
     if effective_workers <= 1:
         return _sequential()
@@ -832,6 +851,7 @@ def _calibrate_single(
         param_space=generator.param_space(),
         score_fn=generator.score_params,
         frame=frame,
+        prepare_fn=generator.prepare_score_context,
     )
     if result is not None:
         generator.active_params = result.best_params
@@ -1106,9 +1126,14 @@ class StrategyEvaluator:
 
         # ------------------------------------------------------------------
         # Merge chunks per period and enforce cooldown.
+        # Track signal→context provenance so each signal can resolve
+        # against the chunk context that generated it.
         # ------------------------------------------------------------------
+        signal_ctx_map: dict[int, PreparedMarketContext] = {}
         period_signals: dict[int, list[Signal]] = defaultdict(list)
-        for _, period_idx, _, sigs in chunk_results:
+        for _, period_idx, ctx, sigs in chunk_results:
+            for sig in sigs:
+                signal_ctx_map[id(sig)] = ctx
             period_signals[period_idx].extend(sigs)
 
         for period_idx in period_signals:
@@ -1119,6 +1144,7 @@ class StrategyEvaluator:
         # Phase 2: Backtest resolution — batch ALL signals, resolve in parallel.
         # ------------------------------------------------------------------
         all_signals_flat: list[Signal] = []
+        all_contexts_flat: list[PreparedMarketContext | None] = []
         window_info: list[tuple[EvalWindow, int, int, int, int]] = []
 
         for period_idx, (pw, _, _, _) in enumerate(period_params):
@@ -1133,6 +1159,9 @@ class StrategyEvaluator:
                 long_count = len(w_sigs) - short_count
                 offset = len(all_signals_flat)
                 all_signals_flat.extend(w_sigs)
+                all_contexts_flat.extend(
+                    signal_ctx_map.get(id(s)) for s in w_sigs
+                )
                 window_info.append((window, short_count, long_count, offset, len(w_sigs)))
 
         if all_signals_flat:
@@ -1143,6 +1172,7 @@ class StrategyEvaluator:
                 entry_delay_seconds=self._config.entry_delay_seconds,
                 max_workers=self._config.backtest_max_workers,
                 client=self._client,
+                signal_contexts=all_contexts_flat,
             )
         else:
             all_trades = []

@@ -25,7 +25,8 @@ claude-trader/
 │   └── run.py                  # Entry point for live trading
 ├── marketdata/
 │   └── models.py               # MarketDataRequest, SymbolMarketContext
-└── run_strategy_eval.py        # Entry point for backtest evaluation
+├── run_strategy_eval.py        # Entry point for backtest evaluation
+└── run_strategy_validate.py    # Entry point for lookahead validation
 ```
 
 
@@ -53,6 +54,30 @@ A strategy also declares:
 - **`required_warmup_bars`** — how many extra bars to fetch before the signal window for indicator history (default 100). When `indicator_request()` is declared, the framework ensures at least `required_warmup(indicator_request())` bars; set this higher only if you need additional bars.
 - **`analysis_interval`** / **`poll_interval`** — candle timeframe for analysis and optional faster polling
 - **`cooldown_hours`** — minimum time between signals on the same symbol
+- **`setup()` / `teardown()`** — optional live-engine lifecycle hooks
+
+For live logic, use `current_time()` instead of `datetime.now()` so the engine
+controls the clock consistently across generators.
+
+For backtesting, `generate_backtest_signals(prepared_context, symbols, start, end)`
+may receive context data outside the target window for warmup/history, but it
+must only emit signals whose `signal_date` is in `[start, end)`.
+
+### Advanced SignalGenerator Hooks
+
+Adaptive strategies can opt into framework-managed calibration:
+
+- **`needs_calibration`** — enable periodic parameter search
+- **`calibration_interval_hours`** — how often to recalibrate
+- **`calibration_lookback_hours`** — history used for each calibration cycle
+- **`param_space()`** — candidate parameter grid
+- **`build_calibration_frame(frame, t)`** — enrich/filter the lookback frame before scoring
+- **`prepare_score_context(frame)`** — cache shared expensive state in `frame.attrs`
+- **`score_params(params, frame)`** — score one candidate parameter set
+- **`active_params`** — the currently selected parameters during calibrated runs
+
+Use calibration only for small, development-justified search spaces. Most
+strategies can stay simpler with fixed parameters.
 
 ### Signal
 
@@ -102,6 +127,8 @@ The entry point is `run_strategy_eval.py`.
    `validate_no_lookahead()`): truncates market context to each signal's
    timestamp and re-runs generation. If a signal disappears, it was using
    future data.
+
+**CLI:** `python run_strategy_validate.py --strategy my_strategy.py:MyStrategy --windows development`
 
 ### Evaluation Windows
 
@@ -202,13 +229,19 @@ class MyStrategy(SignalGenerator):
         return signals
 
     def poll(self):
-        # Live: check current market, return Signal or None
+        now = self.current_time()
+        # Live: use the engine-injected time, then return Signal or None
         return None
 ```
 
 **Backtest it:**
 ```bash
 python run_strategy_eval.py --strategy my_strategy.py:MyStrategy --windows development
+```
+
+**Validate it:**
+```bash
+python run_strategy_validate.py --strategy my_strategy.py:MyStrategy --windows development
 ```
 
 **Deploy it live:**

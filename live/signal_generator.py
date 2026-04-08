@@ -69,6 +69,26 @@ class SignalGenerator(ABC):
         """
         return 0.0
 
+    def prepare_score_context(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Pre-compute shared state before the parameter grid search.
+
+        Called once per calibration cycle, before ``score_params`` runs for
+        each parameter combination.  The hook receives a shallow copy of the
+        calibration frame and **must only write to** ``frame.attrs`` — never
+        mutate columns, index, or underlying data (the shallow copy shares
+        column buffers with the original).  Frame enrichment (adding columns,
+        computing indicators) belongs in ``build_calibration_frame``, not here.
+
+        Cached attrs and any objects they reference **must not be mutated**
+        by ``score_params`` — they are shared across all candidate
+        evaluations and across forked processes in parallel mode, where
+        mutation defeats copy-on-write.
+
+        Must return the (enriched) DataFrame.  Default: returns *frame*
+        unchanged.
+        """
+        return frame
+
     def build_calibration_frame(
         self, frame: pd.DataFrame, t: datetime,
     ) -> pd.DataFrame:
