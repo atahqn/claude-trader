@@ -316,6 +316,7 @@ def backtest_signal(
         exit_reason = resolution.reason
         resolution_level = resolution.resolution_level
         used_fallback = used_fallback or resolution.used_fallback
+        random_resolved = resolution.random_resolved
     else:
         # Timeout: no exit within max_hours
         exit_reason = ExitReason.TIMEOUT
@@ -327,6 +328,7 @@ def backtest_signal(
             approximate=approximate,
         )
         used_fallback = used_fallback or timeout_used_fallback
+        random_resolved = False
 
     net_pnl, gross_pnl, fee_drag = compute_pnl(
         entry_price, exit_price, signal.position_type,
@@ -347,6 +349,7 @@ def backtest_signal(
         gross_pnl_pct=gross_pnl,
         fee_drag_pct=fee_drag,
         used_fallback=used_fallback,
+        random_resolved=random_resolved,
     )
 
 

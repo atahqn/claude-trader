@@ -437,7 +437,7 @@ def _resolve_candles_minute_approximate(
             f"picked {random_outcome.value} randomly for candle ending {candle.close_time.isoformat()}"
         )
         exit_price = tp_price if random_outcome is ExitReason.TP else sl_price
-        return ExitResolution(random_outcome, candle.close_time, exit_price, ResolutionLevel.MINUTE)
+        return ExitResolution(random_outcome, candle.close_time, exit_price, ResolutionLevel.MINUTE, random_resolved=True)
     return None
 
 

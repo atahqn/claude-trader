@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+import multiprocessing
 import os
 import random as _random_module
 from bisect import bisect_left
@@ -191,9 +192,10 @@ class EvaluationReport:
             risk_free_rate_annual=self.config.risk_free_rate_annual,
         )
 
-    def resolved_trade_breakdown(self) -> tuple[int, int]:
+    def resolved_trade_breakdown(self) -> tuple[int, int, int]:
         exact = 0
         fallback = 0
+        random_resolved = 0
         for wr in self.window_results:
             for trade in wr.backtest.trades:
                 if trade.exit_reason is ExitReason.UNFILLED:
@@ -202,7 +204,9 @@ class EvaluationReport:
                     fallback += 1
                 else:
                     exact += 1
-        return exact, fallback
+                if trade.random_resolved:
+                    random_resolved += 1
+        return exact, fallback, random_resolved
 
     def format_table(self) -> str:
         rows = self.all_summaries() + [self.overall_summary()]
@@ -769,6 +773,9 @@ StrategyFactory = (
     | list[tuple[str, str, dict[str, Any]]]
 )
 
+_shared_signal_strategy_factory: StrategyFactory | None = None
+_shared_period_contexts: dict[int, PreparedMarketContext] | None = None
+
 
 def _build_generator_from_factory(
     factory: StrategyFactory,
@@ -786,6 +793,16 @@ def _build_generator_from_factory(
     module = importlib.import_module(module_name)
     strategy_cls = getattr(module, class_name)
     return strategy_cls(**kwargs)
+
+
+def _init_signal_generation_worker(
+    strategy_factory: StrategyFactory,
+    period_contexts: dict[int, PreparedMarketContext],
+) -> None:
+    """Initializer for chunk signal-generation workers."""
+    global _shared_signal_strategy_factory, _shared_period_contexts
+    _shared_signal_strategy_factory = strategy_factory
+    _shared_period_contexts = period_contexts
 
 
 def _build_calibration_frame(
@@ -905,31 +922,53 @@ def _generate_signals_with_calibration(
     return all_signals
 
 
-def _generate_period_signals(
+def _required_chunk_warmup(
+    chunk_start: datetime,
+    chunk_end: datetime,
+    base_warmup: timedelta,
+    *,
+    uses_calibration: bool,
+    calib_interval: timedelta,
+    calib_lookback: timedelta,
+    calibration_anchor: datetime | None = None,
+) -> timedelta:
+    """Return the warmup needed for a chunk-local market context.
+
+    The current evaluator prepares one context per period, so production code
+    no longer needs this helper directly. We keep it because phase-0 tests use
+    it to verify the calibration boundary math a chunked implementation would
+    need to preserve.
+    """
+    del chunk_end  # Included for API symmetry with the phase-0 tests.
+
+    if not uses_calibration:
+        return base_warmup
+
+    if calibration_anchor is None:
+        calibration_anchor = chunk_start
+
+    interval_secs = calib_interval.total_seconds()
+    elapsed = (chunk_start - calibration_anchor).total_seconds()
+    k = max(0, int(elapsed // interval_secs))
+    first_calibration_time = calibration_anchor + timedelta(seconds=k * interval_secs)
+    calibration_warmup = (chunk_start - first_calibration_time) + calib_lookback
+    return max(base_warmup, calibration_warmup)
+
+
+def _generate_chunk_signals(
+    chunk_idx: int,
     period_idx: int,
-    strategy_factory: StrategyFactory,
     symbols: list[str],
     signal_start: datetime,
     signal_end: datetime,
-    fetch_end: datetime,
-    request: Any,
-    warmup_bars: int,
-    data_max_workers: int,
     calibration_config: tuple[int, int, datetime] | None = None,
-    indicators: tuple[str, ...] = (),
-) -> tuple[int, PreparedMarketContext, list[Signal]]:
-    """Worker: create a fresh strategy + client, generate signals for one period."""
-    from .data import BinanceClient
+) -> tuple[int, int, list[Signal]]:
+    """Worker: generate one chunk's signals using a shared period context."""
+    if _shared_signal_strategy_factory is None or _shared_period_contexts is None:
+        raise RuntimeError("signal-generation worker was not initialized")
 
-    generator = _build_generator_from_factory(strategy_factory)
-
-    client = BinanceClient()
-    ctx = prepare_market_context(
-        symbols, signal_start, fetch_end,
-        client=client, request=request,
-        warmup_bars=warmup_bars, indicators=indicators,
-        max_workers=data_max_workers,
-    )
+    generator = _build_generator_from_factory(_shared_signal_strategy_factory)
+    ctx = _shared_period_contexts[period_idx]
     if calibration_config is not None and generator.needs_calibration:
         interval_h, lookback_h, anchor = calibration_config
         signals = _generate_signals_with_calibration(
@@ -941,7 +980,7 @@ def _generate_period_signals(
     else:
         signals = generator.generate_backtest_signals(ctx, symbols, signal_start, signal_end)
     signals.sort(key=lambda s: s.signal_date)
-    return period_idx, ctx, signals
+    return chunk_idx, period_idx, signals
 
 
 # ---------------------------------------------------------------------------
@@ -993,20 +1032,23 @@ class StrategyEvaluator:
             validate_calibration_config(generator)
 
         # Warmup must cover indicator needs and calibration lookback.
+        analysis_interval = interval_to_timedelta(request.ohlcv_interval)
         indicators = generator.indicator_request()
         warmup_bars = generator.required_warmup_bars
         if indicators:
             from .indicators import required_warmup as _ind_warmup
             warmup_bars = max(warmup_bars, _ind_warmup(indicators))
         if uses_calibration:
-            interval_td = interval_to_timedelta(request.ohlcv_interval)
-            interval_hours = interval_td.total_seconds() / 3600
-            warmup_bars = max(warmup_bars, int(generator.calibration_lookback_hours / interval_hours))
+            interval_hours = analysis_interval.total_seconds() / 3600
+            warmup_bars = max(
+                warmup_bars,
+                math.ceil(generator.calibration_lookback_hours / interval_hours),
+            )
+        base_warmup = analysis_interval * warmup_bars
 
         # ------------------------------------------------------------------
         # Build chunk list: subdivide periods so we have >= max_w chunks.
-        # Each chunk: (chunk_idx, period_idx, windows, sig_start, sig_end,
-        #              fetch_end)
+        # Each chunk: (chunk_idx, period_idx, windows, sig_start, sig_end)
         # ------------------------------------------------------------------
         period_params: list[tuple[list[EvalWindow], datetime, datetime, datetime]] = []
         for period_windows in periods:
@@ -1017,7 +1059,7 @@ class StrategyEvaluator:
             fetch_end = signal_end + timedelta(hours=_DATA_BUFFER_HOURS)
             period_params.append((period_windows, signal_start, signal_end, fetch_end))
 
-        chunks: list[tuple[int, int, list[EvalWindow], datetime, datetime, datetime]] = []
+        chunks: list[tuple[int, int, list[EvalWindow], datetime, datetime]] = []
         chunk_idx = 0
         for period_idx, (pw, sig_start, sig_end, fetch_end) in enumerate(period_params):
             period_dur = sig_end - sig_start
@@ -1038,28 +1080,36 @@ class StrategyEvaluator:
                     c_sig_end = sig_start + chunk_dur * (ci + 1)
                     if ci == n_chunks - 1:
                         c_sig_end = sig_end  # avoid float drift
-                    c_fetch_end = c_sig_end + timedelta(hours=_DATA_BUFFER_HOURS)
-                    chunks.append((chunk_idx, period_idx, pw, c_sig_start, c_sig_end, c_fetch_end))
+                    chunks.append((chunk_idx, period_idx, pw, c_sig_start, c_sig_end))
                     chunk_idx += 1
             else:
-                chunks.append((chunk_idx, period_idx, pw, sig_start, sig_end, fetch_end))
+                chunks.append((chunk_idx, period_idx, pw, sig_start, sig_end))
                 chunk_idx += 1
 
         # ------------------------------------------------------------------
-        # Phase 1: Signal generation — parallel across chunks.
+        # Phase 1: Prepare one period context, then generate chunk signals.
         # ------------------------------------------------------------------
-        # Result per chunk: (chunk_idx, period_idx, ctx, signals)
-        chunk_results: list[tuple[int, int, PreparedMarketContext, list[Signal]]]
+        period_contexts: dict[int, PreparedMarketContext] = {}
+        for period_idx, (_, sig_start, _, fetch_end) in enumerate(period_params):
+            period_contexts[period_idx] = prepare_market_context(
+                self._symbols,
+                sig_start,
+                fetch_end,
+                client=self._client,
+                request=request,
+                warmup=base_warmup,
+                indicators=indicators,
+                max_workers=self._config.data_max_workers,
+            )
 
-        if not can_parallel or len(chunks) <= 1:
+        # Result per chunk: (chunk_idx, period_idx, signals)
+        chunk_results: list[tuple[int, int, list[Signal]]]
+
+        can_fork = multiprocessing.get_start_method() == "fork"
+        if not can_parallel or len(chunks) <= 1 or not can_fork:
             chunk_results = []
-            for ci, period_idx, pw, sig_start, sig_end, fetch_end in chunks:
-                ctx = prepare_market_context(
-                    self._symbols, sig_start, fetch_end,
-                    client=self._client, request=request,
-                    warmup_bars=warmup_bars, indicators=indicators,
-                    max_workers=self._config.data_max_workers,
-                )
+            for ci, period_idx, _, sig_start, sig_end in chunks:
+                ctx = period_contexts[period_idx]
                 if uses_calibration:
                     anchor = period_params[period_idx][1]
                     sigs = _generate_signals_with_calibration(
@@ -1072,57 +1122,37 @@ class StrategyEvaluator:
                         ctx, self._symbols, sig_start, sig_end,
                     )
                 sigs.sort(key=lambda s: s.signal_date)
-                chunk_results.append((ci, period_idx, ctx, sigs))
+                chunk_results.append((ci, period_idx, sigs))
         else:
-            try:
+            effective_w = min(len(chunks), max_w)
+            with ProcessPoolExecutor(
+                max_workers=effective_w,
+                mp_context=multiprocessing.get_context("fork"),
+                initializer=_init_signal_generation_worker,
+                initargs=(self._strategy_factory, period_contexts),
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        _generate_chunk_signals,
+                        ci,
+                        period_idx,
+                        list(self._symbols),
+                        sig_start,
+                        sig_end,
+                        (
+                            generator.calibration_interval_hours,
+                            generator.calibration_lookback_hours,
+                            period_params[period_idx][1],
+                        ) if uses_calibration else None,
+                    ): (ci, period_idx)
+                    for ci, period_idx, _, sig_start, sig_end in chunks
+                }
                 chunk_results = []
-                effective_w = min(len(chunks), max_w)
-                with ProcessPoolExecutor(max_workers=effective_w) as pool:
-                    futures = {
-                        pool.submit(
-                            _generate_period_signals,
-                            ci,
-                            self._strategy_factory,
-                            list(self._symbols),
-                            sig_start, sig_end, fetch_end,
-                            request, warmup_bars,
-                            1,  # data_max_workers=1 inside each process
-                            (
-                                generator.calibration_interval_hours,
-                                generator.calibration_lookback_hours,
-                                period_params[period_idx][1],
-                            ) if uses_calibration else None,
-                            indicators,
-                        ): (ci, period_idx)
-                        for ci, period_idx, _, sig_start, sig_end, fetch_end in chunks
-                    }
-                    for future in as_completed(futures):
-                        ci, period_idx = futures[future]
-                        result_ci, ctx, sigs = future.result()
-                        chunk_results.append((ci, period_idx, ctx, sigs))
-                chunk_results.sort(key=lambda x: x[0])
-            except (TypeError, AttributeError):
-                chunk_results = []
-                for ci, period_idx, pw, sig_start, sig_end, fetch_end in chunks:
-                    ctx = prepare_market_context(
-                        self._symbols, sig_start, fetch_end,
-                        client=self._client, request=request,
-                        warmup_bars=warmup_bars, indicators=indicators,
-                        max_workers=self._config.data_max_workers,
-                    )
-                    if uses_calibration:
-                        anchor = period_params[period_idx][1]
-                        sigs = _generate_signals_with_calibration(
-                            generator, ctx, self._symbols, sig_start, sig_end,
-                            calib_interval, calib_lookback,
-                            calibration_anchor=anchor,
-                        )
-                    else:
-                        sigs = generator.generate_backtest_signals(
-                            ctx, self._symbols, sig_start, sig_end,
-                        )
-                    sigs.sort(key=lambda s: s.signal_date)
-                    chunk_results.append((ci, period_idx, ctx, sigs))
+                for future in as_completed(futures):
+                    ci, period_idx = futures[future]
+                    result_ci, result_period_idx, sigs = future.result()
+                    chunk_results.append((result_ci, result_period_idx, sigs))
+            chunk_results.sort(key=lambda x: x[0])
 
         # ------------------------------------------------------------------
         # Merge chunks per period and enforce cooldown.
@@ -1131,7 +1161,8 @@ class StrategyEvaluator:
         # ------------------------------------------------------------------
         signal_ctx_map: dict[int, PreparedMarketContext] = {}
         period_signals: dict[int, list[Signal]] = defaultdict(list)
-        for _, period_idx, ctx, sigs in chunk_results:
+        for _, period_idx, sigs in chunk_results:
+            ctx = period_contexts[period_idx]
             for sig in sigs:
                 signal_ctx_map[id(sig)] = ctx
             period_signals[period_idx].extend(sigs)

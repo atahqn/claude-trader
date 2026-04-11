@@ -394,8 +394,8 @@ def print_run_summary(
         f"Sortino {_display_metric(report_summary.sortino_ratio)}"
     )
     if resolution_breakdown is not None:
-        exact_resolved, fallback_resolved = resolution_breakdown
-        print(f"Resolved:   {exact_resolved} exact | {fallback_resolved} fallback")
+        exact_resolved, fallback_resolved, random_resolved = resolution_breakdown
+        print(f"Resolved:   {exact_resolved} exact | {fallback_resolved} fallback | {random_resolved} random")
     print(f"Eligible:   {report_summary.preference_eligible}")
     print(f"Saved to:   {output_dir}")
 
@@ -502,11 +502,7 @@ def main() -> int:
         )
         report = evaluator.evaluate(strategy, windows)
         summary = report.overall_summary()
-        resolution_breakdown = (
-            report.resolved_trade_breakdown()
-            if not config.approximate
-            else None
-        )
+        resolution_breakdown = report.resolved_trade_breakdown()
 
         output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(
             strategy_name,

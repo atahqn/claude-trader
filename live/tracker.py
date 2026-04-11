@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -585,7 +586,10 @@ class PositionTracker:
         )]
         data = [self._serialize_position(p) for p in active]
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        _STATE_PATH.write_text(json.dumps(data, indent=2, default=str))
+        payload = json.dumps(data, indent=2, default=str)
+        tmp_path = _STATE_PATH.with_name(f"{_STATE_PATH.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(payload)
+        tmp_path.replace(_STATE_PATH)
         self._dirty = False
 
     def load_state(self) -> None:

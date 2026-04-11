@@ -56,7 +56,7 @@ After seeing evaluation results: either accept the candidate as genuinely genera
 1. Read `README.md`.
 2. Discuss with the user what to research. If new research, do not read existing research folders or prior `results.tsv`. If continuing, read only the relevant prior research specified by the user.
 3. Before starting research, understand the related parts of the code.
-4. Confirm the research direction with the user, ask whether there is a `preference_score` to beat, and get explicit approval to start. If no target score is provided, the research loop runs indefinitely until the user interrupts it.
+4. Confirm the research direction with the user and get explicit approval to start.
 
 Until the user explicitly approves, you may only read files and summarize findings. Before approval, you must NOT create research folders, strategy files, results.tsv, run backtests, pick a research direction, or begin the experiment loop. The "NEVER STOP" experiment loop starts only AFTER explicit user approval. Do not infer approval from silence, context, or unrelated follow-up questions.
 
@@ -270,27 +270,24 @@ cevat	cevat	cevat	cevat	cevat
 
 ## The Experiment Loop
 
-The experiment loop is an infinite sequence of sealed research cycles, each following: DEVELOP > FREEZE > VALIDATE > EVALUATE > LOG > repeat.
+The experiment loop is an infinite cycle of continuous improvement: DEVELOP > EVALUATE (check overfitting) > IMPROVE > repeat.
 
 Within each cycle:
 
-1. Develop only on `DEVELOPMENT_WINDOWS`.
+1. Develop on `DEVELOPMENT_WINDOWS`.
 2. Use development results, code understanding, and external research to refine.
-3. When confident, freeze the candidate.
-4. Before evaluation, record: strategy version, core hypothesis, chosen symbols, parameters, and why it should generalize.
-5. Run `python run_strategy_validate.py --strategy ... --windows development` on the frozen candidate.
-6. Run exactly one evaluation on `EVALUATION_WINDOWS`.
-7. Log the result to `results.tsv`.
+3. When the candidate looks promising, run evaluation on `EVALUATION_WINDOWS` to check for overfitting.
+4. Use the dev vs eval gap to diagnose generalization issues and improve.
+5. Log the result to `results.tsv` and continue with the next iteration.
 
 Loop rules:
 
 - after seeing evaluation results, do not make small parameter changes justified by specific evaluation outcomes
-- if a candidate fails, discard it and return to development with a materially new idea
+- if a candidate fails to generalize, diagnose why and return to development with a materially new idea
 - preserve failed candidate explanations in `results.tsv` so the same bad idea is not retried
-- if a candidate succeeds, record it as a good generalized strategy and continue researching through a new sealed cycle
 - use external sources, papers, blogposts, ideas freely during development
 
-**NEVER STOP**: Once the experiment loop has begun (after approval and initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". If no target score was provided, the loop runs indefinitely until the human interrupts you. If a target score was provided, the loop runs until the human interrupts you or until you beat that target.
+**NEVER STOP**: Once the experiment loop has begun (after approval and initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The loop runs indefinitely until the human interrupts you.
 
 ## Evaluation Windows
 

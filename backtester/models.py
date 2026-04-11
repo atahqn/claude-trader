@@ -90,6 +90,7 @@ class ExitResolution:
     exit_price: float
     resolution_level: ResolutionLevel
     used_fallback: bool = False
+    random_resolved: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -107,6 +108,7 @@ class TradeResult:
     gross_pnl_pct: float
     fee_drag_pct: float
     used_fallback: bool = False
+    random_resolved: bool = False
 
 
 @dataclass(slots=True)
