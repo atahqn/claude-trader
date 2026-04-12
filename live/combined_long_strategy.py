@@ -701,6 +701,7 @@ class CombinedLongStrategy(SignalGenerator):
 
         # -- 1. Fetch indicator frames for all symbols in parallel -----------
         frames: dict[str, pd.DataFrame] = {}
+        fetch_errors = 0
         with ThreadPoolExecutor(max_workers=6) as pool:
             future_to_symbol = {
                 pool.submit(self._fetch_symbol_frame, symbol, now): symbol
@@ -715,10 +716,19 @@ class CombinedLongStrategy(SignalGenerator):
                 except FatalSignalError:
                     raise
                 except Exception as exc:
+                    fetch_errors += 1
                     print(
                         f"CombinedLong: error fetching {symbol}: {exc}",
                         file=sys.stderr,
                     )
+
+        if fetch_errors > 0:
+            evaluated = len(SYMBOLS) - fetch_errors
+            print(
+                f"CombinedLong: {fetch_errors}/{len(SYMBOLS)} symbols had data fetch errors "
+                f"({evaluated} evaluated cleanly)",
+                file=sys.stderr,
+            )
 
         self._last_poll_time = now
 

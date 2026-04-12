@@ -555,9 +555,20 @@ class LiveEngine:
 
         # Poll all due generators in parallel
         slot_signals: dict[str, list[Signal]] = {}
+        errored_slots: set[str] = set()
         if len(due_slots) == 1:
             slot = due_slots[0]
-            slot_signals[slot.strategy_id] = self._poll_generator(slot, now_utc)
+            try:
+                slot_signals[slot.strategy_id] = self._poll_generator(slot, now_utc)
+            except FatalSignalError:
+                raise
+            except Exception as exc:
+                print(
+                    f"Signal generator error ({slot.strategy_id}): {exc}",
+                    file=sys.stderr,
+                )
+                slot_signals[slot.strategy_id] = []
+                errored_slots.add(slot.strategy_id)
         else:
             with ThreadPoolExecutor(max_workers=len(due_slots)) as pool:
                 future_to_slot = {
@@ -576,6 +587,7 @@ class LiveEngine:
                             file=sys.stderr,
                         )
                         slot_signals[slot.strategy_id] = []
+                        errored_slots.add(slot.strategy_id)
 
         # Mark boundaries
         for slot in due_slots:
@@ -584,22 +596,13 @@ class LiveEngine:
             )
 
         # Execute with per-generator budgets + global ceiling
-        self._execute_slot_signals(due_slots, slot_signals, balance)
+        self._execute_slot_signals(due_slots, slot_signals, balance, errored_slots)
 
     def _poll_generator(
         self, slot: _GeneratorSlot, now_utc: datetime,
     ) -> list[Signal]:
-        try:
-            slot.generator.set_poll_time(now_utc)
-            result = slot.generator.poll()
-        except FatalSignalError:
-            raise
-        except Exception as exc:
-            print(
-                f"Signal generator error ({slot.strategy_id}): {exc}",
-                file=sys.stderr,
-            )
-            return []
+        slot.generator.set_poll_time(now_utc)
+        result = slot.generator.poll()
         if result is None:
             return []
         if isinstance(result, list):
@@ -629,6 +632,7 @@ class LiveEngine:
         due_slots: list[_GeneratorSlot],
         slot_signals: dict[str, list[Signal]],
         balance: float,
+        errored_slots: set[str] | None = None,
     ) -> None:
         assert self._tracker is not None
 
@@ -741,7 +745,15 @@ class LiveEngine:
                 )
 
         if not any(slot_signals.get(s.strategy_id) for s in due_slots):
-            print("No signals this poll.", file=sys.stderr)
+            if errored_slots:
+                print(
+                    f"No signals this poll "
+                    f"({len(errored_slots)} slot(s) failed due to data errors: "
+                    f"{', '.join(sorted(errored_slots))})",
+                    file=sys.stderr,
+                )
+            else:
+                print("No signals this poll.", file=sys.stderr)
 
     # -- Helpers ---------------------------------------------------------------
 

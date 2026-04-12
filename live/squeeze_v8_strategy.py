@@ -1519,6 +1519,7 @@ class SqueezeV8Strategy(SignalGenerator):
         assert self._client is not None
         now = self.current_time()
         signals: list[Signal] = []
+        fetch_errors = 0
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             future_to_symbol = {
@@ -1533,7 +1534,16 @@ class SqueezeV8Strategy(SignalGenerator):
                 except FatalSignalError:
                     raise
                 except Exception as exc:
+                    fetch_errors += 1
                     print(f"Error checking {symbol}: {exc}", file=sys.stderr)
+
+        if fetch_errors > 0:
+            evaluated = len(SYMBOLS) - fetch_errors
+            print(
+                f"SqueezeV8: {fetch_errors}/{len(SYMBOLS)} symbols had data fetch errors "
+                f"({evaluated} evaluated cleanly)",
+                file=sys.stderr,
+            )
 
         signals = _apply_dynamic_sizing(signals, sizing_mode=self.sizing_mode)
         return signals if signals else None
