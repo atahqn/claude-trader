@@ -22,6 +22,7 @@ from .pipeline import (
 from .eval_windows import (
     ALL_WINDOWS,
     BULL_DEVELOPMENT_WINDOWS,
+    COMPLETE_WINDOWS,
     DEVELOPMENT_WINDOWS,
     EVALUATION_WINDOWS,
     EvalWindow,
@@ -31,7 +32,10 @@ from .eval_windows import (
     OOS5_WINDOWS,
     PAIRED_DEVELOPMENT_WINDOWS,
     OOS4_WINDOWS,
+    RANDOM_DEVELOPMENT_WINDOWS,
+    RANDOM_EVALUATION_WINDOWS,
     STRESS_DEVELOPMENT_WINDOWS,
+    TEST_WINDOWS,
 )
 from .evaluator import (
     CategorySummary,
@@ -74,6 +78,8 @@ __all__ = [
     "OOS4_WINDOWS",
     "PAIRED_DEVELOPMENT_WINDOWS",
     "PortfolioConfig",
+    "RANDOM_DEVELOPMENT_WINDOWS",
+    "RANDOM_EVALUATION_WINDOWS",
     "rank_evaluation_reports",
     "STRESS_DEVELOPMENT_WINDOWS",
     "StrategyEvaluator",

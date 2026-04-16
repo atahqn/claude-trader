@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -57,6 +58,14 @@ class PositionTracker:
         )
         return tracked_open + len(self._external_position_keys)
 
+    def open_count_for(self, strategy_id: str) -> int:
+        """Count active positions attributed to a specific strategy."""
+        return sum(
+            1 for p in self._positions
+            if p.strategy_id == strategy_id
+            and p.status in (PositionStatus.PENDING_ENTRY, PositionStatus.OPEN)
+        )
+
     # -- Position management ---------------------------------------------------
 
     def add_position(self, position: LivePosition) -> None:
@@ -97,11 +106,40 @@ class PositionTracker:
     def check_fills(self, now_utc: datetime | None = None) -> None:
         """Poll exchange for order status updates on all active positions."""
         now_utc = now_utc or self._client.server_now()
+        # Prefetch all exchange positions once (weight 5) instead of
+        # per-position get_position_info calls (weight 5 each).
+        all_exchange_positions: list[dict[str, Any]] | None = None
+        if any(p.status is PositionStatus.OPEN for p in self._positions):
+            try:
+                all_exchange_positions = self._client.get_position_info()
+            except Exception:
+                pass  # per-position fallback in _has_open_exchange_position
+
+        # Identify (symbol, side) pairs with multiple open positions so the
+        # exit-fill fast path is only used when a single position owns the
+        # entire exchange-level position.
+        side_counts: dict[tuple[str, str], int] = {}
+        for p in self._positions:
+            if p.status is PositionStatus.OPEN:
+                key = (
+                    _symbol_for_api(p.signal.ticker),
+                    "LONG" if p.signal.position_type is PositionType.LONG else "SHORT",
+                )
+                side_counts[key] = side_counts.get(key, 0) + 1
+
         for pos in self._positions:
             if pos.status is PositionStatus.PENDING_ENTRY:
                 self._check_entry_fill(pos, now_utc)
             elif pos.status is PositionStatus.OPEN:
-                exit_closed = self._check_exit_fills(pos, now_utc)
+                key = (
+                    _symbol_for_api(pos.signal.ticker),
+                    "LONG" if pos.signal.position_type is PositionType.LONG else "SHORT",
+                )
+                shares_side = side_counts.get(key, 1) > 1
+                exit_closed = self._check_exit_fills(
+                    pos, now_utc, all_exchange_positions,
+                    skip_fast_path=shares_side,
+                )
                 if exit_closed is not False:
                     continue
                 self._check_timeout(pos, now_utc)
@@ -153,11 +191,6 @@ class PositionTracker:
                     f"@ {pos.fill_price}, TP/SL placed.",
                     file=sys.stderr,
                 )
-                try:
-                    balance = self._client.get_available_balance()
-                    print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
-                except Exception:
-                    pass
             except Exception as exc:
                 print(
                     f"[{pos.position_id}] Entry filled but TP/SL placement failed: {exc}",
@@ -237,16 +270,23 @@ class PositionTracker:
     def _close_side(pos: LivePosition) -> OrderSide:
         return OrderSide.SELL if pos.signal.position_type is PositionType.LONG else OrderSide.BUY
 
-    def _has_open_exchange_position(self, pos: LivePosition) -> bool | None:
+    def _has_open_exchange_position(
+        self,
+        pos: LivePosition,
+        all_exchange_positions: list[dict[str, Any]] | None = None,
+    ) -> bool | None:
         """Return whether the exchange still reports an open position for *pos*."""
-        try:
-            raw_positions = self._client.get_position_info(pos.signal.ticker)
-        except Exception as exc:
-            print(
-                f"[{pos.position_id}] Failed to query exchange position: {exc}",
-                file=sys.stderr,
-            )
-            return None
+        if all_exchange_positions is not None:
+            raw_positions = all_exchange_positions
+        else:
+            try:
+                raw_positions = self._client.get_position_info(pos.signal.ticker)
+            except Exception as exc:
+                print(
+                    f"[{pos.position_id}] Failed to query exchange position: {exc}",
+                    file=sys.stderr,
+                )
+                return None
 
         api_symbol = _symbol_for_api(pos.signal.ticker)
         target_side = self._position_side(pos)
@@ -362,7 +402,26 @@ class PositionTracker:
 
         return exit_reason, total_notional / total_qty, exit_time
 
-    def _check_exit_fills(self, pos: LivePosition, now_utc: datetime) -> bool | None:
+    def _check_exit_fills(
+        self,
+        pos: LivePosition,
+        now_utc: datetime,
+        all_exchange_positions: list[dict[str, Any]] | None = None,
+        *,
+        skip_fast_path: bool = False,
+    ) -> bool | None:
+        # Fast path: when only one position owns the exchange-level side and
+        # that side is still open, no TP/SL can have triggered — skip order
+        # queries.  Disabled when multiple positions share the same side
+        # because a per-quantity TP/SL fill leaves the exchange position open.
+        if all_exchange_positions is not None:
+            exchange_open = self._has_open_exchange_position(pos, all_exchange_positions)
+            if exchange_open is True and not skip_fast_path:
+                return False
+        else:
+            exchange_open = None
+
+        # Position gone or couldn't determine — query TP/SL to detect fills
         tp_filled = False
         sl_filled = False
         query_failed = False
@@ -379,7 +438,8 @@ class PositionTracker:
                 )
                 query_failed = True
 
-        if pos.sl_order is not None:
+        # Skip SL query if TP already filled
+        if not tp_filled and pos.sl_order is not None:
             try:
                 updated_sl = self._query_order(pos.signal.ticker, pos.sl_order)
                 pos.sl_order = updated_sl
@@ -404,7 +464,10 @@ class PositionTracker:
             self._finalize_close(pos, exit_order, exit_reason, now_utc)
             return True
 
-        exchange_open = self._has_open_exchange_position(pos)
+        # No fill from order queries — check exchange position if not yet known
+        if exchange_open is None:
+            exchange_open = self._has_open_exchange_position(pos, all_exchange_positions)
+
         if exchange_open is False:
             exit_reason, exit_order = self._infer_exchange_exit(pos)
             if exit_reason == "EXTERNAL":
@@ -521,11 +584,6 @@ class PositionTracker:
             f"@ {exit_price_text} | PnL: {pnl_text}",
             file=sys.stderr,
         )
-        try:
-            balance = self._client.get_available_balance()
-            print(f"Available capital: {balance:.2f} USDT", file=sys.stderr)
-        except Exception:
-            pass
 
     # -- State persistence -----------------------------------------------------
 
@@ -538,7 +596,10 @@ class PositionTracker:
         )]
         data = [self._serialize_position(p) for p in active]
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        _STATE_PATH.write_text(json.dumps(data, indent=2, default=str))
+        payload = json.dumps(data, indent=2, default=str)
+        tmp_path = _STATE_PATH.with_name(f"{_STATE_PATH.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(payload)
+        tmp_path.replace(_STATE_PATH)
         self._dirty = False
 
     def load_state(self) -> None:
@@ -600,6 +661,7 @@ class PositionTracker:
 
         return {
             "position_id": pos.position_id,
+            "strategy_id": pos.strategy_id,
             "status": pos.status.value,
             "signal": _signal_dict(pos.signal),
             "entry_order": _order_dict(pos.entry_order),
@@ -649,6 +711,7 @@ class PositionTracker:
             return LivePosition(
                 signal=signal,
                 position_id=data["position_id"],
+                strategy_id=data.get("strategy_id", ""),
                 status=PositionStatus(data["status"]),
                 entry_order=_parse_order(data.get("entry_order")),
                 tp_order=_parse_order(data.get("tp_order")),

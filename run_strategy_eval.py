@@ -29,6 +29,7 @@ from backtester import PortfolioConfig, StrategyEvaluator
 from backtester.eval_windows import (
     ALL_WINDOWS,
     BULL_DEVELOPMENT_WINDOWS,
+    COMPLETE_WINDOWS,
     DEVELOPMENT_WINDOWS,
     EVALUATION_WINDOWS,
     HOLDOUT_WINDOWS,
@@ -38,14 +39,18 @@ from backtester.eval_windows import (
     OOS4_WINDOWS,
     OOS5_WINDOWS,
     PAIRED_DEVELOPMENT_WINDOWS,
+    RANDOM_DEVELOPMENT_WINDOWS,
+    RANDOM_EVALUATION_WINDOWS,
     STRESS_DEVELOPMENT_WINDOWS,
+    TEST_WINDOWS,
     EvalWindow,
 )
-from live.signal_generator import SignalGenerator
+from live.signal_generator import CompositeSignalGenerator, SignalGenerator
 
 
 WINDOW_ALIASES: dict[str, list[EvalWindow]] = {
     "all": ALL_WINDOWS,
+    "complete": COMPLETE_WINDOWS,
     "dev": DEVELOPMENT_WINDOWS,
     "development": DEVELOPMENT_WINDOWS,
     "eval": EVALUATION_WINDOWS,
@@ -55,10 +60,13 @@ WINDOW_ALIASES: dict[str, list[EvalWindow]] = {
     "oos3": OOS3_WINDOWS,
     "oos4": OOS4_WINDOWS,
     "oos5": OOS5_WINDOWS,
+    "test": TEST_WINDOWS,
     "legacy_development": LEGACY_DEVELOPMENT_WINDOWS,
     "development_stress": STRESS_DEVELOPMENT_WINDOWS,
     "development_bull": BULL_DEVELOPMENT_WINDOWS,
     "development_pairs": PAIRED_DEVELOPMENT_WINDOWS,
+    "development_random": RANDOM_DEVELOPMENT_WINDOWS,
+    "evaluation_random": RANDOM_EVALUATION_WINDOWS,
 }
 
 
@@ -69,9 +77,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         required=True,
+        nargs="+",
         help=(
-            "Strategy spec as module[:attr] or path/to/file.py[:attr]. "
-            "If attr is omitted, a unique SignalGenerator subclass defined in the file is used."
+            "One or more strategy specs as module[:attr] or path/to/file.py[:attr]. "
+            "If attr is omitted, a unique SignalGenerator subclass defined in the file is used. "
+            "When multiple specs are given, strategies are combined into a composite."
         ),
     )
     parser.add_argument(
@@ -83,9 +93,20 @@ def parse_args() -> argparse.Namespace:
         "--windows",
         default="eval",
         help=(
-            "Window pack: eval, dev, all, holdout, oos2, oos3, oos4, oos5, "
-            "legacy_development, development_stress, development_bull, development_pairs."
+            "Window pack: eval, dev, all, complete, test, holdout, oos2, oos3, oos4, oos5, "
+            "legacy_development, development_stress, development_bull, "
+            "development_pairs, development_random, evaluation_random."
         ),
+    )
+    parser.add_argument(
+        "--start",
+        default="",
+        help="Custom period start date (YYYY-MM-DD). Used with --end to define an arbitrary evaluation window.",
+    )
+    parser.add_argument(
+        "--end",
+        default="",
+        help="Custom period end date (YYYY-MM-DD). Used with --start to define an arbitrary evaluation window.",
     )
     parser.add_argument(
         "--symbols",
@@ -134,9 +155,44 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--data-max-workers",
+        type=int,
+        default=8,
+        help="Max threads for parallel symbol data fetching (default: 8).",
+    )
+    parser.add_argument(
+        "--backtest-max-workers",
+        type=int,
+        default=0,
+        help="Max threads for parallel signal backtesting (0 = auto, caps at 16; 1 = sequential).",
+    )
+    parser.add_argument(
         "--output-dir",
         default="",
         help="Optional output directory. Defaults to outputs/strategy_eval/<strategy>_<windows>_<mode>_<timestamp>.",
+    )
+    parser.add_argument(
+        "--equity-curve",
+        action="store_true",
+        default=False,
+        help="Generate a granular equity curve plot from intermediate candle data.",
+    )
+    parser.add_argument(
+        "--equity-interval",
+        default="15m",
+        help="Candle interval for equity curve granularity (default: 15m).",
+    )
+    parser.add_argument(
+        "--position-size-usdt",
+        type=float,
+        default=10_000.0,
+        help="Position size in USDT per trade for equity curve (default: 10000).",
+    )
+    parser.add_argument(
+        "--starting-capital",
+        type=float,
+        default=10_000.0,
+        help="Starting capital in USDT for equity curve (default: 10000).",
     )
     return parser.parse_args()
 
@@ -320,6 +376,7 @@ def print_run_summary(
     output_dir: Path,
     report_summary: Any,
     table: str,
+    resolution_breakdown: tuple[int, int] | None = None,
 ) -> None:
     print(table)
     print()
@@ -336,6 +393,9 @@ def print_run_summary(
         f"PF {_display_metric(report_summary.profit_factor)} | "
         f"Sortino {_display_metric(report_summary.sortino_ratio)}"
     )
+    if resolution_breakdown is not None:
+        exact_resolved, fallback_resolved, random_resolved = resolution_breakdown
+        print(f"Resolved:   {exact_resolved} exact | {fallback_resolved} fallback | {random_resolved} random")
     print(f"Eligible:   {report_summary.preference_eligible}")
     print(f"Saved to:   {output_dir}")
 
@@ -346,13 +406,58 @@ def _display_metric(value: float) -> str:
     return "inf" if value > 0 else "-inf"
 
 
+def _load_strategies(
+    specs: list[str], kwargs: dict[str, Any],
+) -> tuple[SignalGenerator, str, str]:
+    """Load one or more strategy specs and return (generator, display_name, strategy_spec_str).
+
+    For a single spec, returns the generator directly.
+    For multiple specs, wraps them in a CompositeSignalGenerator.
+    kwargs are only applied when a single strategy is loaded.
+    """
+    if len(specs) == 1:
+        strategy, module, name = load_strategy(specs[0], kwargs)
+        return strategy, name, specs[0]
+
+    if kwargs and kwargs != {}:
+        raise ValueError("--strategy-kwargs is not supported with multiple strategies")
+
+    generators: list[SignalGenerator] = []
+    names: list[str] = []
+    for spec in specs:
+        gen, _, name = load_strategy(spec, {})
+        generators.append(gen)
+        names.append(name)
+
+    composite = CompositeSignalGenerator(generators)
+    display_name = "+".join(names)
+    spec_str = " ".join(specs)
+    return composite, display_name, spec_str
+
+
 def main() -> int:
     args = parse_args()
     try:
         strategy_kwargs = parse_strategy_kwargs(args.strategy_kwargs)
-        window_label, windows = resolve_windows(args.windows)
-        strategy, module, strategy_name = load_strategy(args.strategy, strategy_kwargs)
-        symbols = resolve_symbols(args.symbols, module, strategy)
+        if args.start and args.end:
+            start_dt = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=UTC)
+            end_dt = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=UTC)
+            if end_dt <= start_dt:
+                raise ValueError("--end must be after --start")
+            window_label = f"{args.start}_to_{args.end}"
+            windows = [EvalWindow(window_label, start_dt, end_dt, "custom")]
+        elif args.start or args.end:
+            raise ValueError("Both --start and --end are required for a custom period")
+        else:
+            window_label, windows = resolve_windows(args.windows)
+        strategy, strategy_name, strategy_spec = _load_strategies(
+            args.strategy, strategy_kwargs,
+        )
+        symbols = (
+            [s.strip() for s in args.symbols.split(",") if s.strip()]
+            if args.symbols.strip()
+            else strategy.symbols
+        )
 
         config = PortfolioConfig(
             approximate=args.approximate,
@@ -367,14 +472,37 @@ def main() -> int:
                 if args.entry_delay_seconds is not None
                 else PortfolioConfig().entry_delay_seconds
             ),
+            data_max_workers=args.data_max_workers,
+            backtest_max_workers=args.backtest_max_workers,
         )
+        # Build a strategy factory for parallel signal generation.
+        strategy_factory = None
+        if len(args.strategy) == 1:
+            spec = args.strategy[0]
+            module_spec, _, attr_name = spec.partition(":")
+            module_name = _normalize_module_name(module_spec)
+            if attr_name:
+                strategy_factory = (module_name, attr_name, strategy_kwargs)
+        else:
+            # Composite: list of (module, class, {}) tuples.
+            parts = []
+            for spec in args.strategy:
+                module_spec, _, attr_name = spec.partition(":")
+                if not attr_name:
+                    parts = None
+                    break
+                parts.append((_normalize_module_name(module_spec), attr_name, {}))
+            strategy_factory = parts
+
         evaluator = StrategyEvaluator(
             symbols=symbols,
             config=config,
             cooldown_warmup=timedelta(days=args.cooldown_warmup_days),
+            strategy_factory=strategy_factory,
         )
         report = evaluator.evaluate(strategy, windows)
         summary = report.overall_summary()
+        resolution_breakdown = report.resolved_trade_breakdown()
 
         output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(
             strategy_name,
@@ -384,16 +512,16 @@ def main() -> int:
         saved_dir = report.save(output_dir)
         enrich_meta(
             saved_dir / "meta.json",
-            strategy_spec=args.strategy,
+            strategy_spec=strategy_spec,
             strategy_name=strategy_name,
             strategy_kwargs=strategy_kwargs,
-            module_name=module.__name__,
+            module_name=strategy_name,
             window_selector=window_label,
             symbols=symbols,
             summary=summary,
         )
         print_run_summary(
-            strategy_spec=args.strategy,
+            strategy_spec=strategy_spec,
             strategy_name=strategy_name,
             window_selector=window_label,
             approximate=config.approximate,
@@ -401,7 +529,40 @@ def main() -> int:
             output_dir=saved_dir,
             report_summary=summary,
             table=report.format_table(),
+            resolution_breakdown=resolution_breakdown,
         )
+
+        if args.equity_curve:
+            from backtester.data import BinanceClient
+            from backtester.equity_curve import (
+                compute_granular_equity_curve,
+                plot_equity_curve,
+                save_equity_csv,
+            )
+
+            all_trades = [t for wr in report.window_results for t in wr.backtest.trades]
+            client = BinanceClient()
+            points = compute_granular_equity_curve(
+                all_trades,
+                client,
+                interval=args.equity_interval,
+                position_size_usdt=args.position_size_usdt,
+                starting_capital=args.starting_capital,
+                max_workers=args.data_max_workers,
+            )
+            if points:
+                curve_title = f"{strategy_name} \u2014 Equity Curve ({args.equity_interval})"
+                plot_path = plot_equity_curve(
+                    points,
+                    saved_dir / "equity_curve.html",
+                    title=curve_title,
+                    starting_capital=args.starting_capital,
+                    interval=args.equity_interval,
+                )
+                csv_path = save_equity_csv(points, saved_dir / "equity_curve.csv")
+                print(f"Equity curve: {plot_path}")
+                print(f"Equity data:  {csv_path}")
+
         return 0
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

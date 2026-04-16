@@ -60,6 +60,7 @@ class PartialCandleAccumulator:
     low: float = 0.0
     close: float = 0.0
     volume: float = 0.0
+    taker_buy_volume: float = 0.0
     _analysis_duration: timedelta = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -78,6 +79,7 @@ class PartialCandleAccumulator:
                     low=self.low,
                     close=self.close,
                     volume=self.volume,
+                    taker_buy_volume=self.taker_buy_volume,
                 )
             self.open_time = source_period_start
             self.close_time = poll_bar.close_time
@@ -86,12 +88,14 @@ class PartialCandleAccumulator:
             self.low = poll_bar.low
             self.close = poll_bar.close
             self.volume = poll_bar.volume
+            self.taker_buy_volume = poll_bar.taker_buy_volume
         else:
             self.close_time = poll_bar.close_time
             self.high = max(self.high, poll_bar.high)
             self.low = min(self.low, poll_bar.low)
             self.close = poll_bar.close
             self.volume += poll_bar.volume
+            self.taker_buy_volume += poll_bar.taker_buy_volume
 
         candle = Candle(
             open_time=self.open_time,
@@ -101,6 +105,7 @@ class PartialCandleAccumulator:
             low=self.low,
             close=self.close,
             volume=self.volume,
+            taker_buy_volume=self.taker_buy_volume,
         )
         is_final = candle.close_time >= source_period_start + self._analysis_duration
         return PreviewSnapshot(
@@ -119,6 +124,7 @@ class PartialCandleAccumulator:
         self.low = 0.0
         self.close = 0.0
         self.volume = 0.0
+        self.taker_buy_volume = 0.0
 
 
 def iter_preview_snapshots(

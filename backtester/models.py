@@ -80,6 +80,7 @@ class Candle:
     low: float
     close: float
     volume: float = 0.0
+    taker_buy_volume: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,6 +89,8 @@ class ExitResolution:
     exit_time: datetime
     exit_price: float
     resolution_level: ResolutionLevel
+    used_fallback: bool = False
+    random_resolved: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -104,6 +107,8 @@ class TradeResult:
     pnl_pct: float
     gross_pnl_pct: float
     fee_drag_pct: float
+    used_fallback: bool = False
+    random_resolved: bool = False
 
 
 @dataclass(slots=True)

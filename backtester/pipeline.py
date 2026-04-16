@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import threading
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
+
+import pandas as pd
 
 from marketdata import (
     DataRequirement,
@@ -10,6 +16,7 @@ from marketdata import (
     MarketDataRequest,
     SymbolMarketContext,
 )
+from marketdata.key_levels import KeyLevels, compute_key_levels_series
 
 from .models import AggTrade, Candle
 from .preview import interval_to_timedelta
@@ -61,18 +68,40 @@ class PreparedMarketContext:
     request: MarketDataRequest
     bundle: MarketContextBundle
     poll_candles: dict[str, list[Candle]] = field(default_factory=dict)
-    _hourly_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
+    key_levels_data: dict[str, list[tuple[datetime, KeyLevels]]] = field(default_factory=dict)
+    _analysis_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
     _poll_candles: dict[str, list[Candle]] = field(init=False, repr=False, default_factory=dict)
+    _indicator_frames: dict[str, pd.DataFrame] = field(init=False, repr=False, default_factory=dict)
+    _data_ranges: dict[str, tuple[datetime, datetime]] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
-        self._hourly_candles = {
-            symbol: _frame_to_candles(context.frame)
-            for symbol, context in self.bundle.by_symbol.items()
-        }
         self._poll_candles = {
             symbol: list(rows)
             for symbol, rows in self.poll_candles.items()
         }
+
+    def _ensure_analysis_candles(self, symbol: str) -> list[Candle]:
+        candles = self._analysis_candles.get(symbol)
+        if candles is None:
+            context = self.bundle.by_symbol.get(symbol)
+            candles = _frame_to_candles(context.frame) if context else []
+            self._analysis_candles[symbol] = candles
+        return candles
+
+    def data_range(self, symbol: str) -> tuple[datetime, datetime] | None:
+        """Return (first_open_time, last_logical_end) from actual frame data."""
+        cached = self._data_ranges.get(symbol)
+        if cached is not None:
+            return cached
+        smc = self.bundle.by_symbol.get(symbol)
+        if smc is None or smc.frame.empty:
+            return None
+        first_open = smc.frame["open_time"].iloc[0]
+        last_open = smc.frame["open_time"].iloc[-1]
+        interval_td = interval_to_timedelta(self.request.ohlcv_interval)
+        bounds = (first_open, last_open + interval_td)
+        self._data_ranges[symbol] = bounds
+        return bounds
 
     @property
     def symbols(self) -> list[str]:
@@ -81,20 +110,18 @@ class PreparedMarketContext:
     def for_symbol(self, symbol: str) -> SymbolMarketContext:
         return self.bundle.for_symbol(symbol)
 
-    def slice_hourly_candles(
+    def slice_analysis_candles(
         self,
         symbol: str,
         start: datetime,
         end: datetime,
     ) -> list[Candle]:
-        candles = self._hourly_candles.get(symbol, [])
+        candles = self._ensure_analysis_candles(symbol)
         if not candles:
             return []
-        return [
-            candle
-            for candle in candles
-            if candle.open_time >= start and candle.open_time < end
-        ]
+        lo = bisect_left(candles, start, key=lambda c: c.open_time)
+        hi = bisect_left(candles, end, key=lambda c: c.open_time)
+        return candles[lo:hi]
 
     def slice_poll_candles(
         self,
@@ -104,14 +131,31 @@ class PreparedMarketContext:
     ) -> list[Candle]:
         candles = self._poll_candles.get(symbol)
         if candles is None:
-            candles = self._hourly_candles.get(symbol, [])
+            candles = self._ensure_analysis_candles(symbol)
         if not candles:
             return []
-        return [
-            candle
-            for candle in candles
-            if candle.open_time >= start and candle.open_time < end
-        ]
+        lo = bisect_left(candles, start, key=lambda c: c.open_time)
+        hi = bisect_left(candles, end, key=lambda c: c.open_time)
+        return candles[lo:hi]
+
+    def get_key_levels(self, symbol: str, t: datetime) -> KeyLevels | None:
+        """Return the key levels at or just before timestamp *t*, or ``None``."""
+        entries = self.key_levels_data.get(symbol)
+        if not entries:
+            return None
+        idx = bisect_right(entries, t, key=lambda e: e[0]) - 1
+        if idx < 0:
+            return None
+        return entries[idx][1]
+
+    def indicator_frame(self, symbol: str) -> pd.DataFrame:
+        """Return the precomputed indicator frame for *symbol*.
+
+        Only available when the evaluator was given a generator that
+        declares ``indicator_request()``.  Raises ``KeyError`` if no
+        indicator frame exists for *symbol*.
+        """
+        return self._indicator_frames[symbol]
 
     def truncated_to(self, t: datetime) -> PreparedMarketContext:
         """Return a copy with all data after *t* physically removed.
@@ -143,14 +187,23 @@ class PreparedMarketContext:
             sym: [c for c in candles if c.close_time <= t]
             for sym, candles in self.poll_candles.items()
         }
-        return PreparedMarketContext(
+        truncated_kl = {
+            sym: [(ts, kl) for ts, kl in entries if ts <= t]
+            for sym, entries in self.key_levels_data.items()
+        }
+        ctx = PreparedMarketContext(
             start=self.start,
             end=self.end,
             fetch_start=self.fetch_start,
             request=self.request,
             bundle=truncated_bundle,
             poll_candles=truncated_poll,
+            key_levels_data=truncated_kl,
         )
+        for sym, df in self._indicator_frames.items():
+            if not df.empty:
+                ctx._indicator_frames[sym] = df[df["close_time"] <= t].copy()
+        return ctx
 
 
 def _truncate_raw_datasets(
@@ -182,6 +235,24 @@ def _truncate_raw_datasets(
     return truncated
 
 
+def _fetch_symbol_key_levels(
+    client: "BinanceClient",
+    symbol: str,
+    kl_start: datetime,
+    hourly_start: datetime,
+    end: datetime,
+    timestamps: list[datetime],
+) -> list[tuple[datetime, KeyLevels]]:
+    """Fetch multi-TF candles for *symbol* and compute key levels."""
+    h4 = client.fetch_klines(symbol, "4h", kl_start, end)
+    daily = client.fetch_klines(symbol, "1d", kl_start, end)
+    weekly = client.fetch_klines(symbol, "1w", kl_start, end)
+    monthly = client.fetch_klines(symbol, "1M", kl_start, end)
+    hourly = client.fetch_klines(symbol, "1h", hourly_start, end)
+    kl_series = compute_key_levels_series(h4, daily, weekly, monthly, hourly, timestamps)
+    return list(zip(timestamps, kl_series))
+
+
 def prepare_market_context(
     symbols: list[str],
     start: datetime,
@@ -191,6 +262,8 @@ def prepare_market_context(
     request: MarketDataRequest | None = None,
     warmup: timedelta | None = None,
     warmup_bars: int = 0,
+    indicators: Sequence[str] = (),
+    max_workers: int = 8,
 ) -> PreparedMarketContext:
     if request is None:
         request = MarketDataRequest.ohlcv_only()
@@ -205,20 +278,74 @@ def prepare_market_context(
         client = BinanceClient()
 
     fetch_start = start - warmup
-    bundle = client.fetch_market_context_bundle(symbols, fetch_start, end, request)
+    bundle = client.fetch_market_context_bundle(
+        symbols, fetch_start, end, request, max_workers=max_workers,
+    )
     poll_candles: dict[str, list[Candle]] = {}
     poll_interval = request.effective_poll_ohlcv_interval
-    if poll_interval != request.ohlcv_interval:
+    if poll_interval != request.ohlcv_interval and symbols:
+        if max_workers <= 1 or len(symbols) <= 1:
+            for symbol in symbols:
+                poll_candles[symbol] = client.fetch_klines(
+                    symbol, poll_interval, fetch_start, end,
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(symbols))) as pool:
+                futures = {
+                    pool.submit(
+                        client.fetch_klines, symbol, poll_interval, fetch_start, end,
+                    ): symbol
+                    for symbol in symbols
+                }
+                for future in as_completed(futures):
+                    poll_candles[futures[future]] = future.result()
+    key_levels_data: dict[str, list[tuple[datetime, KeyLevels]]] = {}
+    if request.include_key_levels and symbols:
+        kl_start = datetime(max(fetch_start.year - 1, 1), 1, 1, tzinfo=UTC)
+        hourly_start = fetch_start - timedelta(days=7)
+
+        kl_tasks: list[tuple[str, list[datetime]]] = []
         for symbol in symbols:
-            poll_candles[symbol] = client.fetch_klines(symbol, poll_interval, fetch_start, end)
-    return PreparedMarketContext(
+            smc = bundle.by_symbol.get(symbol)
+            if smc is not None and not smc.frame.empty:
+                kl_tasks.append((symbol, list(smc.frame["close_time"])))
+
+        if kl_tasks:
+            if max_workers <= 1 or len(kl_tasks) <= 1:
+                for sym, timestamps in kl_tasks:
+                    key_levels_data[sym] = _fetch_symbol_key_levels(
+                        client, sym, kl_start, hourly_start, end, timestamps,
+                    )
+            else:
+                with ThreadPoolExecutor(max_workers=min(max_workers, len(kl_tasks))) as pool:
+                    futures = {
+                        pool.submit(
+                            _fetch_symbol_key_levels,
+                            client, sym, kl_start, hourly_start, end, timestamps,
+                        ): sym
+                        for sym, timestamps in kl_tasks
+                    }
+                    for future in as_completed(futures):
+                        key_levels_data[futures[future]] = future.result()
+
+    ctx = PreparedMarketContext(
         start=start,
         end=end,
         fetch_start=fetch_start,
         request=request,
         bundle=bundle,
         poll_candles=poll_candles,
+        key_levels_data=key_levels_data,
     )
+    if indicators:
+        from .indicators import compute_indicator_frame
+
+        for symbol, smc in bundle.by_symbol.items():
+            if not smc.frame.empty:
+                ctx._indicator_frames[symbol] = compute_indicator_frame(
+                    smc.frame, indicators,
+                )
+    return ctx
 
 
 T = TypeVar("T")
@@ -230,6 +357,57 @@ class _ChunkedWindowCache(Generic[T]):
     fetcher: Callable[[str, datetime, datetime], list[T]]
     time_selector: Callable[[T], datetime]
     _cache: dict[tuple[str, datetime], list[T]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _in_flight: dict[tuple[str, datetime], threading.Event | BaseException] = field(
+        default_factory=dict,
+    )
+
+    def _fetch_chunk(self, key: tuple[str, datetime]) -> list[T]:
+        """Fetch a single chunk, coalescing concurrent requests for the same key.
+
+        Uses an in-flight map so different keys can be fetched concurrently
+        while duplicate requests for the same key are coalesced.  On failure
+        the exception is stored and propagated to all waiters.
+        """
+        with self._lock:
+            if key in self._cache:
+                return self._cache[key]
+            slot = self._in_flight.get(key)
+            if slot is not None:
+                if isinstance(slot, BaseException):
+                    raise slot
+                event = slot
+            else:
+                event = threading.Event()
+                self._in_flight[key] = event
+
+        if slot is not None:
+            # Another thread is fetching — wait for it.
+            event.wait()
+            with self._lock:
+                if key in self._cache:
+                    return self._cache[key]
+                # Owner failed — stored exception is still in _in_flight.
+                exc = self._in_flight.get(key)
+                if isinstance(exc, BaseException):
+                    raise exc
+                return []  # pragma: no cover
+
+        # We are the owner — fetch without holding the lock.
+        symbol, cursor = key
+        chunk_end = cursor + self.chunk_size
+        try:
+            data = self.fetcher(symbol, cursor, chunk_end)
+        except BaseException as exc:
+            with self._lock:
+                self._in_flight[key] = exc
+                event.set()
+            raise
+        with self._lock:
+            self._cache[key] = data
+            del self._in_flight[key]
+            event.set()
+        return data
 
     def fetch(self, symbol: str, start: datetime, end: datetime) -> list[T]:
         if end <= start:
@@ -238,18 +416,13 @@ class _ChunkedWindowCache(Generic[T]):
         rows: list[T] = []
         cursor = _floor_time(start, self.chunk_size)
         while cursor < end:
-            key = (symbol, cursor)
-            if key not in self._cache:
-                chunk_end = cursor + self.chunk_size
-                self._cache[key] = self.fetcher(symbol, cursor, chunk_end)
-            rows.extend(
-                row
-                for row in self._cache[key]
-                if start <= self.time_selector(row) < end
-            )
+            chunk = self._fetch_chunk((symbol, cursor))
+            if chunk:
+                lo = bisect_left(chunk, start, key=self.time_selector)
+                hi = bisect_left(chunk, end, key=self.time_selector)
+                rows.extend(chunk[lo:hi])
             cursor += self.chunk_size
 
-        rows.sort(key=self.time_selector)
         return rows
 
 
@@ -257,6 +430,7 @@ class _ChunkedWindowCache(Generic[T]):
 class BacktestExecutionSession:
     client: Any
     prepared_context: PreparedMarketContext | None = None
+    analysis_interval: str = "1h"
     minute_chunk: timedelta = timedelta(hours=6)
     agg_trade_chunk: timedelta = timedelta(minutes=15)
     use_chunk_cache: bool = True
@@ -264,6 +438,8 @@ class BacktestExecutionSession:
     _agg_trade_cache: _ChunkedWindowCache[AggTrade] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.prepared_context is not None:
+            self.analysis_interval = self.prepared_context.request.ohlcv_interval
         self._minute_cache = _ChunkedWindowCache(
             chunk_size=self.minute_chunk,
             fetcher=lambda symbol, start, end: self.client.fetch_klines(symbol, "1m", start, end),
@@ -275,15 +451,18 @@ class BacktestExecutionSession:
             time_selector=lambda trade: trade.timestamp,
         )
 
-    def fetch_hourly_candles(
+    def fetch_analysis_candles(
         self,
         symbol: str,
         start: datetime,
         end: datetime,
     ) -> list[Candle]:
-        if self.prepared_context is not None and symbol in self.prepared_context.bundle.by_symbol:
-            return self.prepared_context.slice_hourly_candles(symbol, start, end)
-        return self.client.fetch_klines(symbol, "1h", start, end)
+        ctx = self.prepared_context
+        if ctx is not None and symbol in ctx.bundle.by_symbol:
+            dr = ctx.data_range(symbol)
+            if dr is not None and dr[0] <= start and dr[1] >= end:
+                return ctx.slice_analysis_candles(symbol, start, end)
+        return self.client.fetch_klines(symbol, self.analysis_interval, start, end)
 
     def fetch_minute_candles(
         self,

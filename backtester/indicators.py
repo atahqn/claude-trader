@@ -12,7 +12,14 @@ _SLOPE_XS_20 = np.arange(20, dtype=float)
 _SLOPE_XS_20_SUM = float(_SLOPE_XS_20.sum())
 _SLOPE_XS_20_DOT = float(np.dot(_SLOPE_XS_20, _SLOPE_XS_20))
 _SLOPE_DENOM_20 = 20 * _SLOPE_XS_20_DOT - _SLOPE_XS_20_SUM ** 2
-_RAW_INDICATOR_INPUTS = frozenset({"open", "high", "low", "close", "volume"})
+_RAW_INDICATOR_INPUTS = frozenset({"open", "high", "low", "close", "volume", "taker_buy_volume"})
+
+_T3_PERIOD = 5
+_T3_VFACTOR = 0.7
+_T3_C1 = -_T3_VFACTOR ** 3
+_T3_C2 = 3 * _T3_VFACTOR ** 2 + 3 * _T3_VFACTOR ** 3
+_T3_C3 = -6 * _T3_VFACTOR ** 2 - 3 * _T3_VFACTOR - 3 * _T3_VFACTOR ** 3
+_T3_C4 = 1 + 3 * _T3_VFACTOR + _T3_VFACTOR ** 3 + 3 * _T3_VFACTOR ** 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +129,30 @@ _INDICATOR_SPECS: dict[str, IndicatorSpec] = {
     "mom_slope": IndicatorSpec("mom_slope", ("close",), 19),
     "body": IndicatorSpec("body", ("open", "close"), 0),
     "body_ratio": IndicatorSpec("body_ratio", ("body", "high", "low"), 0),
+    # --- ADX (Average Directional Index) ---
+    "_plus_dm": IndicatorSpec("_plus_dm", ("high", "low"), 1),
+    "_minus_dm": IndicatorSpec("_minus_dm", ("high", "low"), 1),
+    "_smoothed_plus_dm": IndicatorSpec("_smoothed_plus_dm", ("_plus_dm",), 13),
+    "_smoothed_minus_dm": IndicatorSpec("_smoothed_minus_dm", ("_minus_dm",), 13),
+    "_smoothed_tr": IndicatorSpec("_smoothed_tr", ("true_range",), 13),
+    "_plus_di": IndicatorSpec("_plus_di", ("_smoothed_plus_dm", "_smoothed_tr"), 0),
+    "_minus_di": IndicatorSpec("_minus_di", ("_smoothed_minus_dm", "_smoothed_tr"), 0),
+    "_dx": IndicatorSpec("_dx", ("_plus_di", "_minus_di"), 0),
+    "adx_14": IndicatorSpec("adx_14", ("_dx",), 13),
+    # --- Bollinger Band normalizations ---
+    "bb_pct_b": IndicatorSpec("bb_pct_b", ("close", "bb_upper", "bb_lower"), 0),
+    "bb_width": IndicatorSpec("bb_width", ("bb_upper", "bb_lower", "_bb_ma_20"), 0),
+    # --- CVD (Cumulative Volume Delta) ---
+    "volume_delta": IndicatorSpec("volume_delta", ("taker_buy_volume", "volume"), 0),
+    "cvd": IndicatorSpec("cvd", ("volume_delta",), 0),
+    # --- Tilson T3 ---
+    "_t3_e1": IndicatorSpec("_t3_e1", ("close",), 0),
+    "_t3_e2": IndicatorSpec("_t3_e2", ("_t3_e1",), 0),
+    "_t3_e3": IndicatorSpec("_t3_e3", ("_t3_e2",), 0),
+    "_t3_e4": IndicatorSpec("_t3_e4", ("_t3_e3",), 0),
+    "_t3_e5": IndicatorSpec("_t3_e5", ("_t3_e4",), 0),
+    "_t3_e6": IndicatorSpec("_t3_e6", ("_t3_e5",), 0),
+    "t3": IndicatorSpec("t3", ("_t3_e3", "_t3_e4", "_t3_e5", "_t3_e6"), 0),
 }
 
 
@@ -176,6 +207,58 @@ def _compute_indicator(name: str, frame: pd.DataFrame) -> pd.Series:
         return frame["close"] - frame["open"]
     if name == "body_ratio":
         return frame["body"] / (frame["high"] - frame["low"]).replace(0, np.nan)
+    # --- ADX ---
+    if name == "_plus_dm":
+        diff_high = frame["high"].diff()
+        diff_low = -(frame["low"].diff())
+        return diff_high.where((diff_high > diff_low) & (diff_high > 0), 0.0)
+    if name == "_minus_dm":
+        diff_high = frame["high"].diff()
+        diff_low = -(frame["low"].diff())
+        return diff_low.where((diff_low > diff_high) & (diff_low > 0), 0.0)
+    if name == "_smoothed_plus_dm":
+        return frame["_plus_dm"].ewm(alpha=_RSI_ALPHA, min_periods=14).mean()
+    if name == "_smoothed_minus_dm":
+        return frame["_minus_dm"].ewm(alpha=_RSI_ALPHA, min_periods=14).mean()
+    if name == "_smoothed_tr":
+        return frame["true_range"].ewm(alpha=_RSI_ALPHA, min_periods=14).mean()
+    if name == "_plus_di":
+        return 100.0 * frame["_smoothed_plus_dm"] / frame["_smoothed_tr"]
+    if name == "_minus_di":
+        return 100.0 * frame["_smoothed_minus_dm"] / frame["_smoothed_tr"]
+    if name == "_dx":
+        di_sum = frame["_plus_di"] + frame["_minus_di"]
+        di_diff = (frame["_plus_di"] - frame["_minus_di"]).abs()
+        return (100.0 * di_diff / di_sum).replace([np.inf, -np.inf], np.nan)
+    if name == "adx_14":
+        return frame["_dx"].ewm(alpha=_RSI_ALPHA, min_periods=14).mean()
+    # --- BB normalizations ---
+    if name == "bb_pct_b":
+        band_range = frame["bb_upper"] - frame["bb_lower"]
+        return ((frame["close"] - frame["bb_lower"]) / band_range).replace([np.inf, -np.inf], np.nan)
+    if name == "bb_width":
+        return (frame["bb_upper"] - frame["bb_lower"]) / frame["_bb_ma_20"]
+    # --- CVD ---
+    if name == "volume_delta":
+        return 2 * frame["taker_buy_volume"] - frame["volume"]
+    if name == "cvd":
+        return frame["volume_delta"].cumsum()
+    # --- Tilson T3 ---
+    if name == "_t3_e1":
+        return frame["close"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e2":
+        return frame["_t3_e1"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e3":
+        return frame["_t3_e2"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e4":
+        return frame["_t3_e3"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e5":
+        return frame["_t3_e4"].ewm(span=_T3_PERIOD).mean()
+    if name == "_t3_e6":
+        return frame["_t3_e5"].ewm(span=_T3_PERIOD).mean()
+    if name == "t3":
+        return (_T3_C1 * frame["_t3_e6"] + _T3_C2 * frame["_t3_e5"]
+                + _T3_C3 * frame["_t3_e4"] + _T3_C4 * frame["_t3_e3"])
     raise KeyError(f"unknown indicator: {name}")
 
 

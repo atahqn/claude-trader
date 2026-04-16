@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
+import os
 import random as _random_module
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -45,7 +48,7 @@ def _resolve_timeout_exit(
     entry_price: float,
     *,
     approximate: bool = False,
-) -> tuple[float, datetime, ResolutionLevel]:
+) -> tuple[float, datetime, ResolutionLevel, bool]:
     """Approximate a live timeout close using the first trade after the deadline."""
     ticker = signal.ticker
 
@@ -57,7 +60,7 @@ def _resolve_timeout_exit(
         )
         first_trade = next((t for t in timeout_trades if t.timestamp >= timeout_time), None)
         if first_trade is not None:
-            return first_trade.price, first_trade.timestamp, ResolutionLevel.TRADE
+            return first_trade.price, first_trade.timestamp, ResolutionLevel.TRADE, False
 
     minute_start = timeout_time.replace(second=0, microsecond=0)
     minute_candles = session.fetch_minute_candles(
@@ -67,20 +70,30 @@ def _resolve_timeout_exit(
     )
     minute_candle = next((c for c in minute_candles if c.close_time >= timeout_time), None)
     if minute_candle is not None:
-        return minute_candle.close, minute_candle.close_time, ResolutionLevel.MINUTE
+        return (
+            minute_candle.close,
+            minute_candle.close_time,
+            ResolutionLevel.MINUTE,
+            not approximate,
+        )
 
     hour_start = timeout_time.replace(minute=0, second=0, microsecond=0)
-    hour_candles = session.fetch_hourly_candles(
+    hour_candles = session.fetch_analysis_candles(
         ticker,
         hour_start,
         hour_start + timedelta(hours=2),
     )
     hour_candle = next((c for c in hour_candles if c.close_time >= timeout_time), None)
     if hour_candle is not None:
-        return hour_candle.close, hour_candle.close_time, ResolutionLevel.HOUR
+        return (
+            hour_candle.close,
+            hour_candle.close_time,
+            ResolutionLevel.HOUR,
+            not approximate,
+        )
 
     fallback_level = ResolutionLevel.HOUR if approximate else ResolutionLevel.TRADE
-    return entry_price, timeout_time, fallback_level
+    return entry_price, timeout_time, fallback_level, not approximate
 
 
 def _resolve_entry_approximate(
@@ -101,7 +114,7 @@ def _resolve_entry_approximate(
     candle_start = candle_close_time - _interval_duration(candle_interval)
 
     if candle_interval == "1h":
-        candles = session.fetch_hourly_candles(ticker, candle_start, candle_close_time)
+        candles = session.fetch_analysis_candles(ticker, candle_start, candle_close_time)
         candle = next((c for c in reversed(candles) if c.close_time <= candle_close_time), None)
     else:
         minute_candles = session.fetch_minute_candles(ticker, candle_start, candle_close_time)
@@ -202,6 +215,7 @@ def backtest_signal(
     ticker = signal.ticker
     if rng is None:
         rng = _random_module.Random()
+    used_fallback = False
 
     # ----- Step 1: Resolve entry (fill check) -----
     if approximate:
@@ -229,13 +243,14 @@ def backtest_signal(
             entry_price = base_trade.price
             entry_time = base_trade.timestamp
         else:
-            # Fallback: close of 1h candle at signal_date
-            candle_start = signal.signal_date.replace(minute=0, second=0, microsecond=0)
-            candle_end = candle_start + timedelta(hours=1)
-            fallback_candles = session.fetch_hourly_candles(ticker, candle_start, candle_end)
+            # Fallback: close of 1m candle at signal_date
+            candle_start = signal.signal_date.replace(second=0, microsecond=0)
+            candle_end = candle_start + timedelta(minutes=1)
+            fallback_candles = session.fetch_minute_candles(ticker, candle_start, candle_end)
             if fallback_candles:
                 entry_price = fallback_candles[0].close
                 entry_time = fallback_candles[0].close_time
+                used_fallback = True
             else:
                 # Cannot determine entry at all -> treat as unfilled
                 return _unfilled_result(signal)
@@ -272,7 +287,7 @@ def backtest_signal(
     # ----- Step 3: Fetch 1h candles for resolution window -----
     holding_hours = signal.max_holding_hours
     resolution_end = entry_time + timedelta(hours=holding_hours)
-    hour_candles = session.fetch_hourly_candles(ticker, entry_time, resolution_end)
+    hour_candles = session.fetch_analysis_candles(ticker, entry_time, resolution_end)
 
     # ----- Step 4: Resolve exit (3-level hierarchy) -----
     def minute_fetcher(start, end):
@@ -300,16 +315,20 @@ def backtest_signal(
         exit_time = resolution.exit_time
         exit_reason = resolution.reason
         resolution_level = resolution.resolution_level
+        used_fallback = used_fallback or resolution.used_fallback
+        random_resolved = resolution.random_resolved
     else:
         # Timeout: no exit within max_hours
         exit_reason = ExitReason.TIMEOUT
-        exit_price, exit_time, resolution_level = _resolve_timeout_exit(
+        exit_price, exit_time, resolution_level, timeout_used_fallback = _resolve_timeout_exit(
             signal,
             session,
             resolution_end,
             entry_price,
             approximate=approximate,
         )
+        used_fallback = used_fallback or timeout_used_fallback
+        random_resolved = False
 
     net_pnl, gross_pnl, fee_drag = compute_pnl(
         entry_price, exit_price, signal.position_type,
@@ -329,6 +348,8 @@ def backtest_signal(
         pnl_pct=net_pnl,
         gross_pnl_pct=gross_pnl,
         fee_drag_pct=fee_drag,
+        used_fallback=used_fallback,
+        random_resolved=random_resolved,
     )
 
 
@@ -375,6 +396,38 @@ def _compute_stats(trades: list[TradeResult]) -> dict:
     }
 
 
+def _process_batch(
+    batch: list[tuple[int, Signal, int]],
+    approximate: bool,
+    default_entry_delay_seconds: int,
+    prepared_context: PreparedMarketContext | None,
+) -> list[tuple[int, TradeResult]]:
+    """Worker function for ProcessPoolExecutor.
+
+    Each process creates its own BinanceClient + session so the GIL is
+    bypassed entirely.  The shared disk cache means data already fetched
+    in a previous run is available without network calls.
+    """
+    from .data import BinanceClient  # deferred to avoid top-level pickle issues
+
+    session = BacktestExecutionSession(
+        client=BinanceClient(),
+        prepared_context=prepared_context,
+    )
+    results: list[tuple[int, TradeResult]] = []
+    for idx, signal, sig_seed in batch:
+        rng = _random_module.Random(sig_seed)
+        result = backtest_signal(
+            signal,
+            approximate=approximate,
+            rng=rng,
+            session=session,
+            default_entry_delay_seconds=default_entry_delay_seconds,
+        )
+        results.append((idx, result))
+    return results
+
+
 def backtest_signals(
     signals: list[Signal],
     client: BinanceClient | None = None,
@@ -383,26 +436,76 @@ def backtest_signals(
     session: BacktestExecutionSession | None = None,
     prepared_context: PreparedMarketContext | None = None,
     default_entry_delay_seconds: int = DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS,
+    max_workers: int = 0,
 ) -> BacktestResult:
     """Backtest multiple signals and aggregate results."""
-    rng = _random_module.Random(seed)
-    session = _ensure_session(
-        signal=signals[0] if signals else None,
-        client=client,
-        session=session,
-        prepared_context=prepared_context,
-        use_chunk_cache=True,
+    if not signals:
+        return BacktestResult(trades=[], **_compute_stats([]))
+
+    # Derive deterministic per-signal seeds so results are identical
+    # regardless of execution order.
+    parent_rng = _random_module.Random(seed)
+    signal_seeds = [parent_rng.getrandbits(64) for _ in signals]
+
+    effective_workers = (
+        min(len(signals), max_workers or (os.cpu_count() or 4))
+        if max_workers != 1
+        else 1
     )
-    trades: list[TradeResult] = []
-    for signal in signals:
-        result = backtest_signal(
-            signal,
-            approximate=approximate,
-            rng=rng,
+
+    if effective_workers <= 1:
+        session = _ensure_session(
+            signal=signals[0],
+            client=client,
             session=session,
-            default_entry_delay_seconds=default_entry_delay_seconds,
+            prepared_context=prepared_context,
+            use_chunk_cache=True,
         )
-        trades.append(result)
+        trades: list[TradeResult] = []
+        for signal, sig_seed in zip(signals, signal_seeds):
+            rng = _random_module.Random(sig_seed)
+            result = backtest_signal(
+                signal,
+                approximate=approximate,
+                rng=rng,
+                session=session,
+                default_entry_delay_seconds=default_entry_delay_seconds,
+            )
+            trades.append(result)
+    else:
+        # Resolve prepared_context for the pool: if a session was provided
+        # use its context; otherwise use the explicit argument.
+        ctx = prepared_context
+        if ctx is None and session is not None:
+            ctx = session.prepared_context
+
+        # Split signals into batches — one per worker process.
+        indexed = [
+            (i, sig, sig_seed)
+            for i, (sig, sig_seed) in enumerate(zip(signals, signal_seeds))
+        ]
+        batch_size = math.ceil(len(indexed) / effective_workers)
+        batches = [
+            indexed[i : i + batch_size]
+            for i in range(0, len(indexed), batch_size)
+        ]
+
+        all_indexed: list[tuple[int, TradeResult]] = []
+        with ProcessPoolExecutor(max_workers=len(batches)) as pool:
+            futures = [
+                pool.submit(
+                    _process_batch,
+                    batch,
+                    approximate,
+                    default_entry_delay_seconds,
+                    ctx,
+                )
+                for batch in batches
+            ]
+            for future in as_completed(futures):
+                all_indexed.extend(future.result())
+        all_indexed.sort(key=lambda x: x[0])
+        trades = [t for _, t in all_indexed]
 
     trades.sort(key=lambda t: t.entry_time)
     stats = _compute_stats(trades)
@@ -423,4 +526,5 @@ def _unfilled_result(signal: Signal) -> TradeResult:
         pnl_pct=0.0,
         gross_pnl_pct=0.0,
         fee_drag_pct=0.0,
+        used_fallback=False,
     )

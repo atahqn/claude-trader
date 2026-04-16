@@ -8,20 +8,34 @@ from __future__ import annotations
 
 import csv
 import json
+import multiprocessing
+import os
+import random as _random_module
+from bisect import bisect_left
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from .engine import DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS, backtest_signals
-from .eval_windows import EvalWindow
-from .models import BacktestResult, ExitReason, PositionType
-from .pipeline import BacktestExecutionSession, prepare_market_context
+import pandas as pd
+
+from .calibration import CalibrationResult, search_parameters, validate_calibration_config
+from .engine import (
+    DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS,
+    _compute_stats,
+    _process_batch,
+    backtest_signals,
+)
+from .eval_windows import CATEGORY_DESCRIPTIONS, EvalWindow
+from .models import BacktestResult, ExitReason, PositionType, Signal, TradeResult
+from .pipeline import BacktestExecutionSession, PreparedMarketContext, prepare_market_context
+from .preview import interval_to_timedelta
 
 if TYPE_CHECKING:
-    from live.signal_generator import SignalGenerator
+    from live.signal_generator import CompositeSignalGenerator, SignalGenerator
 
     from .data import BinanceClient
 
@@ -59,6 +73,8 @@ class PortfolioConfig:
     seed: int | None = None
     risk_free_rate_annual: float = DEFAULT_USD_RISK_FREE_RATE_ANNUAL
     entry_delay_seconds: int = DEFAULT_BACKTEST_ENTRY_DELAY_SECONDS
+    data_max_workers: int = 8
+    backtest_max_workers: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +192,26 @@ class EvaluationReport:
             risk_free_rate_annual=self.config.risk_free_rate_annual,
         )
 
+    def resolved_trade_breakdown(self) -> tuple[int, int, int]:
+        exact = 0
+        fallback = 0
+        random_resolved = 0
+        for wr in self.window_results:
+            for trade in wr.backtest.trades:
+                if trade.exit_reason is ExitReason.UNFILLED:
+                    continue
+                if trade.used_fallback:
+                    fallback += 1
+                else:
+                    exact += 1
+                if trade.random_resolved:
+                    random_resolved += 1
+        return exact, fallback, random_resolved
+
     def format_table(self) -> str:
         rows = self.all_summaries() + [self.overall_summary()]
         header = (
-            f"{'Category':<20} | {'Win':>7} | {'PNL':>9} | {'WR':>6} "
+            f"{'Category':<35} | {'Win':>7} | {'PNL':>9} | {'WR':>6} "
             f"| {'Worst':>8} | {'Best':>8} | {'Trades':>6} "
             f"| {'S/L':>9} | {'Trd WR':>6} | {'PF':>5} | {'Sort':>7} "
             f"| {'DD':>6} | {'Omega':>6} | {'Pref':>7}"
@@ -187,8 +219,10 @@ class EvaluationReport:
         sep = "-" * len(header)
         lines = [header, sep]
         for s in rows:
+            desc = CATEGORY_DESCRIPTIONS.get(s.category, "")
+            label = f"{s.category} ({desc})" if desc else s.category
             lines.append(
-                f"{s.category:<20} | {s.windows:>7} | "
+                f"{label:<35} | {s.windows:>7} | "
                 f"{s.total_pnl:>+8.2f}% | "
                 f"{s.weekly_win_rate * 100:>5.1f}% | "
                 f"{s.worst_week_pnl:>+7.2f}% | "
@@ -312,7 +346,7 @@ class EvaluationReport:
             "window", "category", "symbol", "direction",
             "signal_date", "entry_time", "exit_time", "hold_hours",
             "entry_price", "exit_price", "tp_price", "sl_price",
-            "tp_pct", "sl_pct", "exit_reason", "resolution_level",
+            "tp_pct", "sl_pct", "exit_reason", "resolution_level", "used_fallback",
             "pnl_pct", "gross_pnl_pct", "fee_drag_pct",
             "leverage", "size_multiplier", "max_holding_hours",
             "metadata",
@@ -343,6 +377,7 @@ class EvaluationReport:
                         "sl_pct": t.signal.sl_pct,
                         "exit_reason": t.exit_reason.value,
                         "resolution_level": t.resolution_level.value,
+                        "used_fallback": t.used_fallback,
                         "pnl_pct": round(t.pnl_pct, 4),
                         "gross_pnl_pct": round(t.gross_pnl_pct, 4),
                         "fee_drag_pct": round(t.fee_drag_pct, 4),
@@ -439,6 +474,9 @@ class EvaluationReport:
                 "approximate": self.config.approximate,
                 "seed": self.config.seed,
                 "risk_free_rate_annual": self.config.risk_free_rate_annual,
+                "entry_delay_seconds": self.config.entry_delay_seconds,
+                "data_max_workers": self.config.data_max_workers,
+                "backtest_max_workers": self.config.backtest_max_workers,
             },
             "total_windows": len(self.window_results),
             "windows": [
@@ -483,6 +521,469 @@ def _format_metric(value: float, *, width: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Period-level parallel backtesting
+# ---------------------------------------------------------------------------
+
+
+def _resolve_signals_parallel(
+    *,
+    signals: list[Signal],
+    approximate: bool,
+    seed: int | None,
+    entry_delay_seconds: int,
+    max_workers: int,
+    client: object = None,
+    signal_contexts: list[PreparedMarketContext | None] | None = None,
+) -> list[TradeResult]:
+    """Resolve a flat list of signals, optionally with per-signal contexts.
+
+    When *signal_contexts* is provided, each signal can be resolved against
+    its originating PreparedMarketContext (avoiding disk I/O for 1h candles).
+    Contexts are only used on the sequential path — the parallel path still
+    relies on the shared disk cache.
+
+    Returns trades in the same order as the input signals.
+    """
+    if not signals:
+        return []
+
+    parent_rng = _random_module.Random(seed)
+    signal_seeds = [parent_rng.getrandbits(64) for _ in signals]
+
+    def _sequential() -> list[TradeResult]:
+        c = client
+        if c is None:
+            from .data import BinanceClient
+            c = BinanceClient()
+        first_ctx = signal_contexts[0] if signal_contexts else None
+        session = BacktestExecutionSession(client=c, prepared_context=first_ctx)
+        from .engine import backtest_signal
+
+        trades: list[TradeResult] = []
+        for i, (signal, sig_seed) in enumerate(zip(signals, signal_seeds)):
+            if signal_contexts is not None:
+                ctx = signal_contexts[i]
+                if session.prepared_context is not ctx:
+                    session.prepared_context = ctx
+                    if ctx is not None:
+                        session.analysis_interval = ctx.request.ohlcv_interval
+            rng = _random_module.Random(sig_seed)
+            trades.append(backtest_signal(
+                signal, approximate=approximate, rng=rng,
+                session=session, default_entry_delay_seconds=entry_delay_seconds,
+            ))
+        return trades
+
+    # Heuristic: approximate + in-memory contexts → sequential is faster
+    # than pickle overhead.  Explicit max_workers > 1 overrides the hint.
+    use_sequential_hint = approximate and signal_contexts is not None
+
+    if max_workers == 0:
+        if use_sequential_hint:
+            effective_workers = 1
+        else:
+            effective_workers = min(len(signals), os.cpu_count() or 4)
+    elif max_workers == 1:
+        effective_workers = 1
+    else:
+        effective_workers = min(len(signals), max_workers)
+
+    if effective_workers <= 1:
+        return _sequential()
+
+    indexed = [
+        (i, sig, sig_seed)
+        for i, (sig, sig_seed) in enumerate(zip(signals, signal_seeds))
+    ]
+    batch_size = math.ceil(len(indexed) / effective_workers)
+    batches = [indexed[i : i + batch_size] for i in range(0, len(indexed), batch_size)]
+
+    try:
+        all_indexed: list[tuple[int, TradeResult]] = []
+        with ProcessPoolExecutor(max_workers=len(batches)) as pool:
+            futures = [
+                pool.submit(
+                    _process_batch, batch, approximate, entry_delay_seconds, None,
+                )
+                for batch in batches
+            ]
+            for future in as_completed(futures):
+                all_indexed.extend(future.result())
+        all_indexed.sort(key=lambda x: x[0])
+        return [t for _, t in all_indexed]
+    except (TypeError, AttributeError):
+        return _sequential()
+
+
+def _backtest_period(
+    *,
+    window_slices: list[tuple[EvalWindow, list[Signal], int, int]],
+    ctx: PreparedMarketContext,
+    approximate: bool,
+    seed: int | None,
+    entry_delay_seconds: int,
+    max_workers: int,
+    client: object,
+) -> list[BacktestResult]:
+    """Backtest all signals in a period, optionally using multiprocessing.
+
+    Collects signals from all windows, batches them across worker processes,
+    then re-distributes results to per-window BacktestResults.
+    """
+    import os
+    import random as _random_module
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    # Flatten all window signals into one list with (global_idx, window_idx) tracking.
+    all_signals: list[Signal] = []
+    window_offsets: list[tuple[int, int]] = []  # (start_idx, count) per window
+    for _, w_sigs, _, _ in window_slices:
+        offset = len(all_signals)
+        all_signals.extend(w_sigs)
+        window_offsets.append((offset, len(w_sigs)))
+
+    # Empty period — return empty results for each window.
+    if not all_signals:
+        return [
+            BacktestResult(trades=[], **_compute_stats([]))
+            for _ in window_slices
+        ]
+
+    # Derive deterministic per-signal seeds.
+    parent_rng = _random_module.Random(seed)
+    signal_seeds = [parent_rng.getrandbits(64) for _ in all_signals]
+
+    effective_workers = (
+        min(len(all_signals), max_workers or (os.cpu_count() or 4))
+        if max_workers != 1
+        else 1
+    )
+
+    if effective_workers <= 1:
+        # Sequential path.
+        session = BacktestExecutionSession(client=client, prepared_context=ctx)
+        from .engine import backtest_signal
+
+        all_trades: list[TradeResult] = []
+        for signal, sig_seed in zip(all_signals, signal_seeds):
+            rng = _random_module.Random(sig_seed)
+            result = backtest_signal(
+                signal,
+                approximate=approximate,
+                rng=rng,
+                session=session,
+                default_entry_delay_seconds=entry_delay_seconds,
+            )
+            all_trades.append(result)
+    else:
+        # Parallel path — batch across processes.
+        indexed = [
+            (i, sig, sig_seed)
+            for i, (sig, sig_seed) in enumerate(zip(all_signals, signal_seeds))
+        ]
+        batch_size = math.ceil(len(indexed) / effective_workers)
+        batches = [
+            indexed[i : i + batch_size]
+            for i in range(0, len(indexed), batch_size)
+        ]
+
+        try:
+            all_indexed: list[tuple[int, TradeResult]] = []
+            with ProcessPoolExecutor(max_workers=len(batches)) as pool:
+                futures = [
+                    pool.submit(
+                        _process_batch,
+                        batch,
+                        approximate,
+                        entry_delay_seconds,
+                        ctx,
+                    )
+                    for batch in batches
+                ]
+                for future in as_completed(futures):
+                    all_indexed.extend(future.result())
+            all_indexed.sort(key=lambda x: x[0])
+            all_trades = [t for _, t in all_indexed]
+        except (TypeError, AttributeError):
+            # Context or signals not picklable — fall back to sequential.
+            session = BacktestExecutionSession(client=client, prepared_context=ctx)
+            from .engine import backtest_signal
+
+            all_trades = []
+            for signal, sig_seed in zip(all_signals, signal_seeds):
+                rng = _random_module.Random(sig_seed)
+                all_trades.append(backtest_signal(
+                    signal, approximate=approximate, rng=rng,
+                    session=session,
+                    default_entry_delay_seconds=entry_delay_seconds,
+                ))
+
+
+    # Re-distribute trades to per-window results.
+    results: list[BacktestResult] = []
+    for start_idx, count in window_offsets:
+        window_trades = all_trades[start_idx : start_idx + count]
+        window_trades.sort(key=lambda t: t.entry_time)
+        results.append(BacktestResult(trades=window_trades, **_compute_stats(window_trades)))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Cooldown enforcement across chunk/period boundaries
+# ---------------------------------------------------------------------------
+
+
+def _enforce_cooldown(
+    signals: list[Signal],
+    cooldown_hours: float,
+) -> list[Signal]:
+    """Remove signals that violate per-symbol, per-side cooldown.
+
+    Expects *signals* sorted by ``signal_date``.  Keeps the first signal
+    for each ``(symbol, position_type)`` pair and drops any subsequent
+    signal within *cooldown_hours* of the previous kept signal for the
+    same pair.  Keying on position_type prevents a SHORT from suppressing
+    a LONG on the same symbol (they have independent cooldowns).
+    """
+    if cooldown_hours <= 0:
+        return signals
+    last_by_key: dict[tuple[str, PositionType], datetime] = {}
+    kept: list[Signal] = []
+    for sig in signals:
+        key = (sig.ticker, sig.position_type)
+        last = last_by_key.get(key)
+        if last is not None:
+            hours = (sig.signal_date - last).total_seconds() / 3600.0
+            if hours < cooldown_hours:
+                continue
+        last_by_key[key] = sig.signal_date
+        kept.append(sig)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# Parallel signal generation worker (top-level for pickle)
+# ---------------------------------------------------------------------------
+
+
+# A strategy factory is either a single (module, class, kwargs) tuple or
+# a list of them for composite strategies.
+StrategyFactory = (
+    tuple[str, str, dict[str, Any]]
+    | list[tuple[str, str, dict[str, Any]]]
+)
+
+_shared_signal_strategy_factory: StrategyFactory | None = None
+_shared_period_contexts: dict[int, PreparedMarketContext] | None = None
+
+
+def _build_generator_from_factory(
+    factory: StrategyFactory,
+) -> Any:
+    """Reconstruct a SignalGenerator from a factory spec."""
+    import importlib
+
+    if isinstance(factory, list):
+        from live.signal_generator import CompositeSignalGenerator
+
+        generators = [_build_generator_from_factory(f) for f in factory]
+        return CompositeSignalGenerator(generators)
+
+    module_name, class_name, kwargs = factory
+    module = importlib.import_module(module_name)
+    strategy_cls = getattr(module, class_name)
+    return strategy_cls(**kwargs)
+
+
+def _init_signal_generation_worker(
+    strategy_factory: StrategyFactory,
+    period_contexts: dict[int, PreparedMarketContext],
+) -> None:
+    """Initializer for chunk signal-generation workers."""
+    global _shared_signal_strategy_factory, _shared_period_contexts
+    _shared_signal_strategy_factory = strategy_factory
+    _shared_period_contexts = period_contexts
+
+
+def _build_calibration_frame(
+    ctx: PreparedMarketContext,
+    symbols: list[str],
+    lookback_start: datetime,
+    lookback_end: datetime,
+) -> pd.DataFrame | None:
+    """Build a combined OHLCV frame for the calibration lookback window."""
+    frames: list[pd.DataFrame] = []
+    for symbol in symbols:
+        try:
+            smc = ctx.for_symbol(symbol)
+        except KeyError:
+            continue
+        if smc.frame.empty:
+            continue
+        mask = (smc.frame["close_time"] >= lookback_start) & (smc.frame["close_time"] < lookback_end)
+        sliced = smc.frame.loc[mask]
+        if not sliced.empty:
+            chunk = sliced.copy()
+            chunk["symbol"] = symbol
+            frames.append(chunk)
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
+def _calibrate_generator(
+    generator: Any,
+    ctx: PreparedMarketContext,
+    symbols: list[str],
+    chunk_start: datetime,
+    calib_lookback: timedelta,
+) -> None:
+    """Run one calibration cycle and set ``active_params`` on *generator*."""
+    from live.signal_generator import CompositeSignalGenerator
+
+    lookback_start = chunk_start - calib_lookback
+
+    if isinstance(generator, CompositeSignalGenerator):
+        for child in generator.calibration_children():
+            child_symbols = [s for s in symbols if s in child.symbols]
+            _calibrate_single(child, ctx, child_symbols, lookback_start, chunk_start)
+    else:
+        _calibrate_single(generator, ctx, symbols, lookback_start, chunk_start)
+
+
+def _calibrate_single(
+    generator: Any,
+    ctx: PreparedMarketContext,
+    symbols: list[str],
+    lookback_start: datetime,
+    lookback_end: datetime,
+) -> None:
+    raw_frame = _build_calibration_frame(ctx, symbols, lookback_start, lookback_end)
+    if raw_frame is None or raw_frame.empty:
+        return
+    frame = generator.build_calibration_frame(raw_frame, lookback_end)
+    if frame is None or frame.empty:
+        return
+    result = search_parameters(
+        param_space=generator.param_space(),
+        score_fn=generator.score_params,
+        frame=frame,
+        prepare_fn=generator.prepare_score_context,
+    )
+    if result is not None:
+        generator.active_params = result.best_params
+
+
+def _generate_signals_with_calibration(
+    generator: Any,
+    ctx: PreparedMarketContext,
+    symbols: list[str],
+    sig_start: datetime,
+    sig_end: datetime,
+    calib_interval: timedelta,
+    calib_lookback: timedelta,
+    calibration_anchor: datetime | None = None,
+) -> list[Signal]:
+    """Generate signals with rolling recalibration.
+
+    Calibration points are anchored to *calibration_anchor* (defaults to
+    *sig_start*) so that parallel chunks sharing the same anchor produce
+    identical calibration schedules.
+    """
+    if calibration_anchor is None:
+        calibration_anchor = sig_start
+
+    # Build deterministic calibration boundaries within [sig_start, sig_end).
+    interval_secs = calib_interval.total_seconds()
+    elapsed = (sig_start - calibration_anchor).total_seconds()
+    k = max(0, int(elapsed // interval_secs))
+
+    boundaries: list[datetime] = []
+    t = calibration_anchor + timedelta(seconds=k * interval_secs)
+    while t < sig_end:
+        boundaries.append(t)
+        t += calib_interval
+    if not boundaries:
+        boundaries = [sig_start]
+
+    all_signals: list[Signal] = []
+    for i, calib_time in enumerate(boundaries):
+        _calibrate_generator(generator, ctx, symbols, calib_time, calib_lookback)
+
+        gen_start = max(sig_start, calib_time)
+        gen_end = boundaries[i + 1] if i + 1 < len(boundaries) else sig_end
+        gen_end = min(gen_end, sig_end)
+
+        if gen_start < gen_end:
+            sigs = generator.generate_backtest_signals(ctx, symbols, gen_start, gen_end)
+            all_signals.extend(sigs)
+
+    all_signals.sort(key=lambda s: s.signal_date)
+    return all_signals
+
+
+def _required_chunk_warmup(
+    chunk_start: datetime,
+    chunk_end: datetime,
+    base_warmup: timedelta,
+    *,
+    uses_calibration: bool,
+    calib_interval: timedelta,
+    calib_lookback: timedelta,
+    calibration_anchor: datetime | None = None,
+) -> timedelta:
+    """Return the warmup needed for a chunk-local market context.
+
+    The current evaluator prepares one context per period, so production code
+    no longer needs this helper directly. We keep it because phase-0 tests use
+    it to verify the calibration boundary math a chunked implementation would
+    need to preserve.
+    """
+    del chunk_end  # Included for API symmetry with the phase-0 tests.
+
+    if not uses_calibration:
+        return base_warmup
+
+    if calibration_anchor is None:
+        calibration_anchor = chunk_start
+
+    interval_secs = calib_interval.total_seconds()
+    elapsed = (chunk_start - calibration_anchor).total_seconds()
+    k = max(0, int(elapsed // interval_secs))
+    first_calibration_time = calibration_anchor + timedelta(seconds=k * interval_secs)
+    calibration_warmup = (chunk_start - first_calibration_time) + calib_lookback
+    return max(base_warmup, calibration_warmup)
+
+
+def _generate_chunk_signals(
+    chunk_idx: int,
+    period_idx: int,
+    symbols: list[str],
+    signal_start: datetime,
+    signal_end: datetime,
+    calibration_config: tuple[int, int, datetime] | None = None,
+) -> tuple[int, int, list[Signal]]:
+    """Worker: generate one chunk's signals using a shared period context."""
+    if _shared_signal_strategy_factory is None or _shared_period_contexts is None:
+        raise RuntimeError("signal-generation worker was not initialized")
+
+    generator = _build_generator_from_factory(_shared_signal_strategy_factory)
+    ctx = _shared_period_contexts[period_idx]
+    if calibration_config is not None and generator.needs_calibration:
+        interval_h, lookback_h, anchor = calibration_config
+        signals = _generate_signals_with_calibration(
+            generator, ctx, symbols, signal_start, signal_end,
+            calib_interval=timedelta(hours=interval_h),
+            calib_lookback=timedelta(hours=lookback_h),
+            calibration_anchor=anchor,
+        )
+    else:
+        signals = generator.generate_backtest_signals(ctx, symbols, signal_start, signal_end)
+    signals.sort(key=lambda s: s.signal_date)
+    return chunk_idx, period_idx, signals
+
+
+# ---------------------------------------------------------------------------
 # Evaluator
 # ---------------------------------------------------------------------------
 
@@ -496,10 +997,12 @@ class StrategyEvaluator:
         config: PortfolioConfig = PortfolioConfig(),
         client: BinanceClient | None = None,
         cooldown_warmup: timedelta = timedelta(days=14),
+        strategy_factory: tuple[str, str, dict[str, Any]] | None = None,
     ) -> None:
         self._symbols = symbols
         self._config = config
         self._cooldown_warmup = cooldown_warmup
+        self._strategy_factory = strategy_factory
         if client is None:
             from .data import BinanceClient as _BinanceClient
 
@@ -517,64 +1020,212 @@ class StrategyEvaluator:
             gap_threshold=self._cooldown_warmup,
         )
 
-        all_window_results: list[WindowResult] = []
+        request = generator.market_data_request()
+        max_w = self._config.data_max_workers or (os.cpu_count() or 4)
+        can_parallel = self._strategy_factory is not None and max_w > 1
+        cooldown_h = generator.cooldown_hours
 
+        uses_calibration = generator.needs_calibration
+        calib_interval = timedelta(hours=generator.calibration_interval_hours)
+        calib_lookback = timedelta(hours=generator.calibration_lookback_hours)
+        if uses_calibration:
+            validate_calibration_config(generator)
+
+        # Warmup must cover indicator needs and calibration lookback.
+        analysis_interval = interval_to_timedelta(request.ohlcv_interval)
+        indicators = generator.indicator_request()
+        warmup_bars = max(
+            int(generator.required_warmup_bars),
+            int(getattr(generator, "warmup_bars", 0) or 0),
+        )
+        if indicators:
+            from .indicators import required_warmup as _ind_warmup
+            warmup_bars = max(warmup_bars, _ind_warmup(indicators))
+        if uses_calibration:
+            interval_hours = analysis_interval.total_seconds() / 3600
+            warmup_bars = max(
+                warmup_bars,
+                math.ceil(generator.calibration_lookback_hours / interval_hours),
+            )
+        base_warmup = analysis_interval * warmup_bars
+
+        # ------------------------------------------------------------------
+        # Build chunk list: subdivide periods so we have >= max_w chunks.
+        # Each chunk: (chunk_idx, period_idx, windows, sig_start, sig_end)
+        # ------------------------------------------------------------------
+        period_params: list[tuple[list[EvalWindow], datetime, datetime, datetime]] = []
         for period_windows in periods:
             earliest_start = min(w.start for w in period_windows)
             latest_end = max(w.end for w in period_windows)
-
             signal_start = earliest_start - self._cooldown_warmup
             signal_end = latest_end
             fetch_end = signal_end + timedelta(hours=_DATA_BUFFER_HOURS)
+            period_params.append((period_windows, signal_start, signal_end, fetch_end))
 
-            request = generator.market_data_request()
-            warmup_bars = getattr(generator, "warmup_bars", 100)
-            ctx = prepare_market_context(
+        chunks: list[tuple[int, int, list[EvalWindow], datetime, datetime]] = []
+        chunk_idx = 0
+        for period_idx, (pw, sig_start, sig_end, fetch_end) in enumerate(period_params):
+            period_dur = sig_end - sig_start
+            # Subdivide if parallel is available and the period is large
+            # enough relative to the number of workers.
+            _MIN_CHUNK_DUR = timedelta(days=7)
+            n_chunks = 1
+            if can_parallel and len(periods) < max_w:
+                # Subdivide so each chunk is at least 1 week.
+                n_chunks = min(
+                    max(1, max_w // max(len(periods), 1)),
+                    max(1, int(period_dur / _MIN_CHUNK_DUR)),
+                )
+            if n_chunks > 1:
+                chunk_dur = period_dur / n_chunks
+                for ci in range(n_chunks):
+                    c_sig_start = sig_start + chunk_dur * ci
+                    c_sig_end = sig_start + chunk_dur * (ci + 1)
+                    if ci == n_chunks - 1:
+                        c_sig_end = sig_end  # avoid float drift
+                    chunks.append((chunk_idx, period_idx, pw, c_sig_start, c_sig_end))
+                    chunk_idx += 1
+            else:
+                chunks.append((chunk_idx, period_idx, pw, sig_start, sig_end))
+                chunk_idx += 1
+
+        # ------------------------------------------------------------------
+        # Phase 1: Prepare one period context, then generate chunk signals.
+        # ------------------------------------------------------------------
+        period_contexts: dict[int, PreparedMarketContext] = {}
+        for period_idx, (_, sig_start, _, fetch_end) in enumerate(period_params):
+            period_contexts[period_idx] = prepare_market_context(
                 self._symbols,
-                signal_start,
+                sig_start,
                 fetch_end,
                 client=self._client,
                 request=request,
-                warmup_bars=warmup_bars,
+                warmup=base_warmup,
+                indicators=indicators,
+                max_workers=self._config.data_max_workers,
             )
 
-            all_signals = generator.generate_backtest_signals(
-                ctx, self._symbols, signal_start, signal_end,
-            )
+        # Result per chunk: (chunk_idx, period_idx, signals)
+        chunk_results: list[tuple[int, int, list[Signal]]]
 
-            session = BacktestExecutionSession(
-                client=self._client,
-                prepared_context=ctx,
-            )
+        can_fork = multiprocessing.get_start_method() == "fork"
+        if not can_parallel or len(chunks) <= 1 or not can_fork:
+            chunk_results = []
+            for ci, period_idx, _, sig_start, sig_end in chunks:
+                ctx = period_contexts[period_idx]
+                if uses_calibration:
+                    anchor = period_params[period_idx][1]
+                    sigs = _generate_signals_with_calibration(
+                        generator, ctx, self._symbols, sig_start, sig_end,
+                        calib_interval, calib_lookback,
+                        calibration_anchor=anchor,
+                    )
+                else:
+                    sigs = generator.generate_backtest_signals(
+                        ctx, self._symbols, sig_start, sig_end,
+                    )
+                sigs.sort(key=lambda s: s.signal_date)
+                chunk_results.append((ci, period_idx, sigs))
+        else:
+            effective_w = min(len(chunks), max_w)
+            with ProcessPoolExecutor(
+                max_workers=effective_w,
+                mp_context=multiprocessing.get_context("fork"),
+                initializer=_init_signal_generation_worker,
+                initargs=(self._strategy_factory, period_contexts),
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        _generate_chunk_signals,
+                        ci,
+                        period_idx,
+                        list(self._symbols),
+                        sig_start,
+                        sig_end,
+                        (
+                            generator.calibration_interval_hours,
+                            generator.calibration_lookback_hours,
+                            period_params[period_idx][1],
+                        ) if uses_calibration else None,
+                    ): (ci, period_idx)
+                    for ci, period_idx, _, sig_start, sig_end in chunks
+                }
+                chunk_results = []
+                for future in as_completed(futures):
+                    ci, period_idx = futures[future]
+                    result_ci, result_period_idx, sigs = future.result()
+                    chunk_results.append((result_ci, result_period_idx, sigs))
+            chunk_results.sort(key=lambda x: x[0])
 
-            for window in period_windows:
-                w_sigs = [
-                    s for s in all_signals
-                    if window.start <= s.signal_date < window.end
-                ]
+        # ------------------------------------------------------------------
+        # Merge chunks per period and enforce cooldown.
+        # Track signal→context provenance so each signal can resolve
+        # against the chunk context that generated it.
+        # ------------------------------------------------------------------
+        signal_ctx_map: dict[int, PreparedMarketContext] = {}
+        period_signals: dict[int, list[Signal]] = defaultdict(list)
+        for _, period_idx, sigs in chunk_results:
+            ctx = period_contexts[period_idx]
+            for sig in sigs:
+                signal_ctx_map[id(sig)] = ctx
+            period_signals[period_idx].extend(sigs)
+
+        for period_idx in period_signals:
+            merged = sorted(period_signals[period_idx], key=lambda s: s.signal_date)
+            period_signals[period_idx] = _enforce_cooldown(merged, cooldown_h)
+
+        # ------------------------------------------------------------------
+        # Phase 2: Backtest resolution — batch ALL signals, resolve in parallel.
+        # ------------------------------------------------------------------
+        all_signals_flat: list[Signal] = []
+        all_contexts_flat: list[PreparedMarketContext | None] = []
+        window_info: list[tuple[EvalWindow, int, int, int, int]] = []
+
+        for period_idx, (pw, _, _, _) in enumerate(period_params):
+            sigs = period_signals.get(period_idx, [])
+            for window in pw:
+                lo = bisect_left(sigs, window.start, key=lambda s: s.signal_date)
+                hi = bisect_left(sigs, window.end, key=lambda s: s.signal_date)
+                w_sigs = sigs[lo:hi]
                 short_count = sum(
                     1 for s in w_sigs if s.position_type is PositionType.SHORT
                 )
                 long_count = len(w_sigs) - short_count
-
-                result = backtest_signals(
-                    w_sigs,
-                    client=self._client,
-                    approximate=self._config.approximate,
-                    seed=self._config.seed,
-                    session=session,
-                    default_entry_delay_seconds=self._config.entry_delay_seconds,
+                offset = len(all_signals_flat)
+                all_signals_flat.extend(w_sigs)
+                all_contexts_flat.extend(
+                    signal_ctx_map.get(id(s)) for s in w_sigs
                 )
+                window_info.append((window, short_count, long_count, offset, len(w_sigs)))
 
-                all_window_results.append(
-                    WindowResult(
-                        window=window,
-                        backtest=result,
-                        signal_count=len(w_sigs),
-                        short_count=short_count,
-                        long_count=long_count,
-                    )
+        if all_signals_flat:
+            all_trades = _resolve_signals_parallel(
+                signals=all_signals_flat,
+                approximate=self._config.approximate,
+                seed=self._config.seed,
+                entry_delay_seconds=self._config.entry_delay_seconds,
+                max_workers=self._config.backtest_max_workers,
+                client=self._client,
+                signal_contexts=all_contexts_flat,
+            )
+        else:
+            all_trades = []
+
+        # Re-distribute trades to per-window results.
+        all_window_results: list[WindowResult] = []
+        for window, short_count, long_count, offset, count in window_info:
+            window_trades = all_trades[offset : offset + count]
+            window_trades.sort(key=lambda t: t.entry_time)
+            stats = _compute_stats(window_trades)
+            all_window_results.append(
+                WindowResult(
+                    window=window,
+                    backtest=BacktestResult(trades=window_trades, **stats),
+                    signal_count=len(window_trades),
+                    short_count=short_count,
+                    long_count=long_count,
                 )
+            )
 
         return EvaluationReport(
             window_results=all_window_results,

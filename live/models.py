@@ -71,10 +71,18 @@ class ExchangeOrder:
     is_conditional: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class GeneratorBudget:
+    """Per-generator budget for multi-generator engine mode."""
+    position_size_usdt: float = 100.0
+    max_positions: int = 3
+
+
 @dataclass(slots=True)
 class LivePosition:
     signal: Signal
     position_id: str
+    strategy_id: str = ""
     status: PositionStatus = PositionStatus.PENDING_ENTRY
     entry_order: ExchangeOrder | None = None
     tp_order: ExchangeOrder | None = None

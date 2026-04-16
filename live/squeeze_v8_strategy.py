@@ -1,34 +1,27 @@
-"""Live signal generator: Squeeze V8.2 Strategy (SHORT + LONG).
+"""Live signal generator: Squeeze V8.3 Strategy.
 
-V8.2 keeps the V8.1 signal set unchanged and adds dynamic position sizing.
-Entries, exits, TP/SL, cooldowns, and filters are the same as V8.1. The only
-change is capital allocation per trade via `Signal.size_multiplier`.
+V8.3 changes over V8.2:
+  - SHORT signals get quality-tiered TP/SL based on (sq_count, RSI, ATR ratio):
+      Tier A (sq [10,20] AND RSI < 45):  TP 3.25% / SL 1.5%  (wider TP)
+      Tier C (toxic combos):              TP 3.0%  / SL 1.1%  (tighter SL)
+      Tier B (everything else):           TP 3.0%  / SL 1.5%  (unchanged)
+  - LONG signals filtered when ret_72h > 25% (overextended bull regime)
 
-V8.1 vs V8 on evaluation windows (11w):
-  V8.1 (72h): +152.58% PNL, 81.8% weekly WR, PF 2.39
-  V8   (24h): +138.74% PNL, 81.8% weekly WR, PF 2.34
+Current live logic:
+  1. SQUEEZE SHORT
+    - BB/KC squeeze release after 7+ compressed bars
+    - negative momentum, RSI >= 25, ATR ratio <= 1.5
+    - TP/SL per quality tier (see above), cooldown 12h
 
-V8 base changes from V7:
-  SHORT: TP 2.0→3.0, SL 1.0→1.5, RSI floor 30→25, ATR gate 1.3→1.5
-  LONG:  unchanged (TP 4.0, SL 2.0, regime >= 6%)
-
-Architecture:
-  Two sub-signals from different structural events:
-
-  1. SQUEEZE SHORT (from BB/KC squeeze release):
-    - 7+ bar compression, release with negative momentum
-    - RSI >= 25 (not deeply oversold), ATR ratio <= 1.5
-    - TP: 3.0%, SL: 1.5%, Cooldown: 12h
-
-  2. PULLBACK LONG (bull pullback reclaim, replaces squeeze LONG):
-    - Strong bull regime (ret_72h >= 10%), positive momentum
-    - Pullback to BB midline (SMA20), then decisive reclaim
+  2. BULL PULLBACK RECLAIM LONG
+    - strong bull regime (10% <= ret_72h <= 25%) with positive momentum
+    - shallow pullback to BB midline / EMA20 support, then decisive reclaim
     - RSI <= 75, ATR ratio <= 1.2, bullish bar, prior impulse
-    - TP: 4.0%, SL: 2.0%, Cooldown: 12h
+    - TP/SL 4.0% / 2.0%, cooldown 12h
 
-  Conflict resolution: SHORT priority when both fire for same ticker+time.
+  Conflict resolution: SHORT priority when both fire for the same ticker+time.
   Max holding time: 72h
-  Position sizing: ridge_v1 dynamic sizing (separate models per side)
+  Position sizing: ridge_v1 dynamic sizing with separate SHORT and LONG models
 
 Polling:
   - the reference calibration is 1h, but lower analysis intervals are supported
@@ -137,6 +130,11 @@ _PULLBACK_FEATURE_COLUMNS = (
     "bb_upper",
     "mom_slope",
 )
+
+# Union of squeeze and pullback columns — computed once per poll instead of twice.
+_COMBINED_FEATURE_COLUMNS = tuple(dict.fromkeys(
+    SQUEEZE_V8_FEATURE_COLUMNS + _PULLBACK_FEATURE_COLUMNS
+))
 
 _PULLBACK_V1_BETA = (
     0.0203650314688874,
@@ -440,6 +438,36 @@ def _apply_dynamic_sizing(
     return sized
 
 
+def _classify_short_tier(
+    sq_count: int,
+    rsi: float,
+    atr_ratio: float,
+) -> str:
+    """Classify SHORT signal quality tier (V8.3).
+
+    Tier A: sq [10,20] AND RSI < 45 — high-quality setups, wider TP.
+    Tier C: toxic feature combinations — tighter SL.
+    Tier B: everything else — standard V8.2 parameters.
+    """
+    if sq_count < 10 and rsi >= 50:
+        return "C"
+    if sq_count >= 20 and atr_ratio >= 1.0:
+        return "C"
+    if 10 <= sq_count < 15 and atr_ratio >= 1.2:
+        return "C"
+    if 10 <= sq_count <= 20 and rsi < 45:
+        return "A"
+    return "B"
+
+
+# V8.3 tier-based TP/SL defaults
+_TIER_TP = {"A": 3.25, "B": 3.0, "C": 3.0}
+_TIER_SL = {"A": 1.5, "B": 1.5, "C": 1.1}
+
+# V8.3 LONG overextension cap
+_LONG_RET_MAX = 25.0
+
+
 @dataclass(slots=True, frozen=True)
 class SqueezeV8Config:
     analysis_interval: str = "1h"
@@ -455,6 +483,7 @@ class SqueezeV8Config:
     long_tp: float = 4.0
     long_sl: float = 2.0
     long_cooldown_h: float = 12.0
+    long_ret_max: float = _LONG_RET_MAX
     min_squeeze_bars: int = 7
     atr_ratio_max: float = 1.5
     taker_fee_rate: float = 0.0005
@@ -517,12 +546,21 @@ def _build_squeeze_short_signal(
     metadata: dict[str, object],
     size_multiplier: float = 1.0,
 ) -> Signal:
+    # V8.3: classify SHORT quality tier and apply per-signal TP/SL
+    sq_count = int(metadata.get("sq_count", 12))
+    rsi = float(metadata.get("rsi", 40.0))
+    atr_ratio = float(metadata.get("atr_ratio", 0.9))
+    tier = _classify_short_tier(sq_count, rsi, atr_ratio)
+    tp = _TIER_TP[tier]
+    sl = _TIER_SL[tier]
+    metadata = {**metadata, "quality_tier": tier}
+
     return Signal(
         signal_date=signal_date,
         position_type=PositionType.SHORT,
         ticker=symbol,
-        tp_pct=config.short_tp,
-        sl_pct=config.short_sl,
+        tp_pct=tp,
+        sl_pct=sl,
         leverage=config.leverage,
         market_type=getattr(config, "market_type", MarketType.FUTURES),
         taker_fee_rate=getattr(config, "taker_fee_rate", 0.0005),
@@ -644,12 +682,14 @@ class _SqueezeV8PreviewState:
     close_tail_bb: deque[float] = None  # type: ignore[assignment]
     close_tail_ret: deque[float] = None  # type: ignore[assignment]
     last_row: _SqueezeV8FeatureRow | None = None
+    candle_buffer: deque[Candle] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         self.tr_tail = deque(maxlen=max(self.periods.atr_bars - 1, 1))
         self.atr_tail = deque(maxlen=max(self.periods.atr_avg_bars - 1, 1))
         self.close_tail_bb = deque(maxlen=max(self.periods.bb_bars - 1, 1))
         self.close_tail_ret = deque(maxlen=max(self.periods.return_bars, 1))
+        self.candle_buffer = deque(maxlen=max(self.periods.lookback_bars, 1))
 
     def preview(self, candle: Candle) -> _SqueezeV8PreviewStep:
         close = candle.close
@@ -782,6 +822,7 @@ class _SqueezeV8PreviewState:
         self.close_tail_bb.append(step.close)
         self.close_tail_ret.append(step.close)
         self.last_row = step.row
+        self.candle_buffer.append(candle)
         return step.row
 
 
@@ -993,7 +1034,7 @@ def _generate_squeeze_short_signals(
             signal_date=close_time,
             symbol=symbol,
             config=config,
-            strategy_name="squeeze_v8.2",
+            strategy_name="squeeze_v8.3",
             prev_squeeze_count=sq_count,
             squeeze_on=bool(squeeze_on_values[index]),
             mom=mom,
@@ -1011,6 +1052,8 @@ def _check_pullback_entry(
     frame: pd.DataFrame,
     index: int,
     periods: SqueezeV8Periods,
+    *,
+    long_ret_max: float = _LONG_RET_MAX,
 ) -> tuple[bool, dict[str, object]]:
     """Check if bull pullback reclaim LONG entry conditions are met."""
     regime_min = 10.0
@@ -1061,6 +1104,9 @@ def _check_pullback_entry(
     ret_raw = cache["ret_72h"][index]
     ret_72h = 0.0 if np.isnan(ret_raw) else float(ret_raw)
     if ret_72h < regime_min:
+        return False, {}
+    # V8.3: filter overextended bull regime
+    if ret_72h > long_ret_max:
         return False, {}
 
     rsi_raw = cache["rsi_14"][index]
@@ -1167,6 +1213,7 @@ def _generate_pullback_long_signals(
     long_tp: float = 4.0,
     long_sl: float = 2.0,
     long_cooldown_h: float = 12.0,
+    long_ret_max: float = _LONG_RET_MAX,
     max_holding_hours: int = 72,
     leverage: float = 1.0,
     market_type: MarketType = MarketType.FUTURES,
@@ -1186,7 +1233,12 @@ def _generate_pullback_long_signals(
         if close_time < start or close_time >= end:
             continue
 
-        ok, metadata = _check_pullback_entry(frame, index, periods)
+        ok, metadata = _check_pullback_entry(
+            frame,
+            index,
+            periods,
+            long_ret_max=long_ret_max,
+        )
         if not ok:
             continue
 
@@ -1211,6 +1263,208 @@ def _generate_pullback_long_signals(
         signals.append(signal)
         last_signal_time = close_time
 
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Vectorized backtest-path scanners (replace per-row iloc loops)
+# ---------------------------------------------------------------------------
+
+
+def _generate_squeeze_short_signals_vec(
+    frame: pd.DataFrame,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    config: SqueezeV8Config,
+) -> list[Signal]:
+    """Vectorized squeeze SHORT signal generation for backtesting.
+
+    Produces identical results to ``_generate_squeeze_short_signals`` but
+    replaces the per-row Python loop with vectorized boolean masks.  Only
+    the cooldown pass and signal construction iterate — over the tiny
+    subset of rows (~1-2%) that pass all gates.
+    """
+    if frame.empty:
+        return []
+
+    prev_sq = frame["squeeze_count"].shift(1)
+    mom = frame["mom_slope"]
+    atr_r = frame["atr_ratio"]
+    rsi = frame["rsi_14"].fillna(50.0)
+
+    candidate = (
+        mom.notna() & atr_r.notna()
+        & atr_r.le(config.atr_ratio_max)
+        & prev_sq.ge(config.min_squeeze_bars)
+        & ~frame["squeeze_on"].astype(bool)
+        & mom.lt(0)
+        & rsi.ge(config.short_rsi_floor)
+        & (frame["close_time"] >= start)
+        & (frame["close_time"] < end)
+    )
+    first_eval = max(min(config.warmup_bars - 1, len(frame) - 1), 1)
+    candidate.iloc[:first_eval] = False
+
+    # Sequential cooldown over candidates only
+    cooldown_sec = config.short_cooldown_h * 3600
+    ct_values = frame["close_time"].values
+    kept_indices: list[int] = []
+    last_short_time = None
+    for idx in candidate.values.nonzero()[0]:
+        ct = pd.Timestamp(ct_values[idx])
+        if last_short_time is not None and (ct - last_short_time).total_seconds() < cooldown_sec:
+            continue
+        last_short_time = ct
+        kept_indices.append(int(idx))
+
+    # Signal construction over the small kept set
+    signals: list[Signal] = []
+    for idx in kept_indices:
+        row = frame.iloc[idx]
+        prev = frame.iloc[idx - 1]
+        close_time = row["close_time"]
+        rsi_val = _safe_value(row, "rsi_14", 50.0)
+        mom_val = _safe_value(row, "mom_slope", 0.0)
+        atr_val = _safe_value(row, "atr_ratio", 1.0)
+        sq_count = int(_safe_value(prev, "squeeze_count", 0.0))
+        metadata: dict[str, object] = {
+            "strategy": "squeeze_v8.3_short",
+            "mom": round(mom_val, 6),
+            "rsi": round(rsi_val, 1),
+            "atr_ratio": round(atr_val, 2),
+            "sq_count": sq_count,
+        }
+        signal = _build_squeeze_short_signal(
+            signal_date=close_time,
+            symbol=symbol,
+            config=config,
+            metadata=metadata,
+        )
+        signals.append(signal)
+    return signals
+
+
+def _generate_pullback_long_signals_vec(
+    frame: pd.DataFrame,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    periods: SqueezeV8Periods,
+    *,
+    long_tp: float = 4.0,
+    long_sl: float = 2.0,
+    long_cooldown_h: float = 12.0,
+    long_ret_max: float = _LONG_RET_MAX,
+    max_holding_hours: int = 72,
+    leverage: float = 1.0,
+    market_type: MarketType = MarketType.FUTURES,
+    taker_fee_rate: float = 0.0005,
+) -> list[Signal]:
+    """Vectorized pullback LONG signal generation for backtesting.
+
+    Produces identical results to ``_generate_pullback_long_signals`` but
+    replaces per-row iloc lookback scans with precomputed rolling columns.
+    """
+    if frame.empty or len(frame) < periods.warmup_bars + 2:
+        return []
+
+    # Support: bb_mid if bb_mid > 0 else ema20 (line 866-868)
+    bb_mid = frame["_bb_ma_20"].fillna(0.0)
+    ema20 = frame["ema_20"]
+    support = bb_mid.where(bb_mid > 0, ema20)
+    atr = frame["atr_14"]
+
+    # prev_support: _safe_value(prev, "_bb_ma_20", _safe_value(prev, "ema_20", support))
+    prev_bb = frame["_bb_ma_20"].shift(1)
+    prev_ema = frame["ema_20"].shift(1)
+    prev_support = prev_bb.where(prev_bb.notna(), prev_ema.where(prev_ema.notna(), support))
+
+    # Lookback support for rolling: _safe_value(lb_row, "_bb_ma_20", _safe_value(lb_row, "ema_20", 0.0))
+    lb_support = frame["_bb_ma_20"].where(
+        frame["_bb_ma_20"].notna(),
+        frame["ema_20"].where(frame["ema_20"].notna(), 0.0),
+    )
+    close_above_lb_support = (frame["close"] > lb_support)
+
+    above_window = max(periods.pullback_above_support_bars, 1)
+    above_support_window = (
+        close_above_lb_support.rolling(above_window, min_periods=1).sum().shift(2)
+    )
+
+    impulse_window = max(periods.pullback_impulse_bars - 1, 1)
+    impulse_hits = (
+        (frame["high"] >= frame["bb_upper"].fillna(float("inf")))
+        .rolling(impulse_window, min_periods=1).max().shift(2).fillna(0).astype(bool)
+    )
+
+    body = frame["close"] - frame["open"]
+    bar_range = frame["high"] - frame["low"]
+
+    candidate = (
+        ema20.notna() & atr.notna() & atr.gt(0)
+        & frame["ret_72h"].between(10.0, long_ret_max)
+        & frame["rsi_14"].fillna(50.0).le(75.0)
+        & frame["atr_ratio"].fillna(1.0).le(1.2)
+        & frame["mom_slope"].fillna(0.0).gt(0)
+        & (frame["close"] > support + 0.3 * atr)
+        & body.gt(0) & bar_range.gt(0) & (body / bar_range).ge(0.4)
+        & (frame["low"].shift(1) <= prev_support)
+        & (frame["close"].shift(1) >= prev_support - 1.0 * atr)
+        & above_support_window.ge(above_window / 2)
+        & impulse_hits
+        & (frame["close_time"] >= start) & (frame["close_time"] < end)
+    )
+    first_eval = max(periods.warmup_bars, 2)
+    candidate.iloc[:first_eval] = False
+
+    # Sequential cooldown over candidates only
+    cooldown_sec = long_cooldown_h * 3600
+    ct_values = frame["close_time"].values
+    kept_indices: list[int] = []
+    last_signal_time = None
+    for idx in candidate.values.nonzero()[0]:
+        ct = pd.Timestamp(ct_values[idx])
+        if last_signal_time is not None and (ct - last_signal_time).total_seconds() < cooldown_sec:
+            continue
+        last_signal_time = ct
+        kept_indices.append(int(idx))
+
+    # Signal construction over the small kept set
+    signals: list[Signal] = []
+    for idx in kept_indices:
+        row = frame.iloc[idx]
+        close_time = row["close_time"]
+        # Recompute metadata values matching _check_pullback_entry
+        row_support = float(support.iloc[idx])
+        row_atr = float(atr.iloc[idx])
+        prev_row = frame.iloc[idx - 1]
+        prev_low_val = float(prev_row["low"])
+        prev_support_val = float(prev_support.iloc[idx])
+        reclaim_strength = (float(row["close"]) - row_support) / row_atr if row_atr > 0 else 0.0
+        pullback_depth = (prev_support_val - prev_low_val) / row_atr if row_atr > 0 else 0.0
+        metadata: dict[str, object] = {
+            "strategy": "pullback_long",
+            "ret_72h": round(_safe_value(row, "ret_72h", 0.0), 2),
+            "rsi": round(_safe_value(row, "rsi_14", 50.0), 2),
+            "atr_ratio": round(_safe_value(row, "atr_ratio", 1.0), 3),
+            "pullback_depth": round(pullback_depth, 3),
+            "mom_slope": round(_safe_value(row, "mom_slope", 0.0), 6),
+            "reclaim_strength": round(reclaim_strength, 3),
+        }
+        signal = Signal(
+            signal_date=close_time,
+            position_type=PositionType.LONG,
+            ticker=symbol,
+            tp_pct=long_tp,
+            sl_pct=long_sl,
+            leverage=leverage,
+            market_type=market_type,
+            taker_fee_rate=taker_fee_rate,
+            max_holding_hours=max_holding_hours,
+            metadata=metadata,
+        )
+        signals.append(signal)
     return signals
 
 
@@ -1272,7 +1526,7 @@ def _generate_symbol_preview_signals(
                     signal_date=snapshot.signal_time,
                     symbol=symbol,
                     config=config,
-                    strategy_name="squeeze_v8.2",
+                    strategy_name="squeeze_v8.3",
                     prev_squeeze_count=sq_count,
                     squeeze_on=row.squeeze_on,
                     mom=mom,
@@ -1338,33 +1592,36 @@ def generate_squeeze_v8_signals(
         )
         selected_symbols = symbols or list(frames)
 
-        # Squeeze SHORT signals
+        # Squeeze SHORT signals (vectorized backtest path)
         signals: list[Signal] = []
         for symbol in selected_symbols:
             frame = frames.get(symbol)
             if frame is None:
                 continue
             signals.extend(
-                _generate_squeeze_short_signals(
+                _generate_squeeze_short_signals_vec(
                     frame, symbol, active_start, active_end, active_config,
                 )
             )
 
-    # Pullback LONG signals
+    # Pullback LONG signals (vectorized backtest path)
     if active_config.enable_pullback_long:
+        available_symbols = [
+            s for s in selected_symbols if s in prepared_context.symbols
+        ]
         pullback_frames = _build_pullback_feature_frames(
             prepared_context,
-            list(selected_symbols),
+            available_symbols,
             analysis_interval=active_config.analysis_interval,
             min_squeeze_bars=active_config.min_squeeze_bars,
             warmup_bars=active_config.warmup_bars,
-        )
+        ) if available_symbols else {}
         for symbol in selected_symbols:
             pf = pullback_frames.get(symbol)
             if pf is None or pf.empty:
                 continue
             signals.extend(
-                _generate_pullback_long_signals(
+                _generate_pullback_long_signals_vec(
                     pf,
                     symbol,
                     active_start,
@@ -1373,6 +1630,7 @@ def generate_squeeze_v8_signals(
                     long_tp=active_config.long_tp,
                     long_sl=active_config.long_sl,
                     long_cooldown_h=active_config.long_cooldown_h,
+                    long_ret_max=active_config.long_ret_max,
                     max_holding_hours=active_config.max_holding_hours,
                     leverage=active_config.leverage,
                     market_type=active_config.market_type,
@@ -1388,15 +1646,33 @@ def generate_squeeze_v8_signals(
 
 
 class SqueezeV8Strategy(SignalGenerator):
-    """Squeeze V8.2: SHORT + pullback LONG live signal generator.
+    """Squeeze V8.3: SHORT + pullback LONG live signal generator.
 
     SHORT: squeeze breakout with negative momentum (all regimes)
-           TP 3.0/SL 1.5, RSI >= 25, ATR ratio <= 1.5
-    LONG:  bull pullback reclaim (replaces squeeze LONG)
-           TP 4.0/SL 2.0, ret_72h >= 10%, RSI <= 75, ATR ratio <= 1.2
+           TP/SL per quality tier:
+             Tier A (sq [10,20] AND RSI < 45):  TP 3.25% / SL 1.5%
+             Tier C (toxic combos):              TP 3.0%  / SL 1.1%
+             Tier B (default):                   TP 3.0%  / SL 1.5%
+           RSI >= 25, ATR ratio <= 1.5
+    LONG:  bull pullback reclaim
+           TP 4.0/SL 2.0, 10% <= ret_72h <= 25%, RSI <= 75, ATR ratio <= 1.2
     Max holding time: 72h
     Default sizing: ridge_v1 dynamic sizing (separate models per side)
     """
+
+    @property
+    def symbols(self) -> list[str]:
+        return list(SYMBOLS)
+
+    @property
+    def cooldown_hours(self) -> float:
+        if self.short_cooldown_h != self.long_cooldown_h:
+            raise ValueError(
+                f"evaluator cooldown assumes equal short/long cooldown "
+                f"(got short={self.short_cooldown_h}, long={self.long_cooldown_h}); "
+                f"if they diverge, _enforce_cooldown needs per-side cooldown support"
+            )
+        return self.short_cooldown_h
 
     def __init__(
         self,
@@ -1404,17 +1680,18 @@ class SqueezeV8Strategy(SignalGenerator):
         poll_interval: str | None = None,
         sizing_mode: str = "ridge_v1",
         leverage: float = 1.0,
-        # SHORT params (V8: wider TP/SL, lower RSI floor)
+        # SHORT params
         short_tp: float = 3.0,
         short_sl: float = 1.5,
         short_cooldown_h: float = 12.0,
         short_rsi_floor: float = 25.0,
-        # LONG params (pullback reclaim)
+        # LONG params
         long_tp: float = 4.0,
         long_sl: float = 2.0,
         long_cooldown_h: float = 12.0,
+        long_ret_max: float = _LONG_RET_MAX,
         enable_pullback_long: bool = True,
-        # Shared params (V8: relaxed ATR gate)
+        # Shared params
         min_squeeze_bars: int = 7,
         atr_ratio_max: float = 1.5,
         max_holding_hours: int = 72,
@@ -1445,6 +1722,7 @@ class SqueezeV8Strategy(SignalGenerator):
         self.long_tp = long_tp
         self.long_sl = long_sl
         self.long_cooldown_h = long_cooldown_h
+        self.long_ret_max = long_ret_max
         self.min_squeeze_bars = min_squeeze_bars
         self.atr_ratio_max = atr_ratio_max
         self.max_holding_hours = max_holding_hours
@@ -1470,17 +1748,23 @@ class SqueezeV8Strategy(SignalGenerator):
     def warmup_bars(self) -> int:
         return self._periods.warmup_bars
 
+    @property
+    def required_warmup_bars(self) -> int:
+        return self.warmup_bars
+
     def setup(self, client: LiveMarketClient) -> None:
         self._client = client
         self._warm_up_states()
         print(
-            f"SqueezeV8.2 initialized | "
+            f"SqueezeV8.3 initialized | "
             f"symbols={len(self._active_symbols)} | leverage={self.leverage}x | "
             f"analysis={self.analysis_interval} | poll={self.effective_poll_interval} | "
             f"sizing={self.sizing_mode} | "
-            f"SHORT TP/SL={self.short_tp}/{self.short_sl}% "
+            f"SHORT TP/SL=tiered(A:{_TIER_TP['A']}/{_TIER_SL['A']}% "
+            f"B:{_TIER_TP['B']}/{_TIER_SL['B']}% C:{_TIER_TP['C']}/{_TIER_SL['C']}%) "
             f"CD={self.short_cooldown_h}h RSI>={self.short_rsi_floor} | "
             f"LONG(pullback) TP/SL={self.long_tp}/{self.long_sl}% "
+            f"ret_max={self.long_ret_max}% "
             f"CD={self.long_cooldown_h}h enabled={self.enable_pullback_long} | "
             f"min_sq={self.periods.min_squeeze_bars} bars "
             f"({self.min_squeeze_bars}h-equiv) ATR<={self.atr_ratio_max} | "
@@ -1553,6 +1837,7 @@ class SqueezeV8Strategy(SignalGenerator):
         assert self._client is not None
         now = self.current_time()
         signals: list[Signal] = []
+        fetch_errors = 0
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             future_to_symbol = {
@@ -1567,7 +1852,16 @@ class SqueezeV8Strategy(SignalGenerator):
                 except FatalSignalError:
                     raise
                 except Exception as exc:
+                    fetch_errors += 1
                     print(f"Error checking {symbol}: {exc}", file=sys.stderr)
+
+        if fetch_errors > 0:
+            evaluated = len(SYMBOLS) - fetch_errors
+            print(
+                f"SqueezeV8: {fetch_errors}/{len(SYMBOLS)} symbols had data fetch errors "
+                f"({evaluated} evaluated cleanly)",
+                file=sys.stderr,
+            )
 
         signals = _apply_dynamic_sizing(signals, sizing_mode=self.sizing_mode)
         return signals if signals else None
@@ -1650,7 +1944,7 @@ class SqueezeV8Strategy(SignalGenerator):
                 signal_date=now,
                 symbol=symbol,
                 config=self,
-                strategy_name="squeeze_v8.2",
+                strategy_name="squeeze_v8.3",
                 prev_squeeze_count=int(prev.squeeze_count),
                 squeeze_on=row.squeeze_on,
                 mom=mom,
@@ -1667,15 +1961,7 @@ class SqueezeV8Strategy(SignalGenerator):
         # Pullback LONG check (full pandas path for preview mode)
         had_short = len(emitted) > 0
         if self.enable_pullback_long and not had_short:
-            lookback_start = now - timedelta(
-                seconds=interval_to_seconds(self.analysis_interval) * (self.periods.lookback_bars + 2)
-            )
-            pb_candles = self._client.fetch_klines(
-                symbol=symbol.replace("/", ""),
-                interval=self.analysis_interval,
-                start=lookback_start,
-                end=now,
-            )
+            pb_candles = list(state.candle_buffer)
             if len(pb_candles) >= self.warmup_bars:
                 import pandas as pd
                 pb_rows = [{
@@ -1775,7 +2061,7 @@ class SqueezeV8Strategy(SignalGenerator):
                 signal_date=now,
                 symbol=symbol,
                 config=self,
-                strategy_name="squeeze_v8.2",
+                strategy_name="squeeze_v8.3",
                 prev_squeeze_count=int(prev["squeeze_count"]),
                 squeeze_on=bool(row["squeeze_on"]),
                 mom=float(mom),
@@ -1813,7 +2099,12 @@ class SqueezeV8Strategy(SignalGenerator):
         if last_idx < self.warmup_bars:
             return []
 
-        ok, metadata = _check_pullback_entry(df_pullback, last_idx, self.periods)
+        ok, metadata = _check_pullback_entry(
+            df_pullback,
+            last_idx,
+            self.periods,
+            long_ret_max=self.long_ret_max,
+        )
         if not ok:
             return []
 
@@ -1858,6 +2149,7 @@ class SqueezeV8Strategy(SignalGenerator):
             long_tp=self.long_tp,
             long_sl=self.long_sl,
             long_cooldown_h=self.long_cooldown_h,
+            long_ret_max=self.long_ret_max,
             min_squeeze_bars=self.min_squeeze_bars,
             atr_ratio_max=self.atr_ratio_max,
             max_holding_hours=self.max_holding_hours,
