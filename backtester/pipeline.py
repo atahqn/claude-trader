@@ -169,7 +169,16 @@ class PreparedMarketContext:
         """
         truncated_by_symbol: dict[str, SymbolMarketContext] = {}
         for sym, smc in self.bundle.by_symbol.items():
-            trunc_frame = smc.frame[smc.frame["close_time"] <= t].copy()
+            if "close_time" not in smc.frame.columns:
+                if smc.frame.empty:
+                    trunc_frame = smc.frame.copy()
+                else:
+                    raise ValueError(
+                        f"PreparedMarketContext.truncated_to(): symbol {sym!r} "
+                        "frame is missing required 'close_time' column",
+                    )
+            else:
+                trunc_frame = smc.frame[smc.frame["close_time"] <= t].copy()
             trunc_raw = _truncate_raw_datasets(smc.raw_datasets, t)
             truncated_by_symbol[sym] = SymbolMarketContext(
                 symbol=smc.symbol,

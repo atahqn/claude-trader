@@ -932,8 +932,10 @@ class CombinedLongStrategy(SignalGenerator):
 
         all_signals: list[Signal] = []
 
+        min_rows = max(_WARMUP_BARS, 3) + 1
+
         for symbol, frame in frames.items():
-            if frame.empty or len(frame) < _WARMUP_BARS + 3:
+            if frame.empty or len(frame) < min_rows:
                 continue
 
             last_signal: datetime | None = None
