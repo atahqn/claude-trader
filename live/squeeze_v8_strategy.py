@@ -31,15 +31,15 @@ Architecture:
   Position sizing: ridge_v1 dynamic sizing (separate models per side)
 
 Polling:
-  - analysis interval stays 1h
-  - poll interval defaults to 1h, preserving the old close-only behavior
-  - when poll interval is lower (for example 15m or 5m), the strategy evaluates
-    Bybit's current in-progress 1h candle snapshot at those poll boundaries
+  - the reference calibration is 1h, but lower analysis intervals are supported
+  - poll interval defaults to the analysis interval, preserving close-only behavior
+  - when poll interval is lower than the analysis interval, the strategy evaluates
+    the current in-progress analysis candle snapshot at those poll boundaries
   - uses incremental _SqueezeV8PreviewState per symbol for O(1) indicator updates
 
 Look-ahead bias prevention:
-  - close-only mode uses the last fully closed 1h candle
-  - preview mode uses the currently visible 1h candle snapshot from Bybit
+  - close-only mode uses the last fully closed analysis candle
+  - preview mode uses the currently visible analysis candle snapshot
   - all indicators remain backward-looking: rolling(), ewm(), pct_change()
   - entry executes via market order after signal
 """
@@ -59,10 +59,8 @@ import pandas as pd
 from marketdata import MarketDataRequest
 
 from backtester.indicators import (
-    compute_indicator_frame,
     compute_rsi_from_ewm_means,
     linear_regression_slope,
-    required_warmup,
     true_range_value,
 )
 from backtester.models import Candle, MarketType, PositionType, Signal
@@ -92,12 +90,19 @@ SQUEEZE_V8_FEATURE_COLUMNS = (
     "squeeze_count",
     "mom_slope",
 )
-_LOOKBACK_BARS = 100
+_BASE_ANALYSIS_INTERVAL = "1h"
+_BASE_LOOKBACK_BARS = 100
+_BASE_RSI_BARS = 14
+_BASE_ATR_BARS = 14
+_BASE_ATR_AVG_BARS = 72
+_BASE_RETURN_BARS = 72
+_BASE_BB_BARS = 20
+_BASE_MOM_BARS = 20
+_BASE_PULLBACK_ABOVE_SUPPORT_BARS = 5
+_BASE_PULLBACK_IMPULSE_BARS = 10
 _SUPPORTED_POLL_INTERVALS = {"1h", "30m", "15m", "5m", "1m"}
+_SUPPORTED_ANALYSIS_INTERVALS = _SUPPORTED_POLL_INTERVALS
 _SUPPORTED_SIZING_MODES = {"baseline", "ridge_v1"}
-_RSI_ALPHA = 1 / 14
-_EMA20_ALPHA = 2 / 21
-_WARMUP_BARS = required_warmup(SQUEEZE_V8_FEATURE_COLUMNS)
 
 _RIDGE_V1_SHORT_BETA = (
     -0.0797095672793,
@@ -132,7 +137,6 @@ _PULLBACK_FEATURE_COLUMNS = (
     "bb_upper",
     "mom_slope",
 )
-_PULLBACK_WARMUP_BARS = required_warmup(_PULLBACK_FEATURE_COLUMNS)
 
 _PULLBACK_V1_BETA = (
     0.0203650314688874,
@@ -156,6 +160,96 @@ _PULLBACK_V1_ALPHA = 0.25
 _PULLBACK_V1_SCALE = 0.9989947888
 _PULLBACK_CLIP_LO = 0.45
 _PULLBACK_CLIP_HI = 1.70
+
+
+def _bars_for_same_duration(base_bars: int, analysis_interval: str) -> int:
+    analysis_seconds = interval_to_seconds(analysis_interval)
+    base_seconds = interval_to_seconds(_BASE_ANALYSIS_INTERVAL)
+    if analysis_seconds <= 0 or analysis_seconds > base_seconds:
+        raise ValueError("analysis_interval must be less than or equal to 1h")
+    if base_seconds % analysis_seconds != 0:
+        raise ValueError("analysis_interval must divide 1h exactly")
+    return max(1, base_bars * (base_seconds // analysis_seconds))
+
+
+def _compute_squeeze_count(values: pd.Series) -> pd.Series:
+    counts: list[int] = []
+    count = 0
+    for active in values.fillna(False):
+        count = count + 1 if bool(active) else 0
+        counts.append(count)
+    return pd.Series(counts, index=values.index, dtype="int64")
+
+
+@dataclass(slots=True, frozen=True)
+class SqueezeV8Periods:
+    analysis_interval: str
+    bars_per_hour: int
+    rsi_bars: int
+    atr_bars: int
+    atr_avg_bars: int
+    return_bars: int
+    bb_bars: int
+    mom_bars: int
+    pullback_above_support_bars: int
+    pullback_impulse_bars: int
+    min_squeeze_bars: int
+    warmup_bars: int
+    lookback_bars: int
+    rsi_alpha: float
+    ema_alpha: float
+
+    @staticmethod
+    def for_interval(
+        analysis_interval: str,
+        *,
+        min_squeeze_bars: int,
+        lookback_bars: int = _BASE_LOOKBACK_BARS,
+        warmup_bars: int | None = None,
+    ) -> "SqueezeV8Periods":
+        bars_per_hour = _bars_for_same_duration(1, analysis_interval)
+        rsi_bars = _bars_for_same_duration(_BASE_RSI_BARS, analysis_interval)
+        atr_bars = _bars_for_same_duration(_BASE_ATR_BARS, analysis_interval)
+        atr_avg_bars = _bars_for_same_duration(_BASE_ATR_AVG_BARS, analysis_interval)
+        return_bars = _bars_for_same_duration(_BASE_RETURN_BARS, analysis_interval)
+        bb_bars = _bars_for_same_duration(_BASE_BB_BARS, analysis_interval)
+        mom_bars = _bars_for_same_duration(_BASE_MOM_BARS, analysis_interval)
+        scaled_min_squeeze_bars = _bars_for_same_duration(min_squeeze_bars, analysis_interval)
+        computed_warmup = max(
+            rsi_bars,
+            atr_bars + atr_avg_bars - 1,
+            return_bars + 1,
+            bb_bars,
+            mom_bars,
+        )
+        final_warmup = computed_warmup if warmup_bars is None else max(warmup_bars, computed_warmup)
+        scaled_lookback = max(
+            _bars_for_same_duration(lookback_bars, analysis_interval),
+            final_warmup + bars_per_hour,
+        )
+        return SqueezeV8Periods(
+            analysis_interval=analysis_interval,
+            bars_per_hour=bars_per_hour,
+            rsi_bars=rsi_bars,
+            atr_bars=atr_bars,
+            atr_avg_bars=atr_avg_bars,
+            return_bars=return_bars,
+            bb_bars=bb_bars,
+            mom_bars=mom_bars,
+            pullback_above_support_bars=_bars_for_same_duration(
+                _BASE_PULLBACK_ABOVE_SUPPORT_BARS,
+                analysis_interval,
+            ),
+            pullback_impulse_bars=_bars_for_same_duration(
+                _BASE_PULLBACK_IMPULSE_BARS,
+                analysis_interval,
+            ),
+            min_squeeze_bars=scaled_min_squeeze_bars,
+            warmup_bars=final_warmup,
+            lookback_bars=scaled_lookback,
+            rsi_alpha=1.0 / rsi_bars,
+            ema_alpha=2.0 / (bb_bars + 1.0),
+        )
 
 
 def _validate_sizing_mode(mode: str) -> str:
@@ -366,12 +460,17 @@ class SqueezeV8Config:
     taker_fee_rate: float = 0.0005
     market_type: MarketType = MarketType.FUTURES
     max_holding_hours: int = 72
-    warmup_bars: int = _WARMUP_BARS
+    warmup_bars: int | None = None
 
     def __post_init__(self) -> None:
-        if self.analysis_interval != "1h":
-            raise ValueError("SqueezeV8 currently supports only 1h analysis_interval")
+        if self.analysis_interval not in _SUPPORTED_ANALYSIS_INTERVALS:
+            supported = ", ".join(sorted(_SUPPORTED_ANALYSIS_INTERVALS))
+            raise ValueError(f"SqueezeV8 analysis_interval must be one of: {supported}")
         _validate_sizing_mode(self.sizing_mode)
+        if self.analysis_interval != "1h" and self.sizing_mode == "ridge_v1":
+            raise ValueError(
+                "ridge_v1 sizing is calibrated only for 1h analysis_interval; use baseline for lower timeframes"
+            )
         effective_poll_interval = self.effective_poll_interval
         if effective_poll_interval not in _SUPPORTED_POLL_INTERVALS:
             raise ValueError(
@@ -385,6 +484,15 @@ class SqueezeV8Config:
     @property
     def effective_poll_interval(self) -> str:
         return self.poll_interval or self.analysis_interval
+
+    @property
+    def periods(self) -> SqueezeV8Periods:
+        return SqueezeV8Periods.for_interval(
+            self.analysis_interval,
+            min_squeeze_bars=self.min_squeeze_bars,
+            lookback_bars=_BASE_LOOKBACK_BARS,
+            warmup_bars=self.warmup_bars,
+        )
 
 
 def market_data_request_for_squeeze_v8(
@@ -441,9 +549,10 @@ def _emit_squeeze_short_signal(
     gate_key: object = "default",
 ) -> tuple[Signal | None, datetime | None]:
     """Check squeeze SHORT conditions and emit signal if met."""
+    periods = _config_periods(config)
     if atr_ratio > config.atr_ratio_max:
         return None, last_short
-    if prev_squeeze_count < config.min_squeeze_bars or squeeze_on:
+    if prev_squeeze_count < periods.min_squeeze_bars or squeeze_on:
         return None, last_short
     if mom >= 0 or rsi < config.short_rsi_floor:
         return None, last_short
@@ -470,7 +579,7 @@ def _emit_squeeze_short_signal(
                 "effective_poll_interval",
                 getattr(config, "analysis_interval", "1h"),
             ),
-            "source_hour_start": source_period_start.isoformat(),
+            "source_period_start": source_period_start.isoformat(),
         }
 
     signal = _build_squeeze_short_signal(
@@ -483,7 +592,7 @@ def _emit_squeeze_short_signal(
             "mom": round(mom, 6),
             "rsi": round(rsi, 1),
             "atr_ratio": round(atr_ratio, 2),
-            "sq_count": int(prev_squeeze_count),
+            "sq_count": round(prev_squeeze_count / periods.bars_per_hour, 3),
         },
     )
     return signal, signal_date
@@ -518,6 +627,7 @@ class _SqueezeV8PreviewStep:
 
 @dataclass(slots=True)
 class _SqueezeV8PreviewState:
+    periods: SqueezeV8Periods
     candle_count: int = 0
     prev_close: float | None = None
     gain_num: float = 0.0
@@ -531,15 +641,15 @@ class _SqueezeV8PreviewState:
     ema_count: int = 0
     tr_tail: deque[float] = None  # type: ignore[assignment]
     atr_tail: deque[float] = None  # type: ignore[assignment]
-    close_tail_19: deque[float] = None  # type: ignore[assignment]
-    close_tail_72: deque[float] = None  # type: ignore[assignment]
+    close_tail_bb: deque[float] = None  # type: ignore[assignment]
+    close_tail_ret: deque[float] = None  # type: ignore[assignment]
     last_row: _SqueezeV8FeatureRow | None = None
 
     def __post_init__(self) -> None:
-        self.tr_tail = deque(maxlen=13)
-        self.atr_tail = deque(maxlen=71)
-        self.close_tail_19 = deque(maxlen=19)
-        self.close_tail_72 = deque(maxlen=72)
+        self.tr_tail = deque(maxlen=max(self.periods.atr_bars - 1, 1))
+        self.atr_tail = deque(maxlen=max(self.periods.atr_avg_bars - 1, 1))
+        self.close_tail_bb = deque(maxlen=max(self.periods.bb_bars - 1, 1))
+        self.close_tail_ret = deque(maxlen=max(self.periods.return_bars, 1))
 
     def preview(self, candle: Candle) -> _SqueezeV8PreviewStep:
         close = candle.close
@@ -562,54 +672,54 @@ class _SqueezeV8PreviewState:
                 self.gain_den,
                 self.gain_count,
                 max(delta, 0.0),
-                alpha=_RSI_ALPHA,
-                min_periods=14,
+                alpha=self.periods.rsi_alpha,
+                min_periods=self.periods.rsi_bars,
             )
             loss_mean, loss_num, loss_den, loss_count = _ewm_next(
                 self.loss_num,
                 self.loss_den,
                 self.loss_count,
                 max(-delta, 0.0),
-                alpha=_RSI_ALPHA,
-                min_periods=14,
+                alpha=self.periods.rsi_alpha,
+                min_periods=self.periods.rsi_bars,
             )
 
         rsi = compute_rsi_from_ewm_means(gain_mean, loss_mean)
 
         tr_value = true_range_value(candle.high, candle.low, prev_close)
         atr_14 = np.nan
-        if len(self.tr_tail) == 13:
-            atr_14 = (sum(self.tr_tail) + tr_value) / 14.0
+        if len(self.tr_tail) == self.periods.atr_bars - 1:
+            atr_14 = (sum(self.tr_tail) + tr_value) / float(self.periods.atr_bars)
 
         atr_72_avg = np.nan
-        if not np.isnan(atr_14) and len(self.atr_tail) == 71:
-            atr_72_avg = (sum(self.atr_tail) + atr_14) / 72.0
+        if not np.isnan(atr_14) and len(self.atr_tail) == self.periods.atr_avg_bars - 1:
+            atr_72_avg = (sum(self.atr_tail) + atr_14) / float(self.periods.atr_avg_bars)
 
         atr_ratio = np.nan
         if not np.isnan(atr_14) and not np.isnan(atr_72_avg) and atr_72_avg != 0.0:
             atr_ratio = atr_14 / atr_72_avg
 
         ret_72h = np.nan
-        if len(self.close_tail_72) == 72 and self.close_tail_72[0] != 0.0:
-            ret_72h = (close / self.close_tail_72[0] - 1.0) * 100.0
+        if len(self.close_tail_ret) == self.periods.return_bars and self.close_tail_ret[0] != 0.0:
+            ret_72h = (close / self.close_tail_ret[0] - 1.0) * 100.0
 
         bb_upper = np.nan
         bb_lower = np.nan
         mom_slope = np.nan
-        if len(self.close_tail_19) == 19:
-            closes_20 = list(self.close_tail_19) + [close]
-            bb_mean = float(np.mean(closes_20))
-            bb_std = float(np.std(closes_20, ddof=1))
+        if len(self.close_tail_bb) == self.periods.bb_bars - 1:
+            closes_for_window = list(self.close_tail_bb) + [close]
+            bb_mean = float(np.mean(closes_for_window))
+            bb_std = float(np.std(closes_for_window, ddof=1))
             bb_upper = bb_mean + 2 * bb_std
             bb_lower = bb_mean - 2 * bb_std
-            mom_slope = linear_regression_slope(closes_20)
+            mom_slope = linear_regression_slope(closes_for_window)
 
         ema_20, ema_num, ema_den, ema_count = _ewm_next(
             self.ema_num,
             self.ema_den,
             self.ema_count,
             close,
-            alpha=_EMA20_ALPHA,
+            alpha=self.periods.ema_alpha,
             min_periods=1,
         )
         kc_upper = ema_20 + 1.5 * atr_14 if not np.isnan(atr_14) else np.nan
@@ -669,8 +779,8 @@ class _SqueezeV8PreviewState:
         self.tr_tail.append(step.tr_value)
         if not np.isnan(step.atr_14):
             self.atr_tail.append(step.atr_14)
-        self.close_tail_19.append(step.close)
-        self.close_tail_72.append(step.close)
+        self.close_tail_bb.append(step.close)
+        self.close_tail_ret.append(step.close)
         self.last_row = step.row
         return step.row
 
@@ -692,36 +802,121 @@ def _ewm_next(
     return mean, next_num, next_den, next_count
 
 
-def build_squeeze_v8_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    return compute_indicator_frame(frame, SQUEEZE_V8_FEATURE_COLUMNS)
+def _build_strategy_feature_frame(
+    frame: pd.DataFrame,
+    periods: SqueezeV8Periods,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    required_columns = {"open", "high", "low", "close", "volume"}
+    if not required_columns.issubset(frame.columns):
+        return frame.copy()
+
+    df = frame.copy()
+    delta_close = df["close"].diff()
+    gain = delta_close.clip(lower=0)
+    loss = (-delta_close).clip(lower=0)
+    gain_ewm = gain.ewm(alpha=periods.rsi_alpha, min_periods=periods.rsi_bars).mean()
+    loss_ewm = loss.ewm(alpha=periods.rsi_alpha, min_periods=periods.rsi_bars).mean()
+    df["rsi_14"] = compute_rsi_from_ewm_means(gain_ewm, loss_ewm)
+
+    prev_close = df["close"].shift(1)
+    true_range = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    df["atr_14"] = true_range.rolling(periods.atr_bars).mean()
+    df["atr_72_avg"] = df["atr_14"].rolling(periods.atr_avg_bars).mean()
+    df["atr_ratio"] = df["atr_14"] / df["atr_72_avg"]
+
+    df["ret_72h"] = df["close"].pct_change(periods.return_bars) * 100.0
+    df["_bb_ma_20"] = df["close"].rolling(periods.bb_bars).mean()
+    df["_bb_std_20"] = df["close"].rolling(periods.bb_bars).std()
+    df["bb_upper"] = df["_bb_ma_20"] + 2.0 * df["_bb_std_20"]
+    df["bb_lower"] = df["_bb_ma_20"] - 2.0 * df["_bb_std_20"]
+    df["ema_20"] = df["close"].ewm(span=periods.bb_bars).mean()
+    df["kc_upper"] = df["ema_20"] + 1.5 * df["atr_14"]
+    df["kc_lower"] = df["ema_20"] - 1.5 * df["atr_14"]
+    df["squeeze_on"] = (
+        (df["bb_lower"] > df["kc_lower"]) & (df["bb_upper"] < df["kc_upper"])
+    )
+    df["squeeze_count"] = _compute_squeeze_count(df["squeeze_on"])
+    df["mom_slope"] = df["close"].rolling(periods.mom_bars).apply(
+        linear_regression_slope,
+        raw=True,
+    )
+    return df
+
+
+def build_squeeze_v8_feature_frame(
+    frame: pd.DataFrame,
+    *,
+    analysis_interval: str = "1h",
+    min_squeeze_bars: int = 7,
+    warmup_bars: int | None = None,
+) -> pd.DataFrame:
+    periods = SqueezeV8Periods.for_interval(
+        analysis_interval,
+        min_squeeze_bars=min_squeeze_bars,
+        warmup_bars=warmup_bars,
+    )
+    return _build_strategy_feature_frame(frame, periods)
 
 
 def build_squeeze_v8_feature_frames(
     prepared_context: PreparedMarketContext,
     *,
     symbols: list[str] | None = None,
+    analysis_interval: str = "1h",
+    min_squeeze_bars: int = 7,
+    warmup_bars: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     feature_frames: dict[str, pd.DataFrame] = {}
     selected_symbols = symbols or prepared_context.symbols
     for symbol in selected_symbols:
         feature_frames[symbol] = build_squeeze_v8_feature_frame(
-            prepared_context.for_symbol(symbol).frame
+            prepared_context.for_symbol(symbol).frame,
+            analysis_interval=analysis_interval,
+            min_squeeze_bars=min_squeeze_bars,
+            warmup_bars=warmup_bars,
         )
     return feature_frames
 
 
-def _build_pullback_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    return compute_indicator_frame(frame, _PULLBACK_FEATURE_COLUMNS)
+def _build_pullback_feature_frame(
+    frame: pd.DataFrame,
+    *,
+    analysis_interval: str = "1h",
+    min_squeeze_bars: int = 7,
+    warmup_bars: int | None = None,
+) -> pd.DataFrame:
+    periods = SqueezeV8Periods.for_interval(
+        analysis_interval,
+        min_squeeze_bars=min_squeeze_bars,
+        warmup_bars=warmup_bars,
+    )
+    return _build_strategy_feature_frame(frame, periods)
 
 
 def _build_pullback_feature_frames(
     prepared_context: PreparedMarketContext,
     symbols: list[str],
+    *,
+    analysis_interval: str = "1h",
+    min_squeeze_bars: int = 7,
+    warmup_bars: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     frames: dict[str, pd.DataFrame] = {}
     for symbol in symbols:
         frames[symbol] = _build_pullback_feature_frame(
-            prepared_context.for_symbol(symbol).frame
+            prepared_context.for_symbol(symbol).frame,
+            analysis_interval=analysis_interval,
+            min_squeeze_bars=min_squeeze_bars,
+            warmup_bars=warmup_bars,
         )
     return frames
 
@@ -733,6 +928,23 @@ def _safe_value(row: pd.Series, column: str, default: float) -> float:
 
 def _safe_feature_value(value: float, default: float) -> float:
     return default if np.isnan(value) else float(value)
+
+
+def _config_periods(config: Any) -> SqueezeV8Periods:
+    periods = getattr(config, "periods", None)
+    if periods is not None:
+        return periods
+    return SqueezeV8Periods.for_interval(
+        getattr(config, "analysis_interval", "1h"),
+        min_squeeze_bars=getattr(config, "min_squeeze_bars", 7),
+        warmup_bars=getattr(config, "warmup_bars", None),
+    )
+
+
+def _float_array(frame: pd.DataFrame, column: str, default: float = np.nan) -> np.ndarray:
+    if column not in frame.columns:
+        return np.full(len(frame), default, dtype=float)
+    return frame[column].to_numpy(dtype=float, copy=False)
 
 
 def _generate_squeeze_short_signals(
@@ -748,29 +960,42 @@ def _generate_squeeze_short_signals(
 
     signals: list[Signal] = []
     last_short: datetime | None = None
+    periods = config.periods
 
-    first_eval_index = max(min(config.warmup_bars - 1, len(frame) - 1), 1)
+    close_times = frame["close_time"].tolist()
+    mom_values = _float_array(frame, "mom_slope")
+    atr_ratio_values = _float_array(frame, "atr_ratio")
+    rsi_values = _float_array(frame, "rsi_14")
+    squeeze_count_values = _float_array(frame, "squeeze_count", 0.0)
+    if "squeeze_on" in frame.columns:
+        squeeze_on_values = frame["squeeze_on"].fillna(False).to_numpy(dtype=bool, copy=False)
+    else:
+        squeeze_on_values = np.zeros(len(frame), dtype=bool)
+
+    first_eval_index = max(min(periods.warmup_bars - 1, len(frame) - 1), 1)
     for index in range(first_eval_index, len(frame)):
-        row = frame.iloc[index]
-        prev = frame.iloc[index - 1]
-        close_time = row["close_time"]
+        close_time = close_times[index]
         if close_time < start or close_time >= end:
             continue
 
-        if pd.isna(row.get("mom_slope")) or pd.isna(row.get("atr_ratio")):
+        mom_raw = mom_values[index]
+        atr_ratio_raw = atr_ratio_values[index]
+        if np.isnan(mom_raw) or np.isnan(atr_ratio_raw):
             continue
 
-        rsi = _safe_value(row, "rsi_14", 50.0)
-        mom = _safe_value(row, "mom_slope", 0.0)
-        atr_ratio = _safe_value(row, "atr_ratio", 1.0)
-        sq_count = int(_safe_value(prev, "squeeze_count", 0.0))
+        rsi_raw = rsi_values[index]
+        prev_sq_count_raw = squeeze_count_values[index - 1]
+        rsi = 50.0 if np.isnan(rsi_raw) else float(rsi_raw)
+        mom = float(mom_raw)
+        atr_ratio = float(atr_ratio_raw)
+        sq_count = 0 if np.isnan(prev_sq_count_raw) else int(prev_sq_count_raw)
         signal, last_short = _emit_squeeze_short_signal(
             signal_date=close_time,
             symbol=symbol,
             config=config,
             strategy_name="squeeze_v8.2",
             prev_squeeze_count=sq_count,
-            squeeze_on=bool(row.get("squeeze_on", False)),
+            squeeze_on=bool(squeeze_on_values[index]),
             mom=mom,
             rsi=rsi,
             atr_ratio=atr_ratio,
@@ -785,50 +1010,85 @@ def _generate_squeeze_short_signals(
 def _check_pullback_entry(
     frame: pd.DataFrame,
     index: int,
+    periods: SqueezeV8Periods,
 ) -> tuple[bool, dict[str, object]]:
     """Check if bull pullback reclaim LONG entry conditions are met."""
     regime_min = 10.0
     rsi_cap = 75.0
     atr_ratio_max = 1.2
-    lookback_above_ema = 5
+    lookback_above_ema = periods.pullback_above_support_bars
     reclaim_atr_min = 0.3
     min_body_ratio = 0.4
-    impulse_lookback = 10
+    impulse_lookback = periods.pullback_impulse_bars
 
     if index < 2:
         return False, {}
 
-    row = frame.iloc[index]
+    cache = frame.attrs.get("_pullback_array_cache")
+    if cache is None:
+        bb_mid = _float_array(frame, "_bb_ma_20")
+        ema20 = _float_array(frame, "ema_20")
+        support = np.where(~np.isnan(bb_mid) & (bb_mid > 0), bb_mid, ema20)
+        close = _float_array(frame, "close")
+        high = _float_array(frame, "high")
+        above_support = np.where(np.isnan(support), False, close > support).astype(np.int32)
+        impulse_hits = np.where(np.isnan(_float_array(frame, "bb_upper")), False, high >= _float_array(frame, "bb_upper")).astype(np.int32)
+        cache = {
+            "ret_72h": _float_array(frame, "ret_72h"),
+            "rsi_14": _float_array(frame, "rsi_14"),
+            "atr_ratio": _float_array(frame, "atr_ratio"),
+            "mom_slope": _float_array(frame, "mom_slope"),
+            "bb_mid": bb_mid,
+            "ema_20": ema20,
+            "support": support,
+            "atr_14": _float_array(frame, "atr_14"),
+            "close": close,
+            "open": _float_array(frame, "open"),
+            "high": high,
+            "low": _float_array(frame, "low"),
+            "bb_upper": _float_array(frame, "bb_upper"),
+            "close_time": frame["close_time"].tolist(),
+            "above_support_prefix": np.concatenate(([0], np.cumsum(above_support))),
+            "impulse_prefix": np.concatenate(([0], np.cumsum(impulse_hits))),
+        }
+        frame.attrs["_pullback_array_cache"] = cache
 
-    if pd.isna(row.get("ema_20")) or pd.isna(row.get("atr_14")):
+    ema20_values = cache["ema_20"]
+    atr_values = cache["atr_14"]
+    if np.isnan(ema20_values[index]) or np.isnan(atr_values[index]):
         return False, {}
 
-    ret_72h = _safe_value(row, "ret_72h", 0.0)
+    ret_raw = cache["ret_72h"][index]
+    ret_72h = 0.0 if np.isnan(ret_raw) else float(ret_raw)
     if ret_72h < regime_min:
         return False, {}
 
-    rsi = _safe_value(row, "rsi_14", 50.0)
+    rsi_raw = cache["rsi_14"][index]
+    rsi = 50.0 if np.isnan(rsi_raw) else float(rsi_raw)
     if rsi > rsi_cap:
         return False, {}
 
-    atr_ratio = _safe_value(row, "atr_ratio", 1.0)
+    atr_ratio_raw = cache["atr_ratio"][index]
+    atr_ratio = 1.0 if np.isnan(atr_ratio_raw) else float(atr_ratio_raw)
     if atr_ratio > atr_ratio_max:
         return False, {}
 
-    mom_slope = _safe_value(row, "mom_slope", 0.0)
+    mom_raw = cache["mom_slope"][index]
+    mom_slope = 0.0 if np.isnan(mom_raw) else float(mom_raw)
     if mom_slope <= 0:
         return False, {}
 
-    bb_mid = _safe_value(row, "_bb_ma_20", 0.0)
-    ema20 = float(row["ema_20"])
+    bb_mid_raw = cache["bb_mid"][index]
+    bb_mid = 0.0 if np.isnan(bb_mid_raw) else float(bb_mid_raw)
+    ema20 = float(ema20_values[index])
     support = bb_mid if bb_mid > 0 else ema20
-    atr = _safe_value(row, "atr_14", 0.0)
+    atr = float(atr_values[index])
     if atr <= 0:
         return False, {}
-    close = float(row["close"])
-    open_price = float(row["open"])
-    high = float(row["high"])
-    low = float(row["low"])
+    close = float(cache["close"][index])
+    open_price = float(cache["open"][index])
+    high = float(cache["high"][index])
+    low = float(cache["low"][index])
 
     # Strong reclaim: close above support + 0.3 * ATR
     if close <= support + reclaim_atr_min * atr:
@@ -845,14 +1105,20 @@ def _check_pullback_entry(
         return False, {}
 
     # Pullback: prev bar's low at or below support
-    prev = frame.iloc[index - 1]
-    prev_low = float(prev["low"])
-    prev_support = _safe_value(prev, "_bb_ma_20", _safe_value(prev, "ema_20", support))
+    prev_low = float(cache["low"][index - 1])
+    prev_bb_mid_raw = cache["bb_mid"][index - 1]
+    prev_ema_raw = cache["ema_20"][index - 1]
+    if not np.isnan(prev_bb_mid_raw):
+        prev_support = float(prev_bb_mid_raw)
+    elif not np.isnan(prev_ema_raw):
+        prev_support = float(prev_ema_raw)
+    else:
+        prev_support = support
     if prev_low > prev_support:
         return False, {}
 
     # Shallow pullback: prev close not too far below support
-    prev_close = float(prev["close"])
+    prev_close = float(cache["close"][index - 1])
     if prev_close < prev_support - 1.0 * atr:
         return False, {}
 
@@ -861,25 +1127,18 @@ def _check_pullback_entry(
     lookback_end = index - 1
     if lookback_end <= lookback_start:
         return False, {}
-    above_count = 0
-    for lb_idx in range(lookback_start, lookback_end):
-        lb_row = frame.iloc[lb_idx]
-        lb_support = _safe_value(lb_row, "_bb_ma_20", _safe_value(lb_row, "ema_20", 0.0))
-        if float(lb_row["close"]) > lb_support:
-            above_count += 1
+    above_prefix = cache["above_support_prefix"]
+    above_count = int(above_prefix[lookback_end] - above_prefix[lookback_start])
     if above_count < (lookback_end - lookback_start) / 2:
         return False, {}
 
     # Prior impulse: recent bar touched BB upper band
     impulse_start = max(0, index - impulse_lookback)
     impulse_end = index - 1
-    had_impulse = False
-    for imp_idx in range(impulse_start, impulse_end):
-        imp_row = frame.iloc[imp_idx]
-        imp_bb_upper = _safe_value(imp_row, "bb_upper", float("inf"))
-        if float(imp_row["high"]) >= imp_bb_upper:
-            had_impulse = True
-            break
+    impulse_prefix = cache["impulse_prefix"]
+    had_impulse = impulse_end > impulse_start and (
+        int(impulse_prefix[impulse_end] - impulse_prefix[impulse_start]) > 0
+    )
     if not had_impulse:
         return False, {}
 
@@ -903,6 +1162,7 @@ def _generate_pullback_long_signals(
     symbol: str,
     start: datetime,
     end: datetime,
+    periods: SqueezeV8Periods,
     *,
     long_tp: float = 4.0,
     long_sl: float = 2.0,
@@ -913,19 +1173,20 @@ def _generate_pullback_long_signals(
     taker_fee_rate: float = 0.0005,
 ) -> list[Signal]:
     """Generate bull pullback reclaim LONG signals from a pullback feature frame."""
-    if frame.empty or len(frame) < _PULLBACK_WARMUP_BARS + 2:
+    if frame.empty or len(frame) < periods.warmup_bars + 2:
         return []
 
     signals: list[Signal] = []
     last_signal_time: datetime | None = None
 
-    first_eval_index = max(_PULLBACK_WARMUP_BARS, 2)
+    first_eval_index = max(periods.warmup_bars, 2)
+    close_times = frame["close_time"].tolist()
     for index in range(first_eval_index, len(frame)):
-        close_time = frame.iloc[index]["close_time"]
+        close_time = close_times[index]
         if close_time < start or close_time >= end:
             continue
 
-        ok, metadata = _check_pullback_entry(frame, index)
+        ok, metadata = _check_pullback_entry(frame, index, periods)
         if not ok:
             continue
 
@@ -977,10 +1238,10 @@ def _generate_symbol_preview_signals(
         return []
 
     signals: list[Signal] = []
-    state = _SqueezeV8PreviewState()
+    state = _SqueezeV8PreviewState(periods=config.periods)
     gate = SourcePeriodGate()
     last_short: datetime | None = None
-    warmup_bars = max(config.warmup_bars, 1)
+    warmup_bars = max(config.periods.warmup_bars, 1)
 
     for snapshot in iter_preview_snapshots(poll_candles, config.analysis_interval):
         partial_candle = snapshot.candle
@@ -1071,6 +1332,9 @@ def generate_squeeze_v8_signals(
         frames = feature_frames or build_squeeze_v8_feature_frames(
             prepared_context,
             symbols=symbols,
+            analysis_interval=active_config.analysis_interval,
+            min_squeeze_bars=active_config.min_squeeze_bars,
+            warmup_bars=active_config.warmup_bars,
         )
         selected_symbols = symbols or list(frames)
 
@@ -1089,7 +1353,11 @@ def generate_squeeze_v8_signals(
     # Pullback LONG signals
     if active_config.enable_pullback_long:
         pullback_frames = _build_pullback_feature_frames(
-            prepared_context, list(selected_symbols),
+            prepared_context,
+            list(selected_symbols),
+            analysis_interval=active_config.analysis_interval,
+            min_squeeze_bars=active_config.min_squeeze_bars,
+            warmup_bars=active_config.warmup_bars,
         )
         for symbol in selected_symbols:
             pf = pullback_frames.get(symbol)
@@ -1097,7 +1365,11 @@ def generate_squeeze_v8_signals(
                 continue
             signals.extend(
                 _generate_pullback_long_signals(
-                    pf, symbol, active_start, active_end,
+                    pf,
+                    symbol,
+                    active_start,
+                    active_end,
+                    active_config.periods,
                     long_tp=active_config.long_tp,
                     long_sl=active_config.long_sl,
                     long_cooldown_h=active_config.long_cooldown_h,
@@ -1147,8 +1419,13 @@ class SqueezeV8Strategy(SignalGenerator):
         atr_ratio_max: float = 1.5,
         max_holding_hours: int = 72,
     ) -> None:
-        if analysis_interval != "1h":
-            raise ValueError("SqueezeV8 live strategy currently supports only 1h analysis_interval")
+        if analysis_interval not in _SUPPORTED_ANALYSIS_INTERVALS:
+            supported = ", ".join(sorted(_SUPPORTED_ANALYSIS_INTERVALS))
+            raise ValueError(f"analysis_interval must be one of: {supported}")
+        if analysis_interval != "1h" and sizing_mode == "ridge_v1":
+            raise ValueError(
+                "ridge_v1 sizing is calibrated only for 1h analysis_interval; use baseline for lower timeframes"
+            )
         effective_poll_interval = poll_interval or analysis_interval
         if effective_poll_interval not in _SUPPORTED_POLL_INTERVALS:
             raise ValueError("poll_interval must be one of 1h, 30m, 15m, 5m, 1m")
@@ -1171,6 +1448,11 @@ class SqueezeV8Strategy(SignalGenerator):
         self.min_squeeze_bars = min_squeeze_bars
         self.atr_ratio_max = atr_ratio_max
         self.max_holding_hours = max_holding_hours
+        self._periods = SqueezeV8Periods.for_interval(
+            analysis_interval,
+            min_squeeze_bars=min_squeeze_bars,
+            lookback_bars=_BASE_LOOKBACK_BARS,
+        )
 
         self._client: LiveMarketClient | None = None
         self._last_short: dict[str, datetime] = {}
@@ -1179,6 +1461,14 @@ class SqueezeV8Strategy(SignalGenerator):
         self._states: dict[str, _SqueezeV8PreviewState] = {}
         self._last_committed_hour: dict[str, datetime] = {}
         self._active_symbols: list[str] = list(SYMBOLS)
+
+    @property
+    def periods(self) -> SqueezeV8Periods:
+        return self._periods
+
+    @property
+    def warmup_bars(self) -> int:
+        return self._periods.warmup_bars
 
     def setup(self, client: LiveMarketClient) -> None:
         self._client = client
@@ -1192,7 +1482,8 @@ class SqueezeV8Strategy(SignalGenerator):
             f"CD={self.short_cooldown_h}h RSI>={self.short_rsi_floor} | "
             f"LONG(pullback) TP/SL={self.long_tp}/{self.long_sl}% "
             f"CD={self.long_cooldown_h}h enabled={self.enable_pullback_long} | "
-            f"min_sq={self.min_squeeze_bars} ATR<={self.atr_ratio_max} | "
+            f"min_sq={self.periods.min_squeeze_bars} bars "
+            f"({self.min_squeeze_bars}h-equiv) ATR<={self.atr_ratio_max} | "
             f"max_hold={self.max_holding_hours}h",
             file=sys.stderr,
         )
@@ -1200,13 +1491,15 @@ class SqueezeV8Strategy(SignalGenerator):
     def _warm_up_states(self) -> None:
         assert self._client is not None
         now = datetime.now(UTC)
-        start = now - timedelta(hours=_LOOKBACK_BARS + 2)
+        start = now - timedelta(
+            seconds=interval_to_seconds(self.analysis_interval) * (self.periods.lookback_bars + 2)
+        )
         failures: list[str] = []
         self._states = {}
         self._last_committed_hour = {}
         active_symbols: list[str] = []
         for symbol in SYMBOLS:
-            state = _SqueezeV8PreviewState()
+            state = _SqueezeV8PreviewState(periods=self.periods)
             try:
                 candles = self._client.fetch_klines(
                     symbol=symbol.replace("/", ""),
@@ -1218,9 +1511,9 @@ class SqueezeV8Strategy(SignalGenerator):
                     if candle.close_time <= now:
                         state.commit(candle)
                         self._last_committed_hour[symbol] = candle.open_time
-                if state.candle_count < _WARMUP_BARS:
+                if state.candle_count < self.warmup_bars:
                     failures.append(
-                        f"{symbol}: only warmed {state.candle_count} candles, need {_WARMUP_BARS}"
+                        f"{symbol}: only warmed {state.candle_count} candles, need {self.warmup_bars}"
                     )
                     continue
                 if (
@@ -1300,7 +1593,10 @@ class SqueezeV8Strategy(SignalGenerator):
             new_candles = self._client.fetch_klines(
                 symbol=symbol.replace("/", ""),
                 interval=self.analysis_interval,
-                start=(last_committed or current_hour - timedelta(hours=2)),
+                start=(
+                    last_committed
+                    or current_hour - timedelta(seconds=interval_to_seconds(self.analysis_interval) * 2)
+                ),
                 end=now,
             )
             for candle in new_candles:
@@ -1313,9 +1609,9 @@ class SqueezeV8Strategy(SignalGenerator):
 
         if state.last_row is None:
             raise FatalSignalError(f"{symbol}: warmup state has no committed candles")
-        if state.candle_count < _WARMUP_BARS:
+        if state.candle_count < self.warmup_bars:
             raise FatalSignalError(
-                f"{symbol}: only {state.candle_count} candles available, need {_WARMUP_BARS}"
+                f"{symbol}: only {state.candle_count} candles available, need {self.warmup_bars}"
             )
         if np.isnan(state.last_row.mom_slope) or np.isnan(state.last_row.atr_ratio):
             raise FatalSignalError(
@@ -1371,14 +1667,16 @@ class SqueezeV8Strategy(SignalGenerator):
         # Pullback LONG check (full pandas path for preview mode)
         had_short = len(emitted) > 0
         if self.enable_pullback_long and not had_short:
-            lookback_start = now - timedelta(hours=_LOOKBACK_BARS + 2)
+            lookback_start = now - timedelta(
+                seconds=interval_to_seconds(self.analysis_interval) * (self.periods.lookback_bars + 2)
+            )
             pb_candles = self._client.fetch_klines(
                 symbol=symbol.replace("/", ""),
                 interval=self.analysis_interval,
                 start=lookback_start,
                 end=now,
             )
-            if len(pb_candles) >= _PULLBACK_WARMUP_BARS:
+            if len(pb_candles) >= self.warmup_bars:
                 import pandas as pd
                 pb_rows = [{
                     "open_time": c.open_time, "close_time": c.close_time,
@@ -1404,7 +1702,9 @@ class SqueezeV8Strategy(SignalGenerator):
         if state is None:
             raise FatalSignalError(f"{symbol}: warmup state is missing")
 
-        start = now - timedelta(hours=_LOOKBACK_BARS + 2)
+        start = now - timedelta(
+            seconds=interval_to_seconds(self.analysis_interval) * (self.periods.lookback_bars + 2)
+        )
         candles = self._client.fetch_klines(
             symbol=symbol.replace("/", ""),
             interval=self.analysis_interval,
@@ -1412,9 +1712,9 @@ class SqueezeV8Strategy(SignalGenerator):
             end=now,
         )
 
-        if len(candles) < _WARMUP_BARS:
+        if len(candles) < self.warmup_bars:
             raise FatalSignalError(
-                f"{symbol}: live fetch returned {len(candles)} candles, need {_WARMUP_BARS}"
+                f"{symbol}: live fetch returned {len(candles)} candles, need {self.warmup_bars}"
             )
 
         # Commit new closed candles to incremental state before any early returns
@@ -1445,13 +1745,18 @@ class SqueezeV8Strategy(SignalGenerator):
         df_raw = df_raw.sort_values("open_time").reset_index(drop=True)
 
         # --- Squeeze SHORT check ---
-        df_squeeze = build_squeeze_v8_feature_frame(df_raw.copy())
+        df_squeeze = build_squeeze_v8_feature_frame(
+            df_raw.copy(),
+            analysis_interval=self.analysis_interval,
+            min_squeeze_bars=self.min_squeeze_bars,
+            warmup_bars=self.warmup_bars,
+        )
         last_idx = len(df_squeeze) - 1
         if df_squeeze.iloc[last_idx]["close_time"] > now:
             last_idx -= 1
-        if last_idx + 1 < _WARMUP_BARS:
+        if last_idx + 1 < self.warmup_bars:
             raise FatalSignalError(
-                f"{symbol}: only {last_idx + 1} closed candles available, need {_WARMUP_BARS}"
+                f"{symbol}: only {last_idx + 1} closed candles available, need {self.warmup_bars}"
             )
 
         emitted: list[Signal] = []
@@ -1496,14 +1801,19 @@ class SqueezeV8Strategy(SignalGenerator):
         now: datetime,
     ) -> list[Signal]:
         """Check pullback LONG conditions on the last closed candle."""
-        df_pullback = _build_pullback_feature_frame(df_raw.copy())
+        df_pullback = _build_pullback_feature_frame(
+            df_raw.copy(),
+            analysis_interval=self.analysis_interval,
+            min_squeeze_bars=self.min_squeeze_bars,
+            warmup_bars=self.warmup_bars,
+        )
         last_idx = len(df_pullback) - 1
         if df_pullback.iloc[last_idx]["close_time"] > now:
             last_idx -= 1
-        if last_idx < _PULLBACK_WARMUP_BARS:
+        if last_idx < self.warmup_bars:
             return []
 
-        ok, metadata = _check_pullback_entry(df_pullback, last_idx)
+        ok, metadata = _check_pullback_entry(df_pullback, last_idx, self.periods)
         if not ok:
             return []
 

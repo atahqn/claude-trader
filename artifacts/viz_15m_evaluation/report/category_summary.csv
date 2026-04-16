@@ -1,0 +1,7 @@
+category,windows,total_pnl,weekly_win_rate,positive_weeks,worst_week_pnl,best_week_pnl,total_trades,resolved_trades,short_trades,long_trades,active_weeks,trade_win_rate,profit_factor,sortino_ratio,max_drawdown_pct,pnl_to_mdd,weekly_omega_ratio,coverage_penalty,preference_eligible,preference_score
+oos4,4,14.5,0.75,3,-4.0,12.5,29,29,1,28,4,0.4138,1.4328,12.6175,11.6254,1.2473,4.625,0.3625,True,2.0911
+oos3,6,-23.0,0.1667,1,-8.0,3.0,15,15,5,10,6,0.0667,0.1154,-5.2791,23.086,-0.9963,0.1154,0.1875,False,0.0
+oos5,8,-13.5,0.375,3,-18.0,10.5,40,40,10,30,7,0.275,0.7523,-1.6999,21.1003,-0.6398,0.6029,0.4677,False,0.0
+holdout,7,4.5,0.4286,3,-7.5,18.0,31,31,7,24,6,0.3548,1.12,1.0753,18.7493,0.24,1.2727,0.3588,False,0.1096
+oos2,4,26.5,1.0,4,0.0,18.0,24,24,8,16,4,0.5417,2.2927,1348.7838,9.6079,2.7581,inf,0.3,True,21.9272
+ALL,29,9.0,0.4828,14,-18.0,18.0,139,139,31,108,27,0.3453,1.0523,0.3439,27.5584,0.3266,1.1118,0.9649,True,0.3503

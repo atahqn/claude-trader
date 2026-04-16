@@ -1,0 +1,449 @@
+{
+  "generated_at": "2026-03-31T14:34:09.072485+00:00",
+  "current_top20_tradable": [
+    "BTC/USDT",
+    "ETH/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
+    "SOL/USDT",
+    "TRX/USDT",
+    "DOGE/USDT",
+    "BCH/USDT",
+    "ADA/USDT",
+    "HYPE/USDT",
+    "LINK/USDT",
+    "XMR/USDT",
+    "CC/USDT",
+    "XLM/USDT",
+    "LTC/USDT",
+    "ZEC/USDT",
+    "M/USDT",
+    "AVAX/USDT",
+    "HBAR/USDT",
+    "SUI/USDT"
+  ],
+  "research_top20_history_filtered": [
+    "BTC/USDT",
+    "ETH/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
+    "SOL/USDT",
+    "TRX/USDT",
+    "DOGE/USDT",
+    "BCH/USDT",
+    "ADA/USDT",
+    "LINK/USDT",
+    "XMR/USDT",
+    "XLM/USDT",
+    "LTC/USDT",
+    "ZEC/USDT",
+    "AVAX/USDT",
+    "HBAR/USDT",
+    "SUI/USDT",
+    "UNI/USDT",
+    "DOT/USDT",
+    "NEAR/USDT"
+  ],
+  "tradable_snapshot": [
+    {
+      "rank": 1,
+      "id": "bitcoin",
+      "symbol": "BTC/USDT",
+      "base": "BTC",
+      "name": "Bitcoin",
+      "market_cap": 1352115342974,
+      "binance_symbol": "BTCUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 2,
+      "id": "ethereum",
+      "symbol": "ETH/USDT",
+      "base": "ETH",
+      "name": "Ethereum",
+      "market_cap": 251347581895,
+      "binance_symbol": "ETHUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 4,
+      "id": "binancecoin",
+      "symbol": "BNB/USDT",
+      "base": "BNB",
+      "name": "BNB",
+      "market_cap": 83732285590,
+      "binance_symbol": "BNBUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 5,
+      "id": "ripple",
+      "symbol": "XRP/USDT",
+      "base": "XRP",
+      "name": "XRP",
+      "market_cap": 81731854467,
+      "binance_symbol": "XRPUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 7,
+      "id": "solana",
+      "symbol": "SOL/USDT",
+      "base": "SOL",
+      "name": "Solana",
+      "market_cap": 47062154328,
+      "binance_symbol": "SOLUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 8,
+      "id": "tron",
+      "symbol": "TRX/USDT",
+      "base": "TRX",
+      "name": "TRON",
+      "market_cap": 29695088796,
+      "binance_symbol": "TRXUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 10,
+      "id": "dogecoin",
+      "symbol": "DOGE/USDT",
+      "base": "DOGE",
+      "name": "Dogecoin",
+      "market_cap": 14076014408,
+      "binance_symbol": "DOGEUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 13,
+      "id": "bitcoin-cash",
+      "symbol": "BCH/USDT",
+      "base": "BCH",
+      "name": "Bitcoin Cash",
+      "market_cap": 9462761987,
+      "binance_symbol": "BCHUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 15,
+      "id": "cardano",
+      "symbol": "ADA/USDT",
+      "base": "ADA",
+      "name": "Cardano",
+      "market_cap": 9007177713,
+      "binance_symbol": "ADAUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 16,
+      "id": "hyperliquid",
+      "symbol": "HYPE/USDT",
+      "base": "HYPE",
+      "name": "Hyperliquid",
+      "market_cap": 8747238807,
+      "binance_symbol": "HYPEUSDT",
+      "first_seen": "2025-05-30T10:00:00+00:00"
+    },
+    {
+      "rank": 17,
+      "id": "chainlink",
+      "symbol": "LINK/USDT",
+      "base": "LINK",
+      "name": "Chainlink",
+      "market_cap": 6212001203,
+      "binance_symbol": "LINKUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 18,
+      "id": "monero",
+      "symbol": "XMR/USDT",
+      "base": "XMR",
+      "name": "Monero",
+      "market_cap": 5969085768,
+      "binance_symbol": "XMRUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 20,
+      "id": "canton-network",
+      "symbol": "CC/USDT",
+      "base": "CC",
+      "name": "Canton",
+      "market_cap": 5597303973,
+      "binance_symbol": "CCUSDT",
+      "first_seen": "2025-10-31T12:00:00+00:00"
+    },
+    {
+      "rank": 21,
+      "id": "stellar",
+      "symbol": "XLM/USDT",
+      "base": "XLM",
+      "name": "Stellar",
+      "market_cap": 5498975747,
+      "binance_symbol": "XLMUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 24,
+      "id": "litecoin",
+      "symbol": "LTC/USDT",
+      "base": "LTC",
+      "name": "Litecoin",
+      "market_cap": 4161501898,
+      "binance_symbol": "LTCUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 25,
+      "id": "zcash",
+      "symbol": "ZEC/USDT",
+      "base": "ZEC",
+      "name": "Zcash",
+      "market_cap": 4160581707,
+      "binance_symbol": "ZECUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 26,
+      "id": "memecore",
+      "symbol": "M/USDT",
+      "base": "M",
+      "name": "MemeCore",
+      "market_cap": 4137795830,
+      "binance_symbol": "MUSDT",
+      "first_seen": "2025-07-07T09:00:00+00:00"
+    },
+    {
+      "rank": 29,
+      "id": "avalanche-2",
+      "symbol": "AVAX/USDT",
+      "base": "AVAX",
+      "name": "Avalanche",
+      "market_cap": 3849099644,
+      "binance_symbol": "AVAXUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 30,
+      "id": "hedera-hashgraph",
+      "symbol": "HBAR/USDT",
+      "base": "HBAR",
+      "name": "Hedera",
+      "market_cap": 3718925143,
+      "binance_symbol": "HBARUSDT",
+      "first_seen": "2021-03-17T07:00:00+00:00"
+    },
+    {
+      "rank": 32,
+      "id": "sui",
+      "symbol": "SUI/USDT",
+      "base": "SUI",
+      "name": "Sui",
+      "market_cap": 3408108785,
+      "binance_symbol": "SUIUSDT",
+      "first_seen": "2023-05-03T16:00:00+00:00"
+    },
+    {
+      "rank": 33,
+      "id": "the-open-network",
+      "symbol": "TON/USDT",
+      "base": "TON",
+      "name": "Toncoin",
+      "market_cap": 3010340914,
+      "binance_symbol": "TONUSDT",
+      "first_seen": "2024-03-01T12:00:00+00:00"
+    },
+    {
+      "rank": 35,
+      "id": "bittensor",
+      "symbol": "TAO/USDT",
+      "base": "TAO",
+      "name": "Bittensor",
+      "market_cap": 2956275341,
+      "binance_symbol": "TAOUSDT",
+      "first_seen": "2024-04-11T14:00:00+00:00"
+    },
+    {
+      "rank": 36,
+      "id": "world-liberty-financial",
+      "symbol": "WLFI/USDT",
+      "base": "WLFI",
+      "name": "World Liberty Financial",
+      "market_cap": 2835886876,
+      "binance_symbol": "WLFIUSDT",
+      "first_seen": "2025-08-23T08:00:00+00:00"
+    },
+    {
+      "rank": 41,
+      "id": "uniswap",
+      "symbol": "UNI/USDT",
+      "base": "UNI",
+      "name": "Uniswap",
+      "market_cap": 2243414125,
+      "binance_symbol": "UNIUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 43,
+      "id": "polkadot",
+      "symbol": "DOT/USDT",
+      "base": "DOT",
+      "name": "Polkadot",
+      "market_cap": 2132336385,
+      "binance_symbol": "DOTUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 48,
+      "id": "sky",
+      "symbol": "SKY/USDT",
+      "base": "SKY",
+      "name": "Sky",
+      "market_cap": 1705688880,
+      "binance_symbol": "SKYUSDT",
+      "first_seen": "2025-09-09T07:00:00+00:00"
+    },
+    {
+      "rank": 49,
+      "id": "aster-2",
+      "symbol": "ASTER/USDT",
+      "base": "ASTER",
+      "name": "Aster",
+      "market_cap": 1629760388,
+      "binance_symbol": "ASTERUSDT",
+      "first_seen": "2025-09-19T12:00:00+00:00"
+    },
+    {
+      "rank": 51,
+      "id": "near",
+      "symbol": "NEAR/USDT",
+      "base": "NEAR",
+      "name": "NEAR Protocol",
+      "market_cap": 1541560893,
+      "binance_symbol": "NEARUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 52,
+      "id": "aave",
+      "symbol": "AAVE/USDT",
+      "base": "AAVE",
+      "name": "Aave",
+      "market_cap": 1491039616,
+      "binance_symbol": "AAVEUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 58,
+      "id": "ondo-finance",
+      "symbol": "ONDO/USDT",
+      "base": "ONDO",
+      "name": "Ondo",
+      "market_cap": 1289348329,
+      "binance_symbol": "ONDOUSDT",
+      "first_seen": "2024-01-20T13:00:00+00:00"
+    },
+    {
+      "rank": 59,
+      "id": "ethereum-classic",
+      "symbol": "ETC/USDT",
+      "base": "ETC",
+      "name": "Ethereum Classic",
+      "market_cap": 1273485476,
+      "binance_symbol": "ETCUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    },
+    {
+      "rank": 60,
+      "id": "internet-computer",
+      "symbol": "ICP/USDT",
+      "base": "ICP",
+      "name": "Internet Computer",
+      "market_cap": 1252639674,
+      "binance_symbol": "ICPUSDT",
+      "first_seen": "2022-09-27T02:00:00+00:00"
+    },
+    {
+      "rank": 64,
+      "id": "quant-network",
+      "symbol": "QNT/USDT",
+      "base": "QNT",
+      "name": "Quant",
+      "market_cap": 1033820526,
+      "binance_symbol": "QNTUSDT",
+      "first_seen": "2022-10-20T02:00:00+00:00"
+    },
+    {
+      "rank": 66,
+      "id": "pump-fun",
+      "symbol": "PUMP/USDT",
+      "base": "PUMP",
+      "name": "Pump.fun",
+      "market_cap": 974200046,
+      "binance_symbol": "PUMPUSDT",
+      "first_seen": "2025-07-10T07:00:00+00:00"
+    },
+    {
+      "rank": 67,
+      "id": "polygon-ecosystem-token",
+      "symbol": "POL/USDT",
+      "base": "POL",
+      "name": "POL (ex-MATIC)",
+      "market_cap": 946412990,
+      "binance_symbol": "POLUSDT",
+      "first_seen": "2024-09-13T12:00:00+00:00"
+    },
+    {
+      "rank": 69,
+      "id": "worldcoin-wld",
+      "symbol": "WLD/USDT",
+      "base": "WLD",
+      "name": "Worldcoin",
+      "market_cap": 894884379,
+      "binance_symbol": "WLDUSDT",
+      "first_seen": "2023-07-24T12:00:00+00:00"
+    },
+    {
+      "rank": 70,
+      "id": "render-token",
+      "symbol": "RENDER/USDT",
+      "base": "RENDER",
+      "name": "Render",
+      "market_cap": 888291370,
+      "binance_symbol": "RENDERUSDT",
+      "first_seen": "2024-07-26T10:00:00+00:00"
+    },
+    {
+      "rank": 72,
+      "id": "kaspa",
+      "symbol": "KAS/USDT",
+      "base": "KAS",
+      "name": "Kaspa",
+      "market_cap": 872764017,
+      "binance_symbol": "KASUSDT",
+      "first_seen": "2023-11-17T02:00:00+00:00"
+    },
+    {
+      "rank": 74,
+      "id": "midnight-3",
+      "symbol": "NIGHT/USDT",
+      "base": "NIGHT",
+      "name": "Midnight",
+      "market_cap": 860399988,
+      "binance_symbol": "NIGHTUSDT",
+      "first_seen": "2025-12-10T11:00:00+00:00"
+    },
+    {
+      "rank": 75,
+      "id": "cosmos",
+      "symbol": "ATOM/USDT",
+      "base": "ATOM",
+      "name": "Cosmos Hub",
+      "market_cap": 843695032,
+      "binance_symbol": "ATOMUSDT",
+      "first_seen": "2021-01-01T00:00:00+00:00"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "saved_at": "2026-03-31T12:40:16.078424+00:00",
+  "symbols": [
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
+    "DOGE/USDT",
+    "AVAX/USDT",
+    "LINK/USDT",
+    "ENA/USDT",
+    "INJ/USDT",
+    "NEAR/USDT",
+    "ALGO/USDT",
+    "RENDER/USDT",
+    "WIF/USDT",
+    "ADA/USDT",
+    "APT/USDT"
+  ],
+  "config": {
+    "approximate": true,
+    "seed": 42,
+    "risk_free_rate_annual": 0.0373
+  },
+  "total_windows": 1,
+  "windows": [
+    {
+      "name": "OOS4_FEB21_MANIA",
+      "category": "oos4",
+      "start": "2021-02-04T00:00:00+00:00",
+      "end": "2021-02-11T00:00:00+00:00",
+      "signal_count": 11,
+      "short_count": 5,
+      "long_count": 6,
+      "total_pnl_pct": 3.8222,
+      "trades": 11,
+      "wins": 4,
+      "losses": 7,
+      "win_rate": 36.3636,
+      "profit_factor": 1.336,
+      "max_drawdown_pct": 3.7462
+    }
+  ]
+}

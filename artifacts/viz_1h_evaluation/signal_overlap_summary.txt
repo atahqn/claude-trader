@@ -1,0 +1,23 @@
+analysis_interval=1h
+total_signals=375
+active_signal_timestamps=285
+avg_signals_per_timestamp=1.316
+share_of_signals_in_clusters_ge_2=0.403
+share_of_signals_in_clusters_ge_3=0.184
+
+top_overlap_pairs:
+APT/USDT <-> AVAX/USDT: 0.300
+ENA/USDT <-> LINK/USDT: 0.231
+DOGE/USDT <-> NEAR/USDT: 0.216
+ENA/USDT <-> ETH/USDT: 0.207
+ETH/USDT <-> LINK/USDT: 0.207
+ADA/USDT <-> APT/USDT: 0.200
+DOGE/USDT <-> LINK/USDT: 0.200
+AVAX/USDT <-> INJ/USDT: 0.189
+ETH/USDT <-> INJ/USDT: 0.189
+INJ/USDT <-> NEAR/USDT: 0.189
+ALGO/USDT <-> LINK/USDT: 0.185
+AVAX/USDT <-> ENA/USDT: 0.174
+ALGO/USDT <-> DOGE/USDT: 0.167
+DOGE/USDT <-> WIF/USDT: 0.167
+ALGO/USDT <-> INJ/USDT: 0.162

@@ -1,0 +1,146 @@
+//@version=5
+strategy("Squeeze V8 Single-Symbol Viewer", overlay=true, pyramiding=0, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+shortTpPct = input.float(3.0, "Short TP %", minval=0.1, step=0.1)
+shortSlPct = input.float(1.5, "Short SL %", minval=0.1, step=0.1)
+shortCooldownHours = input.float(12.0, "Short Cooldown Hours", minval=0.0, step=0.5)
+shortRsiFloor = input.float(25.0, "Short RSI Floor", minval=0.0, maxval=100.0, step=0.5)
+
+longTpPct = input.float(4.0, "Long TP %", minval=0.1, step=0.1)
+longSlPct = input.float(2.0, "Long SL %", minval=0.1, step=0.1)
+longCooldownHours = input.float(12.0, "Long Cooldown Hours", minval=0.0, step=0.5)
+longRsiCap = input.float(75.0, "Long RSI Cap", minval=0.0, maxval=100.0, step=0.5)
+longRegimeMin = input.float(10.0, "Long 72h Regime Min %", step=0.5)
+
+minSqueezeHours = input.int(7, "Min Squeeze Hours", minval=1)
+atrRatioMaxShort = input.float(1.5, "Short ATR Ratio Max", minval=0.1, step=0.1)
+atrRatioMaxLong = input.float(1.2, "Long ATR Ratio Max", minval=0.1, step=0.1)
+maxHoldingHours = input.int(72, "Max Holding Hours", minval=1)
+
+showSignals = input.bool(true, "Show Signal Markers")
+showBands = input.bool(false, "Show BB / KC Bands")
+
+tfSeconds = timeframe.in_seconds()
+if barstate.isfirst and (tfSeconds > 3600 or math.fmod(3600, tfSeconds) != 0)
+    runtime.error("Use 1h or lower timeframes that divide 1h exactly (for example 30m, 15m, 5m, 1m).")
+
+barsPerHour = int(math.round(3600.0 / tfSeconds))
+rsiLen = math.max(1, 14 * barsPerHour)
+atrLen = math.max(1, 14 * barsPerHour)
+atrAvgLen = math.max(1, 72 * barsPerHour)
+retLen = math.max(1, 72 * barsPerHour)
+bbLen = math.max(1, 20 * barsPerHour)
+momLen = math.max(1, 20 * barsPerHour)
+minSqueezeBars = math.max(1, minSqueezeHours * barsPerHour)
+lookbackAboveSupport = math.max(1, 5 * barsPerHour)
+impulseLookback = math.max(1, 10 * barsPerHour)
+
+f_linreg_slope(src, length) =>
+    float sumX = 0.0
+    float sumY = 0.0
+    float sumXY = 0.0
+    float sumXX = 0.0
+    for i = 0 to length - 1
+        x = i
+        y = src[length - 1 - i]
+        sumX += x
+        sumY += y
+        sumXY += x * y
+        sumXX += x * x
+    denom = length * sumXX - sumX * sumX
+    denom == 0.0 ? 0.0 : (length * sumXY - sumX * sumY) / denom
+
+rsi14 = ta.rsi(close, rsiLen)
+tr = ta.tr(true)
+atr14 = ta.sma(tr, atrLen)
+atr72avg = ta.sma(atr14, atrAvgLen)
+atrRatio = atr72avg != 0 ? atr14 / atr72avg : na
+ret72h = ta.roc(close, retLen)
+bbBasis = ta.sma(close, bbLen)
+bbDev = ta.stdev(close, bbLen)
+bbUpper = bbBasis + 2.0 * bbDev
+bbLower = bbBasis - 2.0 * bbDev
+ema20 = ta.ema(close, bbLen)
+kcUpper = ema20 + 1.5 * atr14
+kcLower = ema20 - 1.5 * atr14
+squeezeOn = bbLower > kcLower and bbUpper < kcUpper
+var int sqCount = 0
+sqCount := squeezeOn ? nz(sqCount[1]) + 1 : 0
+momSlope = bar_index >= momLen ? f_linreg_slope(close, momLen) : na
+
+prevSqCount = nz(sqCount[1])
+shortCooldownMs = int(shortCooldownHours * 60.0 * 60.0 * 1000.0)
+longCooldownMs = int(longCooldownHours * 60.0 * 60.0 * 1000.0)
+holdMs = int(maxHoldingHours * 60.0 * 60.0 * 1000.0)
+
+var int lastShortSignalTs = na
+var int lastLongSignalTs = na
+var int openTradeTs = na
+
+shortCooldownOk = na(lastShortSignalTs) or time - lastShortSignalTs >= shortCooldownMs
+longCooldownOk = na(lastLongSignalTs) or time - lastLongSignalTs >= longCooldownMs
+
+shortSignal = prevSqCount >= minSqueezeBars and not squeezeOn and momSlope < 0 and rsi14 >= shortRsiFloor and atrRatio <= atrRatioMaxShort and shortCooldownOk
+
+support = not na(bbBasis) and bbBasis > 0 ? bbBasis : ema20
+prevSupport = not na(bbBasis[1]) and bbBasis[1] > 0 ? bbBasis[1] : ema20[1]
+strongReclaim = close > support + 0.3 * atr14
+bullishBar = close > open
+bodyRatio = (high - low) > 0 ? (close - open) / (high - low) : 0.0
+pullbackTouched = low[1] <= prevSupport
+shallowPullback = close[1] >= prevSupport - 1.0 * atr14
+
+aboveSupportCount = 0
+for i = 1 to lookbackAboveSupport
+    supportI = not na(bbBasis[i]) and bbBasis[i] > 0 ? bbBasis[i] : ema20[i]
+    aboveSupportCount += close[i] > supportI ? 1 : 0
+trendConfirmed = aboveSupportCount >= lookbackAboveSupport / 2
+
+hadImpulse = false
+for i = 1 to impulseLookback
+    hadImpulse := hadImpulse or (high[i] >= bbUpper[i])
+
+longBase = ret72h >= longRegimeMin and rsi14 <= longRsiCap and atrRatio <= atrRatioMaxLong and momSlope > 0 and strongReclaim and bullishBar and bodyRatio >= 0.4 and pullbackTouched and shallowPullback and trendConfirmed and hadImpulse and longCooldownOk
+longSignal = longBase and not shortSignal
+
+if shortSignal
+    lastShortSignalTs := time
+if longSignal
+    lastLongSignalTs := time
+
+if shortSignal and strategy.position_size >= 0
+    strategy.close("Long", comment="Short Signal")
+    strategy.entry("Short", strategy.short)
+
+if longSignal and strategy.position_size <= 0
+    strategy.close("Short", comment="Long Signal")
+    strategy.entry("Long", strategy.long)
+
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    openTradeTs := time
+if strategy.position_size == 0
+    openTradeTs := na
+
+if strategy.position_size < 0
+    shortTpPrice = strategy.position_avg_price * (1.0 - shortTpPct / 100.0)
+    shortSlPrice = strategy.position_avg_price * (1.0 + shortSlPct / 100.0)
+    strategy.exit("Short TP/SL", from_entry="Short", limit=shortTpPrice, stop=shortSlPrice)
+
+if strategy.position_size > 0
+    longTpPrice = strategy.position_avg_price * (1.0 + longTpPct / 100.0)
+    longSlPrice = strategy.position_avg_price * (1.0 - longSlPct / 100.0)
+    strategy.exit("Long TP/SL", from_entry="Long", limit=longTpPrice, stop=longSlPrice)
+
+if strategy.position_size != 0 and not na(openTradeTs) and time - openTradeTs >= holdMs
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Time Exit")
+    else
+        strategy.close("Short", comment="Time Exit")
+
+plotshape(showSignals and shortSignal, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny, text="S")
+plotshape(showSignals and longSignal, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny, text="L")
+
+plot(showBands ? bbUpper : na, "BB Upper", color=color.new(color.orange, 0))
+plot(showBands ? bbLower : na, "BB Lower", color=color.new(color.orange, 0))
+plot(showBands ? kcUpper : na, "KC Upper", color=color.new(color.blue, 15))
+plot(showBands ? kcLower : na, "KC Lower", color=color.new(color.blue, 15))

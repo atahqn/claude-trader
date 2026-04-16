@@ -1,0 +1,44 @@
+{
+  "saved_at": "2026-03-31T10:31:17.894889+00:00",
+  "symbols": [
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "XRP/USDT",
+    "DOGE/USDT",
+    "AVAX/USDT",
+    "LINK/USDT",
+    "ENA/USDT",
+    "INJ/USDT",
+    "NEAR/USDT",
+    "ALGO/USDT",
+    "RENDER/USDT",
+    "WIF/USDT",
+    "ADA/USDT",
+    "APT/USDT"
+  ],
+  "config": {
+    "approximate": true,
+    "seed": 42,
+    "risk_free_rate_annual": 0.0373
+  },
+  "total_windows": 1,
+  "windows": [
+    {
+      "name": "OOS2_BULL25",
+      "category": "oos2",
+      "start": "2025-05-06T00:00:00+00:00",
+      "end": "2025-05-13T00:00:00+00:00",
+      "signal_count": 13,
+      "short_count": 0,
+      "long_count": 13,
+      "total_pnl_pct": 34.0,
+      "trades": 13,
+      "wins": 10,
+      "losses": 3,
+      "win_rate": 76.9231,
+      "profit_factor": 6.6667,
+      "max_drawdown_pct": 5.8808
+    }
+  ]
+}

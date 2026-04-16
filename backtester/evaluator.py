@@ -528,13 +528,14 @@ class StrategyEvaluator:
             fetch_end = signal_end + timedelta(hours=_DATA_BUFFER_HOURS)
 
             request = generator.market_data_request()
+            warmup_bars = getattr(generator, "warmup_bars", 100)
             ctx = prepare_market_context(
                 self._symbols,
                 signal_start,
                 fetch_end,
                 client=self._client,
                 request=request,
-                warmup_bars=100,
+                warmup_bars=warmup_bars,
             )
 
             all_signals = generator.generate_backtest_signals(

@@ -1,0 +1,23 @@
+analysis_interval=1h
+total_signals=11
+active_signal_timestamps=9
+avg_signals_per_timestamp=1.222
+share_of_signals_in_clusters_ge_2=0.364
+share_of_signals_in_clusters_ge_3=0.000
+
+top_overlap_pairs:
+ALGO/USDT <-> LINK/USDT: 1.000
+BNB/USDT <-> SOL/USDT: 1.000
+ETH/USDT <-> LINK/USDT: 0.500
+ALGO/USDT <-> BNB/USDT: 0.000
+ALGO/USDT <-> DOGE/USDT: 0.000
+ALGO/USDT <-> ETH/USDT: 0.000
+ALGO/USDT <-> NEAR/USDT: 0.000
+ALGO/USDT <-> SOL/USDT: 0.000
+ALGO/USDT <-> XRP/USDT: 0.000
+BNB/USDT <-> DOGE/USDT: 0.000
+BNB/USDT <-> ETH/USDT: 0.000
+BNB/USDT <-> LINK/USDT: 0.000
+BNB/USDT <-> NEAR/USDT: 0.000
+BNB/USDT <-> XRP/USDT: 0.000
+DOGE/USDT <-> ETH/USDT: 0.000

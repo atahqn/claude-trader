@@ -1,0 +1,23 @@
+analysis_interval=5m
+total_signals=13
+active_signal_timestamps=9
+avg_signals_per_timestamp=1.444
+share_of_signals_in_clusters_ge_2=0.462
+share_of_signals_in_clusters_ge_3=0.308
+
+top_overlap_pairs:
+ALGO/USDT <-> LINK/USDT: 1.000
+ALGO/USDT <-> RENDER/USDT: 1.000
+LINK/USDT <-> RENDER/USDT: 1.000
+ALGO/USDT <-> NEAR/USDT: 0.500
+ETH/USDT <-> INJ/USDT: 0.500
+ETH/USDT <-> SOL/USDT: 0.500
+LINK/USDT <-> NEAR/USDT: 0.500
+NEAR/USDT <-> RENDER/USDT: 0.500
+ALGO/USDT <-> ENA/USDT: 0.000
+ALGO/USDT <-> ETH/USDT: 0.000
+ALGO/USDT <-> INJ/USDT: 0.000
+ALGO/USDT <-> SOL/USDT: 0.000
+ALGO/USDT <-> XRP/USDT: 0.000
+ENA/USDT <-> ETH/USDT: 0.000
+ENA/USDT <-> INJ/USDT: 0.000

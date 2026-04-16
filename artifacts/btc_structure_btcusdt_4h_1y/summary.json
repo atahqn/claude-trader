@@ -1,0 +1,68 @@
+{
+  "ticker": "BTC/USDT",
+  "market_type": "FUTURES",
+  "interval": "4h",
+  "years_requested": 1,
+  "bars": 2190,
+  "start": "2025-04-02T23:59:59.999000+00:00",
+  "end": "2026-04-02T19:59:59.999000+00:00",
+  "latest_close": 66994.7,
+  "confirmed_highs": 20,
+  "confirmed_lows": 20,
+  "avg_bars_to_confirm_high": 28.8,
+  "avg_bars_to_confirm_low": 30.0,
+  "candidate_high_replaced_before_confirmation": 106,
+  "candidate_low_replaced_before_confirmation": 118,
+  "high_label_counts": {
+    "HH": 11,
+    "INITIAL_HIGH": 1,
+    "LH": 8
+  },
+  "low_label_counts": {
+    "HL": 9,
+    "INITIAL_LOW": 1,
+    "LL": 10
+  },
+  "structure_break_counts": {
+    "bos_down": 199,
+    "bos_up": 318,
+    "choch_down": 5,
+    "choch_up": 5
+  },
+  "last_market_bias_after_close": "bullish",
+  "last_confirmed_high_value_asof": 75998.9,
+  "last_confirmed_low_value_asof": 64918.2,
+  "config": {
+    "rolling_lookback": 2400,
+    "atr_window": 84,
+    "atr_multiplier": 1.25,
+    "pct_threshold": 0.015,
+    "min_bars_confirmation": 18,
+    "force_confirmation_after_bars": 42,
+    "max_candidate_bars": 108,
+    "level_windows": [
+      6,
+      18,
+      42,
+      60,
+      180,
+      540,
+      1080,
+      1800,
+      2190
+    ],
+    "level_confluence_required": 2,
+    "level_tolerance_atr_multiplier": 0.5,
+    "require_multi_horizon_confluence": true,
+    "short_confluence_max_window": 180,
+    "long_confluence_min_window": 540,
+    "min_short_confluence_hits": 1,
+    "min_long_confluence_hits": 1,
+    "candidate_replace_min_atr_step": 0.1,
+    "candidate_replace_min_pct_step": 0.001,
+    "hhll_tolerance_atr_multiplier": 0.15,
+    "hhll_tolerance_pct": 0.001,
+    "bos_choch_atr_multiplier": 0.35,
+    "bos_choch_pct": 0.003
+  }
+}
